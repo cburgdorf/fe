@@ -3,7 +3,7 @@ name: Expensive
 on:
   schedule:
     # * is a special character in YAML so you have to quote this string
-    - cron:  '3/3 * * * *'
+    - cron:  '0/30 * * * *'
 
 env:
   CARGO_TERM_COLOR: always
@@ -43,4 +43,10 @@ jobs:
       - name: Build
         run: cargo build --all-features --verbose
       - name: Run expensive tests
-        run: cargo test --workspace --features solc-backend --verbose -- --include-ignored
+        id: expensive_tests
+        run: cargo test --workspace --features solc-backend --verbose -- --ignored
+      - name: Report
+        if: failure() && steps.expensive_tests.outcome == 'failure'
+        run: |
+          cat ./crates/tests/proptest-regressions/differential.txt
+
