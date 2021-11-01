@@ -335,7 +335,8 @@ pub fn expr_unary_operation(context: &mut FnContext, exp: &Node<fe::Expr>) -> yu
             fe::UnaryOperator::Not => expression! { iszero([yul_operand]) },
             fe::UnaryOperator::Invert => match typ {
                 Type::Base(Base::Numeric(integer)) => {
-                    math_operations::adjust_numeric_size(integer, expression! { not([yul_operand])})
+                    expression! { not([yul_operand])}
+                    //math_operations::adjust_numeric_size(integer, expression! { not([yul_operand])})
                 }
                 _ => unreachable!(),
             },
