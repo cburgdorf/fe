@@ -18,6 +18,7 @@ pub fn lower_type(db: &dyn MirDb, analyzer_ty: &analyzer_types::Type) -> TypeId 
         analyzer_types::Type::Contract(_) => TypeKind::Address,
         analyzer_types::Type::SelfContract(contract) => lower_contract(db, contract),
         analyzer_types::Type::Struct(struct_) => lower_struct(db, struct_),
+        analyzer_types::Type::Trait(val) => todo!()
     };
 
     intern_type(db, ty_kind, Some(analyzer_ty))

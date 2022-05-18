@@ -3,5 +3,5 @@ trait Foo:
 
 contract Meh:
 
-  pub fn bar<T>(x: T) -> bool:
+  pub fn bar(x: Foo) -> bool:
     return true

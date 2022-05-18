@@ -57,6 +57,9 @@ pub fn function_signature(
             ast::FunctionArg::Regular(reg) => {
                 let typ = type_desc(&mut scope, &reg.typ).and_then(|typ| match typ {
                     typ if typ.has_fixed_size() => Ok(typ),
+                    // Nothing to see here, we let Traits go through for now because they are going to be replaced with
+                    // fixed size structs later on.
+                    Type::Trait(_ )=> Ok(typ),
                     _ => Err(TypeError::new(scope.error(
                         "function parameter types must have fixed size",
                         reg.typ.span,

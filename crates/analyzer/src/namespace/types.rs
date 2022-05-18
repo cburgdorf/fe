@@ -1,3 +1,4 @@
+use crate::namespace::items::TraitId;
 use crate::context::AnalyzerContext;
 use crate::errors::TypeError;
 use crate::namespace::items::{Class, ContractId, StructId};
@@ -47,6 +48,7 @@ pub enum Type {
     /// of `self` within a contract function.
     SelfContract(Contract),
     Struct(Struct),
+    Trait(Trait),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -121,6 +123,20 @@ impl Struct {
             name: id.name(db),
             id,
             field_count: id.fields(db).len(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct Trait {
+    pub name: SmolStr,
+    pub id: TraitId,
+}
+impl Trait {
+    pub fn from_id(id: TraitId, db: &dyn AnalyzerDb) -> Self {
+        Self {
+            name: id.name(db),
+            id,
         }
     }
 }
@@ -430,6 +446,7 @@ impl Type {
             Type::Tuple(inner) => inner.to_string().into(),
             Type::String(inner) => inner.to_string().into(),
             Type::Struct(inner) => inner.name.clone(),
+            Type::Trait(inner) => inner.name.clone(),
             Type::Contract(inner) | Type::SelfContract(inner) => inner.name.clone(),
         }
     }
@@ -514,7 +531,7 @@ impl Type {
             | Type::String(_)
             | Type::Struct(_)
             | Type::Contract(_) => true,
-            Type::Map(_) | Type::SelfContract(_) => false,
+            Type::Map(_) | Type::SelfContract(_) | Type::Trait(_) => false,
         }
     }
 }
@@ -694,6 +711,7 @@ impl fmt::Display for Type {
             Type::Contract(inner) => inner.fmt(f),
             Type::SelfContract(inner) => inner.fmt(f),
             Type::Struct(inner) => inner.fmt(f),
+            Type::Trait(inner) => inner.fmt(f),
         }
     }
 }
@@ -783,6 +801,19 @@ impl fmt::Debug for Struct {
         f.debug_struct("Struct")
             .field("name", &self.name)
             .field("field_count", &self.field_count)
+            .finish()
+    }
+}
+
+impl fmt::Display for Trait {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name)
+    }
+}
+impl fmt::Debug for Trait {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Struct")
+            .field("name", &self.name)
             .finish()
     }
 }

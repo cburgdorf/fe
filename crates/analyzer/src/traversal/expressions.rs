@@ -179,7 +179,7 @@ pub fn assignable_expr(
                 attributes.move_location = Some(Location::Value);
             }
         }
-        Array(_) | Tuple(_) | String(_) | Struct(_) => {
+        Array(_) | Tuple(_) | String(_) | Struct(_) | Trait(_) => {
             if attributes.final_location() != Location::Memory {
                 context.fancy_error(
                     "value must be copied to memory",
@@ -1254,6 +1254,7 @@ fn expr_call_type_constructor(
         Type::Struct(_) => unreachable!(),        // handled above
         Type::Map(_) => unreachable!(),           // handled above
         Type::Array(_) => unreachable!(),         // handled above
+        Type::Trait(_) => unreachable!(),         // TODO
         Type::SelfContract(_) => unreachable!(),  /* unnameable; contract names all become
                                                     * Type::Contract */
     };

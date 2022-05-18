@@ -15,6 +15,7 @@ pub fn index(value: Type, index: Type) -> Result<Type, IndexingError> {
         | Type::String(_)
         | Type::Contract(_)
         | Type::SelfContract(_)
+        | Type::Trait(_)
         | Type::Struct(_) => Err(IndexingError::NotSubscriptable),
     }
 }

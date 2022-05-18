@@ -827,6 +827,7 @@ impl ModuleConstantId {
 pub enum TypeDef {
     Alias(TypeAliasId),
     Struct(StructId),
+    Trait(TraitId),
     Contract(ContractId),
     Primitive(types::Base),
 }
@@ -858,6 +859,7 @@ impl TypeDef {
         match self {
             TypeDef::Alias(id) => id.name(db),
             TypeDef::Struct(id) => id.name(db),
+            TypeDef::Trait(id) => id.name(db),
             TypeDef::Contract(id) => id.name(db),
             TypeDef::Primitive(typ) => typ.name(),
         }
@@ -867,6 +869,7 @@ impl TypeDef {
         match self {
             TypeDef::Alias(id) => Some(id.name_span(db)),
             TypeDef::Struct(id) => Some(id.name_span(db)),
+            TypeDef::Trait(id) => Some(id.name_span(db)),
             TypeDef::Contract(id) => Some(id.name_span(db)),
             TypeDef::Primitive(_) => None,
         }
@@ -880,6 +883,10 @@ impl TypeDef {
                 name: id.name(db),
                 field_count: id.fields(db).len(), // for the EvmSized trait
             })),
+            TypeDef::Trait(id) => Ok(types::Type::Trait(types::Trait {
+                id: *id,
+                name: id.name(db),
+            })),
             TypeDef::Contract(id) => Ok(types::Type::Contract(types::Contract {
                 id: *id,
                 name: id.name(db),
@@ -892,6 +899,7 @@ impl TypeDef {
         match self {
             Self::Alias(id) => id.is_public(db),
             Self::Struct(id) => id.is_public(db),
+            Self::Trait(id) => id.is_public(db),
             Self::Contract(id) => id.is_public(db),
             Self::Primitive(_) => true,
         }
@@ -901,6 +909,7 @@ impl TypeDef {
         match self {
             TypeDef::Alias(id) => Some(id.parent(db)),
             TypeDef::Struct(id) => Some(id.parent(db)),
+            TypeDef::Trait(id) => Some(id.parent(db)),
             TypeDef::Contract(id) => Some(id.parent(db)),
             TypeDef::Primitive(_) => None,
         }
@@ -910,6 +919,7 @@ impl TypeDef {
         match self {
             TypeDef::Alias(id) => id.sink_diagnostics(db, sink),
             TypeDef::Struct(id) => id.sink_diagnostics(db, sink),
+            TypeDef::Trait(id) => id.sink_diagnostics(db, sink),
             TypeDef::Contract(id) => id.sink_diagnostics(db, sink),
             TypeDef::Primitive(_) => {}
         }
@@ -1419,6 +1429,48 @@ impl StructFieldId {
 
     pub fn sink_diagnostics(&self, db: &dyn AnalyzerDb, sink: &mut impl DiagnosticSink) {
         db.struct_field_type(*self).sink_diagnostics(sink)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub struct Trait {
+    pub ast: Node<ast::Trait>,
+    pub module: ModuleId,
+}
+
+#[derive(Default, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Copy, Clone)]
+pub struct TraitId(pub(crate) u32);
+impl_intern_key!(TraitId);
+impl TraitId {
+    pub fn data(&self, db: &dyn AnalyzerDb) -> Rc<Trait> {
+        db.lookup_intern_trait(*self)
+    }
+    pub fn span(&self, db: &dyn AnalyzerDb) -> Span {
+        self.data(db).ast.span
+    }
+    pub fn name(&self, db: &dyn AnalyzerDb) -> SmolStr {
+        self.data(db).ast.name().into()
+    }
+    pub fn name_span(&self, db: &dyn AnalyzerDb) -> Span {
+        self.data(db).ast.kind.name.span
+    }
+
+    pub fn is_public(&self, db: &dyn AnalyzerDb) -> bool {
+        self.data(db).ast.kind.pub_qual.is_some()
+    }
+
+    pub fn module(&self, db: &dyn AnalyzerDb) -> ModuleId {
+        self.data(db).module
+    }
+
+    pub fn typ(&self, db: &dyn AnalyzerDb) -> Rc<types::Trait> {
+        db.trait_type(*self)
+    }
+    pub fn parent(&self, db: &dyn AnalyzerDb) -> Item {
+        Item::Module(self.data(db).module)
+    }
+    pub fn sink_diagnostics(&self, db: &dyn AnalyzerDb, sink: &mut impl DiagnosticSink) {
+   
     }
 }
 

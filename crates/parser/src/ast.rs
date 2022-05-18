@@ -378,6 +378,12 @@ impl Node<Struct> {
     }
 }
 
+impl Node<Trait> {
+    pub fn name(&self) -> &str {
+        &self.kind.name.kind
+    }
+}
+
 impl Node<Event> {
     pub fn name(&self) -> &str {
         &self.kind.name.kind
