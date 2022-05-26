@@ -3,7 +3,7 @@ use std::rc::Rc;
 use fe_analyzer::{
     builtins::{ContractTypeMethod, GlobalFunction, ValueMethod},
     context::CallType as AnalyzerCallType,
-    namespace::{items as analyzer_items, types as analyzer_types},
+    namespace::{items as analyzer_items, types::{self as analyzer_types, Type}},
 };
 use fe_common::numeric::Literal;
 use fe_parser::{ast, node::Node};
@@ -27,7 +27,11 @@ use crate::{
 
 type ScopeId = Id<Scope>;
 
+ 
 pub fn lower_func_signature(db: &dyn MirDb, func: analyzer_items::FunctionId) -> FunctionId {
+    lower_monomorphized_func_signature(db, func, &[])
+}
+pub fn lower_monomorphized_func_signature(db: &dyn MirDb, func: analyzer_items::FunctionId, concrete_args: &[Type]) -> FunctionId {
     // TODO: Remove this when an analyzer's function signature contains `self` type.
     let mut params = vec![];
     let has_self = func.takes_self(db.upcast());
@@ -38,9 +42,10 @@ pub fn lower_func_signature(db: &dyn MirDb, func: analyzer_items::FunctionId) ->
     }
 
     let analyzer_signature = func.signature(db.upcast());
-    params.extend(analyzer_signature.params.iter().map(|param| {
+    params.extend(analyzer_signature.params.iter().enumerate().map(|(index, param)| {
         let source = arg_source(db, func, &param.name);
-        make_param(db, param.name.clone(), param.typ.clone().unwrap(), source)
+        let param_typ = concrete_args.get(index).cloned().unwrap_or(param.typ.clone().unwrap());
+        make_param(db, param.name.clone(), param_typ, source)
     }));
     let return_type = db.mir_lowered_type(analyzer_signature.return_type.clone().unwrap());
 
