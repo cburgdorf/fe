@@ -60,6 +60,7 @@ pub fn parse_module_stmt(par: &mut Parser) -> ParseResult<ModuleStmt> {
                     ModuleStmt::Function(parse_fn_def(par, Some(pub_span))?)
                 }
                 TokenKind::Struct => ModuleStmt::Struct(parse_struct_def(par, Some(pub_span))?),
+                TokenKind::Trait => ModuleStmt::Trait(parse_trait_def(par, Some(pub_span))?),
                 TokenKind::Type => ModuleStmt::TypeAlias(parse_type_alias(par, Some(pub_span))?),
                 TokenKind::Const => ModuleStmt::Constant(parse_constant(par, Some(pub_span))?),
                 TokenKind::Contract => {

@@ -860,7 +860,17 @@ impl<'db, 'a> BodyLowerHelper<'db, 'a> {
                 let mut method_args = vec![self.lower_method_receiver(func)];
                 method_args.append(&mut args);
 
-                let func_id = self.db.mir_lowered_func_signature(*method);
+                // For now, we don't care about generics and simply look for methods that take trait directly (e.g. `fn foo(val: SomeTrait)`)
+                let func_id = if method.takes_trait(self.db.upcast()) {
+                    let concrete_args = method_args.iter().map(|val| {
+                        let x = self.builder.value_ty(*val).analyzer_ty(self.db).expect("invalid parameter");
+                        x
+                    }).collect::<Vec<_>>();
+                    self.db.mir_lowered_monomorphized_func_signature(*method, concrete_args)
+                } else {
+                    self.db.mir_lowered_func_signature(*method)
+                };
+
                 self.builder
                     .call(func_id, method_args, CallType::Internal, source)
             }

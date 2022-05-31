@@ -17,9 +17,16 @@ pub fn legalized_body(db: &dyn CodegenDb, function: FunctionId) -> Rc<FunctionBo
 }
 
 pub fn symbol_name(db: &dyn CodegenDb, function: FunctionId) -> Rc<String> {
-    let module = function.signature(db.upcast()).module_id;
+    let signature = function.signature(db.upcast());
+    // Just a quick and dirty hack to handle monomorphized functions.
+    let type_suffix = signature.params.iter().fold(String::new(), |mut acc, x| {
+        acc.push_str(&x.ty.0.to_string());
+        acc
+    });
+
+    let module = signature.module_id;
     let module_name = module.name(db.upcast());
     let func_name = function.name_with_class(db.upcast()).replace("::", "$");
 
-    format!("{}${}", module_name, func_name).into()
+    format!("{}${}_{}", module_name, func_name, type_suffix).into()
 }

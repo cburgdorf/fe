@@ -1,0 +1,3 @@
+# Marker trait that all numeric types implement
+pub trait IsNumeric:
+  pass

@@ -17,6 +17,8 @@ use std::ops::Deref;
 use std::rc::Rc;
 use strum::IntoEnumIterator;
 
+use super::types::Type;
+
 /// A named item. This does not include things inside of
 /// a function body.
 #[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Copy)]
@@ -546,6 +548,10 @@ impl ModuleId {
 
     pub fn is_incomplete(&self, db: &dyn AnalyzerDb) -> bool {
         db.module_is_incomplete(*self)
+    }
+
+    pub fn is_in_std(&self, db: &dyn AnalyzerDb) -> bool {
+        self.ingot(db).name(db) == "std"
     }
 
     /// Includes duplicate names
@@ -1192,6 +1198,9 @@ impl FunctionId {
     pub fn takes_self(&self, db: &dyn AnalyzerDb) -> bool {
         self.signature(db).self_decl.is_some()
     }
+    pub fn takes_trait(&self, db: &dyn AnalyzerDb) -> bool {
+        self.signature(db).param_types().iter().any(|param| matches!(param, Type::Trait(_)))
+    }
     pub fn self_span(&self, db: &dyn AnalyzerDb) -> Option<Span> {
         if self.takes_self(db) {
             self.data(db)
@@ -1203,6 +1212,10 @@ impl FunctionId {
         } else {
             None
         }
+    }
+
+    pub fn is_generic(&self, db: &dyn AnalyzerDb) -> bool {
+        !self.data(db).ast.kind.generic_params.kind.is_empty()
     }
 
     pub fn is_public(&self, db: &dyn AnalyzerDb) -> bool {

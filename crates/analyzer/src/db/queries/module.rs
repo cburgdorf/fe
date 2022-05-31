@@ -61,7 +61,6 @@ pub fn module_is_incomplete(db: &dyn AnalyzerDb, module: ModuleId) -> bool {
 
 pub fn module_all_items(db: &dyn AnalyzerDb, module: ModuleId) -> Rc<[Item]> {
     let body = &module.ast(db).body;
-
     body.iter()
         .filter_map(|stmt| match stmt {
             ast::ModuleStmt::TypeAlias(node) => Some(Item::Type(TypeDef::Alias(

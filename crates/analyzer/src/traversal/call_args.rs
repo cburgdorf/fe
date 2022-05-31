@@ -1,3 +1,4 @@
+use crate::AnalyzerDb;
 use crate::context::{AnalyzerContext, DiagnosticVoucher};
 use crate::errors::{FatalError, TypeError};
 use crate::namespace::types::{EventField, FunctionParam, Type};
@@ -150,7 +151,7 @@ pub fn validate_named_args(
 
         let param_type = param.typ()?;
         let val_attrs = assignable_expr(context, &arg.kind.value, Some(&param_type.clone()))?;
-        if param_type != val_attrs.typ {
+        if !is_arg_type_acceptable_for_param(context.db(), &val_attrs.typ, &param_type) {
             let msg = if let Some(label) = param.label() {
                 format!("incorrect type for `{}` argument `{}`", name, label)
             } else {
@@ -163,4 +164,19 @@ pub fn validate_named_args(
         }
     }
     Ok(())
+}
+
+fn is_arg_type_acceptable_for_param(db: &dyn AnalyzerDb, arg_type: &Type, param_type:&Type) -> bool {
+    if arg_type == param_type {
+        return true
+    }
+    // TODO: Obviously need to be more sophisticated. This is just to give us a std library trait that all numerics implement by default
+    else if let Type::Trait(trait_ty) = param_type {
+        if arg_type.is_integer() {
+            if trait_ty.id.module(db).is_in_std(db) && trait_ty.name == "IsNumeric" {
+                return true
+            }
+        }
+    }
+    false
 }
