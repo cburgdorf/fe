@@ -51,6 +51,9 @@ pub enum Type {
     /// The type of a contract while it's being executed. Ie. the type
     /// of `self` within a contract function.
     SelfContract(ContractId),
+    // The type when `Self` is used within a trait or struct
+    // TODO: should carry a TypeId?!
+    SelfType(),
     Struct(StructId),
     Enum(EnumId),
     Generic(Generic),
@@ -83,6 +86,9 @@ impl TypeId {
         db.intern_type(Type::Tuple(Tuple {
             items: items.into(),
         }))
+    }
+    pub fn self_ty(db: &dyn AnalyzerDb) -> TypeId {
+        db.intern_type(Type::SelfType())
     }
 
     pub fn typ(&self, db: &dyn AnalyzerDb) -> Type {
@@ -121,6 +127,9 @@ impl TypeId {
     }
     pub fn is_string(&self, db: &dyn AnalyzerDb) -> bool {
         matches!(self.typ(db), Type::String(_))
+    }
+    pub fn is_self_ty(&self, db: &dyn AnalyzerDb) -> bool {
+        matches!(self.typ(db), Type::SelfType())
     }
     pub fn as_struct(&self, db: &dyn AnalyzerDb) -> Option<StructId> {
         if let Type::Struct(id) = self.typ(db) {
@@ -272,6 +281,7 @@ impl TypeId {
             Type::Mut(inner) => inner.is_encodable(db),
             Type::Map(_)
             | Type::SelfContract(_)
+            | Type::SelfType()
             | Type::Generic(_)
             | Type::Enum(_)
             | Type::SPtr(_) => Ok(false),
@@ -643,7 +653,8 @@ impl Type {
             | Type::Struct(_)
             | Type::Enum(_)
             | Type::Generic(_)
-            | Type::Contract(_) => true,
+            | Type::Contract(_)
+            | Type::SelfType() => true,
             Type::Map(_) | Type::SelfContract(_) => false,
             Type::SPtr(inner) | Type::Mut(inner) => inner.has_fixed_size(db),
         }
@@ -725,6 +736,7 @@ impl DisplayWithDb for Type {
             Type::Generic(inner) => inner.fmt(f),
             Type::SPtr(inner) => write!(f, "SPtr<{}>", inner.display(db)),
             Type::Mut(inner) => write!(f, "mut {}", inner.display(db)),
+            Type::SelfType() => write!(f, "Self"),
         }
     }
 }

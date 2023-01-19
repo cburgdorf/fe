@@ -30,6 +30,7 @@ pub fn index(
         | Type::SelfContract(_)
         | Type::Generic(_)
         | Type::Struct(_)
+        | Type::SelfType()
         | Type::Enum(_) => Err(IndexingError::NotSubscriptable),
     }
 }
@@ -46,6 +47,7 @@ pub fn expected_index_type(context: &mut dyn AnalyzerContext, obj: TypeId) -> Op
         | Type::SelfContract(_)
         | Type::Generic(_)
         | Type::Enum(_)
+        | Type::SelfType()
         | Type::Struct(_) => None,
     }
 }

@@ -549,6 +549,7 @@ pub fn type_desc(
             })))
         }
         ast::TypeDesc::Unit => Ok(TypeId::unit(context.db())),
+        ast::TypeDesc::SelfType => Ok(TypeId::self_ty(context.db()))
     }
 }
 
