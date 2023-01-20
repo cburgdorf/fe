@@ -1706,7 +1706,7 @@ impl ImplId {
 
     pub fn sink_diagnostics(&self, db: &dyn AnalyzerDb, sink: &mut impl DiagnosticSink) {
         match &self.data(db).receiver.typ(db) {
-            Type::Contract(_) | Type::Map(_) | Type::SelfContract(_) | Type::Generic(_) | Type::SelfType() => sink
+            Type::Contract(_) | Type::Map(_) | Type::SelfContract(_) | Type::Generic(_) | Type::SelfType(_) => sink
                 .push(&errors::fancy_error(
                     format!(
                         "`impl` blocks aren't allowed for {}",
@@ -1778,6 +1778,7 @@ impl ImplId {
                     ));
                 }
 
+                dbg!(impl_fn.signature(db));
                 let impl_fn_return_ty = impl_fn.signature(db).return_type.clone().unwrap();
                 let trait_fn_return_ty = trait_fn.signature(db).return_type.clone().unwrap();
                 let returns_impl_ty = if let Item::Impl(val) = impl_fn.parent(db) {

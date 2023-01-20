@@ -6,9 +6,18 @@ use crate::{
     },
 };
 
-use fe_analyzer::namespace::{items as analyzer_items, types as analyzer_types};
+use fe_analyzer::namespace::{items as analyzer_items, types::{self as analyzer_types, TraitIdOrTypeId}};
 
 pub fn lower_type(db: &dyn MirDb, analyzer_ty: analyzer_types::TypeId) -> TypeId {
+    
+    if let analyzer_types::Type::SelfType(inner) = analyzer_ty.typ(db.upcast()) {
+        match inner {
+            TraitIdOrTypeId::TypeId(id) => return lower_type(db, id),
+            TraitIdOrTypeId::TraitId(_) => panic!("traits aren't lowered"),
+        }
+    }
+    
+    
     let ty_kind = match analyzer_ty.typ(db.upcast()) {
         analyzer_types::Type::SPtr(inner) => TypeKind::SPtr(lower_type(db, inner)),
 
@@ -21,7 +30,6 @@ pub fn lower_type(db: &dyn MirDb, analyzer_ty: analyzer_types::TypeId) -> TypeId
             analyzer_types::Type::Contract(_) => TypeKind::Address,
             _ => TypeKind::MPtr(lower_type(db, inner)),
         },
-
         analyzer_types::Type::Base(base) => lower_base(base),
         analyzer_types::Type::Array(arr) => lower_array(db, &arr),
         analyzer_types::Type::Map(map) => lower_map(db, &map),
@@ -31,7 +39,7 @@ pub fn lower_type(db: &dyn MirDb, analyzer_ty: analyzer_types::TypeId) -> TypeId
         analyzer_types::Type::SelfContract(contract) => lower_contract(db, contract),
         analyzer_types::Type::Struct(struct_) => lower_struct(db, struct_),
         analyzer_types::Type::Enum(enum_) => lower_enum(db, enum_),
-        analyzer_types::Type::Generic(_) | analyzer_types::Type::SelfType() => {
+        analyzer_types::Type::Generic(_) | analyzer_types::Type::SelfType(_) => {
             panic!("should be lowered in `lower_analyzer_type`")
         }
     };

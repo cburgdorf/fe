@@ -5,9 +5,9 @@ use crate::context::{
 };
 use crate::display::Displayable;
 use crate::errors::{TypeCoercionError, TypeError};
-use crate::namespace::items::{Item, TraitId};
+use crate::namespace::items::{Item, TraitId, TypeDef};
 use crate::namespace::types::{
-    Base, FeString, GenericArg, GenericParamKind, GenericType, Integer, Tuple, Type, TypeId,
+    Base, FeString, GenericArg, GenericParamKind, GenericType, Integer, Tuple, Type, TypeId, TraitIdOrTypeId,
 };
 use crate::traversal::call_args::validate_arg_count;
 use fe_common::diagnostics::Label;
@@ -549,7 +549,20 @@ pub fn type_desc(
             })))
         }
         ast::TypeDesc::Unit => Ok(TypeId::unit(context.db())),
-        ast::TypeDesc::SelfType => Ok(TypeId::self_ty(context.db()))
+        ast::TypeDesc::SelfType => {
+
+            match context.root_item() {
+                Item::Type(TypeDef::Struct(id)) => Ok(Type::SelfType(TraitIdOrTypeId::TypeId(id.as_type(context.db()))).id(context.db())),
+                Item::Trait(id) => Ok(Type::SelfType(TraitIdOrTypeId::TraitId(id)).id(context.db())),
+                Item::Impl(id) => Ok(Type::SelfType(TraitIdOrTypeId::TypeId(id.receiver(context.db()))).id(context.db())),
+                _ => { 
+                    dbg!(context.root_item());
+                    dbg!(context.parent());
+                    
+                    panic!()
+                }
+            }
+        }  
     }
 }
 
