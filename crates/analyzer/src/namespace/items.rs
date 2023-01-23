@@ -944,6 +944,9 @@ pub struct Contract {
 pub struct ContractId(pub(crate) u32);
 impl_intern_key!(ContractId);
 impl ContractId {
+    pub fn as_type(&self, db: &dyn AnalyzerDb) -> TypeId {
+        db.intern_type(Type::Contract(*self))
+    }
     pub fn data(&self, db: &dyn AnalyzerDb) -> Rc<Contract> {
         db.lookup_intern_contract(*self)
     }
@@ -1779,6 +1782,7 @@ impl ImplId {
                 }
 
                 dbg!(impl_fn.signature(db));
+                dbg!(trait_fn.signature(db));
                 let impl_fn_return_ty = impl_fn.signature(db).return_type.clone().unwrap();
                 let trait_fn_return_ty = trait_fn.signature(db).return_type.clone().unwrap();
                 let returns_impl_ty = if let Item::Impl(val) = impl_fn.parent(db) {

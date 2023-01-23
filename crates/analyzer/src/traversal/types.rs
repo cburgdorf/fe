@@ -387,7 +387,7 @@ pub fn apply_generic_type_args(
             }
 
             (GenericParamKind::PrimitiveType, ast::GenericArg::TypeDesc(type_node)) => {
-                let typ = type_desc(context, type_node)?;
+                let typ = type_desc(context, type_node, None)?;
                 if typ.is_primitive(context.db()) {
                     Ok(GenericArg::Type(typ))
                 } else {
@@ -407,7 +407,7 @@ pub fn apply_generic_type_args(
             }
 
             (GenericParamKind::AnyType, ast::GenericArg::TypeDesc(type_node)) => {
-                Ok(GenericArg::Type(type_desc(context, type_node)?))
+                Ok(GenericArg::Type(type_desc(context, type_node, None)?))
             }
 
             (
@@ -523,6 +523,7 @@ pub fn resolve_concrete_type_named_thing<T: std::fmt::Display>(
 pub fn type_desc(
     context: &mut dyn AnalyzerContext,
     desc: &Node<ast::TypeDesc>,
+    self_type: Option<TraitIdOrTypeId>,
 ) -> Result<TypeId, TypeError> {
     match &desc.kind {
         ast::TypeDesc::Base { base } => resolve_concrete_type_name(context, base, desc, None),
@@ -534,7 +535,7 @@ pub fn type_desc(
         ast::TypeDesc::Tuple { items } => {
             let types = items
                 .iter()
-                .map(|typ| match type_desc(context, typ) {
+                .map(|typ| match type_desc(context, typ, self_type.clone()) {
                     Ok(typ) if typ.has_fixed_size(context.db()) => Ok(typ),
                     Err(e) => Err(e),
                     _ => Err(TypeError::new(context.error(
@@ -550,18 +551,16 @@ pub fn type_desc(
         }
         ast::TypeDesc::Unit => Ok(TypeId::unit(context.db())),
         ast::TypeDesc::SelfType => {
-
-            match context.root_item() {
-                Item::Type(TypeDef::Struct(id)) => Ok(Type::SelfType(TraitIdOrTypeId::TypeId(id.as_type(context.db()))).id(context.db())),
-                Item::Trait(id) => Ok(Type::SelfType(TraitIdOrTypeId::TraitId(id)).id(context.db())),
-                Item::Impl(id) => Ok(Type::SelfType(TraitIdOrTypeId::TypeId(id.receiver(context.db()))).id(context.db())),
-                _ => { 
-                    dbg!(context.root_item());
-                    dbg!(context.parent());
-                    
-                    panic!()
-                }
+            if let Some(val) = self_type {
+                Ok(Type::SelfType(val).id(context.db()))
+            } else {
+                Err(TypeError::new(context.error(
+                    "`Self` can not be used here",
+                    desc.span,
+                    "",
+                )))
             }
+            
         }  
     }
 }

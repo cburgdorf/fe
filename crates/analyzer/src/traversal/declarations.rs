@@ -2,7 +2,7 @@ use crate::context::AnalyzerContext;
 use crate::display::Displayable;
 use crate::errors::{self, FatalError, TypeCoercionError};
 use crate::namespace::scopes::BlockScope;
-use crate::namespace::types::{Type, TypeId};
+use crate::namespace::types::{Type, TypeId, TraitIdOrTypeId};
 use crate::traversal::{const_expr, expressions, types};
 use fe_common::{diagnostics::Label, utils::humanize::pluralize_conditionally};
 use fe_parser::ast as fe;
@@ -20,7 +20,8 @@ pub fn var_decl(scope: &mut BlockScope, stmt: &Node<fe::FuncStmt>) -> Result<(),
         _ => unreachable!(),
     };
 
-    let declared_type = types::type_desc(scope, typ)?;
+    let self_ty = scope.parent_function().clone().self_type(scope.db()).map(|val| TraitIdOrTypeId::TypeId(val));
+    let declared_type = types::type_desc(scope, typ, self_ty)?;
     if let Type::Map(_) = declared_type.typ(scope.db()) {
         return Err(FatalError::new(scope.error(
             "invalid variable type",
@@ -76,7 +77,9 @@ pub fn var_decl(scope: &mut BlockScope, stmt: &Node<fe::FuncStmt>) -> Result<(),
 
 pub fn const_decl(scope: &mut BlockScope, stmt: &Node<fe::FuncStmt>) -> Result<(), FatalError> {
     if let fe::FuncStmt::ConstantDecl { name, typ, value } = &stmt.kind {
-        let declared_type = match types::type_desc(scope, typ) {
+        let self_ty = scope.parent_function().clone().self_type(scope.db()).map(|val| TraitIdOrTypeId::TypeId(val));
+
+        let declared_type = match types::type_desc(scope, typ, self_ty) {
             Ok(typ) if typ.has_fixed_size(scope.db()) => typ,
             _ => {
                 // If this conversion fails, the type must be a map (for now at least)

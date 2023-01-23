@@ -6,7 +6,7 @@ use crate::namespace::items::{
     DepGraph, DepGraphWrapper, DepLocality, FunctionId, FunctionSigId, Item, TypeDef,
 };
 use crate::namespace::scopes::{BlockScope, BlockScopeType, FunctionScope, ItemScope};
-use crate::namespace::types::{self, CtxDecl, Generic, SelfDecl, Type, TypeId};
+use crate::namespace::types::{self, CtxDecl, Generic, SelfDecl, Type, TypeId, TraitIdOrTypeId};
 use crate::traversal::functions::traverse_statements;
 use crate::traversal::types::{type_desc, type_desc_to_trait};
 use fe_common::diagnostics::Label;
@@ -226,7 +226,14 @@ pub fn function_signature(
                 }
                 Ok(TypeId::unit(scope.db()))
             } else {
-                match type_desc(&mut scope, type_node)? {
+
+                let self_ty = match function.parent(db) {
+                    Item::Trait(id) => Some(TraitIdOrTypeId::TraitId(id)),
+                    _ => function.self_type(db).map(|ty| TraitIdOrTypeId::TypeId(ty))
+                };
+                dbg!(self_ty.clone());
+
+                match type_desc(&mut scope, type_node, self_ty)? {
                     typ if typ.has_fixed_size(scope.db()) => Ok(typ),
                     _ => Err(TypeError::new(scope.error(
                         "function return type must have a fixed size",
@@ -273,7 +280,7 @@ fn resolve_function_param_type(
             })));
         }
     }
-    type_desc(context, desc)
+    type_desc(context, desc, function.self_type(db).map(|ty| TraitIdOrTypeId::TypeId(ty)))
 }
 
 /// Gather context information for a function body and check for type errors.

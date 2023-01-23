@@ -117,7 +117,7 @@ pub fn module_all_impls(db: &dyn AnalyzerDb, module: ModuleId) -> Rc<[ImplId]> {
                     .cloned();
 
                 let mut scope = ItemScope::new(db, module);
-                let receiver_type = type_desc(&mut scope, &impl_node.kind.receiver).unwrap();
+                let receiver_type = type_desc(&mut scope, &impl_node.kind.receiver, None).unwrap();
 
                 if let Some(Item::Trait(val)) = treit {
                     Some(db.intern_impl(Rc::new(Impl {
@@ -312,7 +312,7 @@ pub fn module_constant_type(
 ) -> Analysis<Result<types::TypeId, TypeError>> {
     let constant_data = constant.data(db);
     let mut scope = ItemScope::new(db, constant.data(db).module);
-    let typ = type_desc(&mut scope, &constant_data.ast.kind.typ);
+    let typ = type_desc(&mut scope, &constant_data.ast.kind.typ, None);
 
     match &typ {
         Ok(typ) if !typ.is_primitive(db) => {
@@ -374,7 +374,7 @@ pub fn module_constant_value(
     // analysis is already done in `module_constant_type`) or cache expression
     // types in salsa.
     let mut scope = ItemScope::new(db, constant.data(db).module);
-    let typ = match type_desc(&mut scope, &constant_data.ast.kind.typ) {
+    let typ = match type_desc(&mut scope, &constant_data.ast.kind.typ, None) {
         Ok(typ) => typ,
         // No need to emit diagnostics, it's already emitted in `module_constant_type`.
         Err(err) => {

@@ -8,7 +8,7 @@ use crate::namespace::items::{
     StructId, TypeDef,
 };
 use crate::namespace::scopes::ItemScope;
-use crate::namespace::types::{Type, TypeId};
+use crate::namespace::types::{Type, TypeId, TraitIdOrTypeId};
 use crate::traversal::types::type_desc;
 use crate::AnalyzerDb;
 use fe_common::utils::humanize::pluralize_conditionally;
@@ -111,7 +111,7 @@ pub fn struct_field_type(
     field: StructFieldId,
 ) -> Analysis<Result<TypeId, TypeError>> {
     let field_data = field.data(db);
-
+    let self_ty = Some(TraitIdOrTypeId::TypeId(field_data.parent.as_type(db)));
     let mut scope = ItemScope::new(db, field_data.parent.module(db));
 
     let ast::Field {
@@ -129,7 +129,7 @@ pub fn struct_field_type(
     if let Some(_node) = value {
         scope.not_yet_implemented("struct field initial value assignment", field_data.ast.span);
     }
-    let typ = match type_desc(&mut scope, typ) {
+    let typ = match type_desc(&mut scope, typ, self_ty) {
         Ok(typ) => match typ.typ(db) {
             Type::Contract(_) => {
                 scope.not_yet_implemented(

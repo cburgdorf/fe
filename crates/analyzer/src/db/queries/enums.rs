@@ -15,7 +15,7 @@ use crate::{
             EnumVariantKind, FunctionId, Item, TypeDef,
         },
         scopes::ItemScope,
-        types::Type,
+        types::{Type, TraitIdOrTypeId},
     },
     traversal::types::type_desc,
     AnalyzerDb,
@@ -74,13 +74,13 @@ pub fn enum_variant_kind(
 ) -> Analysis<Result<EnumVariantKind, TypeError>> {
     let variant_data = variant.data(db);
     let mut scope = ItemScope::new(db, variant_data.parent.module(db));
-
+    let self_ty = Some(TraitIdOrTypeId::TypeId(variant.parent(db).as_type(db)));
     let kind = match &variant_data.ast.kind.kind {
         ast::VariantKind::Unit => Ok(EnumVariantKind::Unit),
         ast::VariantKind::Tuple(tuple) => {
             let elem_tys: Result<SmallVec<[_; 4]>, _> = tuple
                 .iter()
-                .map(|ast_ty| match type_desc(&mut scope, ast_ty) {
+                .map(|ast_ty| match type_desc(&mut scope, ast_ty, self_ty.clone()) {
                     Ok(ty) if ty.has_fixed_size(db) => Ok(ty),
                     Ok(_) => Err(TypeError::new(scope.error(
                         "enum variant type must have a fixed size",

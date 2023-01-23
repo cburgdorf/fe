@@ -663,7 +663,7 @@ impl Type {
             | Type::Contract(_) => true,
             Type::Map(_) | Type::SelfContract(_) => false,
             Type::SelfType(inner) => match inner {
-                TraitIdOrTypeId::TraitId(_) => false,
+                TraitIdOrTypeId::TraitId(_) => true,
                 TraitIdOrTypeId::TypeId(id) => id.has_fixed_size(db)
             }
             Type::SPtr(inner) | Type::Mut(inner) => inner.has_fixed_size(db),
