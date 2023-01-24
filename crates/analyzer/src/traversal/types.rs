@@ -36,6 +36,7 @@ pub fn try_cast_type(
         }
 
         (Type::Mut(inner), _) => try_cast_type(context, inner, from_expr, into, into_span),
+        (Type::SelfType(TraitIdOrTypeId::TypeId(inner)), _) => try_cast_type(context, inner, from_expr, into, into_span),
 
         (Type::String(from_str), Type::String(into_str)) => {
             if from_str.max_size > into_str.max_size {
@@ -188,6 +189,14 @@ fn coerce(
             coerce(context, from_expr, from, into, false, chain)
         }
         (_, Type::Mut(into)) => {
+            let chain = add_adjustment_if(should_copy, chain, from, AdjustmentKind::Copy);
+            coerce(context, from_expr, from, into, false, chain)
+        }
+        (Type::SelfType(TraitIdOrTypeId::TypeId(from)), _) => {
+            let chain = add_adjustment_if(should_copy, chain, from, AdjustmentKind::Copy);
+            coerce(context, from_expr, from, into, false, chain)
+        }
+        (_, Type::SelfType(TraitIdOrTypeId::TypeId(into))) => {
             let chain = add_adjustment_if(should_copy, chain, from, AdjustmentKind::Copy);
             coerce(context, from_expr, from, into, false, chain)
         }

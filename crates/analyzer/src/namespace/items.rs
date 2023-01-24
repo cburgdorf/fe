@@ -1781,9 +1781,8 @@ impl ImplId {
                     ));
                 }
 
-                dbg!(impl_fn.signature(db));
-                dbg!(trait_fn.signature(db));
-                let impl_fn_return_ty = impl_fn.signature(db).return_type.clone().unwrap();
+                // TODO: Double check. Looks messier than needed
+                let impl_fn_return_ty = impl_fn.signature(db).return_type.clone().unwrap().deref(db);
                 let trait_fn_return_ty = trait_fn.signature(db).return_type.clone().unwrap();
                 let returns_impl_ty = if let Item::Impl(val) = impl_fn.parent(db) {
                     val.receiver(db) == impl_fn_return_ty
@@ -1791,7 +1790,7 @@ impl ImplId {
                     false
                 };
 
-                if impl_fn_return_ty != trait_fn_return_ty && !(trait_fn_return_ty.is_self_ty(db) && returns_impl_ty) {
+                if impl_fn_return_ty.deref(db) != trait_fn_return_ty.deref(db) && !(trait_fn_return_ty.is_self_ty(db) && returns_impl_ty) {
                     // TODO: This could be a nicer, more detailed report
                     sink.push(&errors::fancy_error(
                         format!(

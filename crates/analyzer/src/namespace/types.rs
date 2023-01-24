@@ -100,6 +100,7 @@ impl TypeId {
         match self.typ(db) {
             Type::SPtr(inner) => inner,
             Type::Mut(inner) => inner.deref(db),
+            Type::SelfType(TraitIdOrTypeId::TypeId(inner)) => inner,
             _ => self,
         }
     }

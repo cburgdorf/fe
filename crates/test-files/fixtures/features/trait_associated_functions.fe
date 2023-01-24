@@ -1,16 +1,22 @@
 trait Max {
   fn max() -> Self;
+  fn min() -> u8;
 }
 
 impl Max for u8 {
   fn max() -> u8 {
-    return u8(255)
+    let x: Self = u8(255)
+    return x
+  }
+
+  fn min() -> Self {
+    return u8(0)
   }
 }
 
 contract Example {
-
   pub fn run_test(self) {
     assert u8::max() == 255
   }
 }
+
