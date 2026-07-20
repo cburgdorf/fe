@@ -2470,6 +2470,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fe-trace-query"
+version = "26.1.0"
+dependencies = [
+ "blake3",
+ "fe-common",
+ "fe-introspection-config",
+ "fe-shape-address",
+ "fe-trace-facts",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "fe-uitest"
 version = "26.2.0"
 dependencies = [
