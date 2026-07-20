@@ -21,10 +21,16 @@ url.workspace = true
 salsa.workspace = true
 smol_str.workspace = true
 hir.workspace = true
+introspection-config.workspace = true
 rayon = "1"
 mir.workspace = true
+shape-address.workspace = true
+trace-facts.workspace = true
+trace-query.workspace = true
+debug-export.workspace = true
 cranelift-entity.workspace = true
 rustc-hash.workspace = true
+blake3.workspace = true
 semantic-indexing.workspace = true
 codegen = { path = "../codegen", package = "fe-codegen" }
 contract-harness = { path = "../contract-harness", package = "fe-contract-harness" }
@@ -39,6 +45,7 @@ walkdir = "2"
 similar = "2"
 colored = "2"
 hex = "0.4"
+getrandom = "0.3"
 tempfile = "3.23"
 toml = "0.8.8"
 ethers-core = "2"

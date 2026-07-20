@@ -1,20 +1,23 @@
 #![allow(clippy::print_stderr, clippy::print_stdout)]
 mod abi;
+mod analyze;
 mod build;
 mod check;
 mod cli;
+mod debug_cli;
 mod dependency_diagnostics;
 mod doc;
 #[cfg(feature = "doc-server")]
 mod doc_serve;
 mod report;
+mod shape_cli;
 mod test;
+mod trace;
 #[cfg(not(target_arch = "wasm32"))]
 mod tree;
 mod workspace_ingot;
 
-use std::fs;
-use std::sync::OnceLock;
+use std::{fs, io::Read, sync::OnceLock};
 
 use build::build;
 use camino::Utf8PathBuf;
@@ -57,6 +60,66 @@ fn cli_version() -> &'static str {
             _ => env!("CARGO_PKG_VERSION").to_string(),
         })
         .as_str()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AnalyzeFormat {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TraceReportFormat {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DatalogExportFormat {
+    Csv,
+    Jsonl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DebugExportFormat {
+    Dwarf,
+    Ethdebug,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RuntimeCaptureModeArg {
+    Minimal,
+    Standard,
+    Full,
+    DebugFull,
+}
+
+impl From<RuntimeCaptureModeArg> for trace_facts::RuntimeCaptureMode {
+    fn from(value: RuntimeCaptureModeArg) -> Self {
+        match value {
+            RuntimeCaptureModeArg::Minimal => Self::Minimal,
+            RuntimeCaptureModeArg::Standard => Self::Standard,
+            RuntimeCaptureModeArg::Full => Self::Full,
+            RuntimeCaptureModeArg::DebugFull => Self::DebugFull,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RuntimeValuePolicyArg {
+    Redacted,
+    HashOnly,
+    Full,
+}
+
+impl From<RuntimeValuePolicyArg> for trace_facts::RuntimeValuePolicy {
+    fn from(value: RuntimeValuePolicyArg) -> Self {
+        match value {
+            RuntimeValuePolicyArg::Redacted => Self::Redacted,
+            RuntimeValuePolicyArg::HashOnly => Self::HashOnly,
+            RuntimeValuePolicyArg::Full => Self::Full,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -182,6 +245,48 @@ pub enum Command {
         /// Use recovery mode when parsing.
         #[arg(long, default_value = "false")]
         recovery_mode: bool,
+    },
+    /// Analyze a Fe target using normal compiler target resolution.
+    Analyze {
+        /// Path to an ingot/workspace directory, a workspace member name, or a .fe file.
+        #[arg(default_value_t = default_project_path())]
+        path: Utf8PathBuf,
+        /// Analyze a single workspace ingot by member name.
+        ///
+        /// This requires targeting a workspace root path.
+        #[arg(short = 'i', long = "ingot", value_name = "INGOT")]
+        ingot: Option<String>,
+        /// Treat a `.fe` file target as standalone, even if it is inside an ingot.
+        #[arg(long)]
+        standalone: bool,
+        /// Compilation profile to use when resolving profile-aware config.
+        #[arg(long, default_value = "dev", value_name = "PROFILE")]
+        profile: String,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "text")]
+        format: AnalyzeFormat,
+        /// Analyze generated test entrypoints instead of runtime entrypoints.
+        #[arg(long)]
+        tests: bool,
+        /// Include typed origin facts in the report.
+        #[arg(long)]
+        origin_facts: bool,
+        /// Include relation-table projections generated from typed facts.
+        #[arg(long, requires = "origin_facts")]
+        fact_relation_tables: bool,
+        /// Use recovery mode when parsing.
+        #[arg(long, default_value = "false")]
+        recovery_mode: bool,
+    },
+    /// Run unstable developer tooling.
+    Dev {
+        #[command(subcommand)]
+        command: DevCommand,
+    },
+    /// Emit and compare derived content-addressed shape views.
+    Shape {
+        #[command(subcommand)]
+        command: ShapeCommand,
     },
     /// Generate documentation for a Fe project
     Doc {
@@ -419,6 +524,18 @@ pub enum DocAction {
 #[cfg(feature = "lsp")]
 #[derive(Debug, Clone, Subcommand)]
 pub enum LspMode {
+    /// Show discovered live LSP endpoint status.
+    Status,
+    /// Diagnose stale or malformed LSP endpoint discovery files.
+    Doctor,
+    /// Ask the discovered LSP process to stop.
+    Stop,
+    /// Print effective shared tooling config and exit.
+    Config {
+        /// Print the fully merged config as JSON.
+        #[arg(long)]
+        effective: bool,
+    },
     /// Start with TCP transport instead of stdio.
     Tcp {
         /// Port to listen on.
@@ -432,6 +549,698 @@ pub enum LspMode {
 
 fn default_project_path() -> Utf8PathBuf {
     Utf8PathBuf::from(".")
+}
+
+fn unix_time_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+fn lsp_auth_token() -> String {
+    // 256 bits from the OS CSPRNG. A guessable fallback (pid + start time) would
+    // be brute-forceable by anything that can reach the loopback port, so refuse
+    // to start rather than mint a weak token if secure randomness is unavailable.
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("OS CSPRNG unavailable; cannot mint a secure LSP auth token");
+    hex::encode(bytes)
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum DevCommand {
+    /// Fixture-backed trace UX prototype; not compiler-derived.
+    TraceFixture {
+        #[command(subcommand)]
+        command: TraceFixtureCommand,
+    },
+    /// Experimental debug export wrappers over validated trace bundles.
+    Debug {
+        #[command(subcommand)]
+        command: DevDebugCommand,
+    },
+    /// Experimental trace queries and exports over validated trace JSONL.
+    Trace {
+        #[command(subcommand)]
+        command: DevTraceCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ShapeCommand {
+    /// Emit graph and node hashes for an EVM bytecode shape.
+    Emit(ShapeEmitArgs),
+    /// Explain what dimensions mean for an EVM bytecode shape.
+    Explain(ShapeExplainArgs),
+    /// Compare two EVM bytecode shapes by dimension.
+    Diff(ShapeDiffArgs),
+    /// Bucket EVM bytecode variants by a selected shape dimension.
+    Bucket(ShapeBucketArgs),
+    /// Compare two loop-region bytecode shape candidates by dimension.
+    LoopDiff(ShapeDiffArgs),
+    /// Bucket loop-region bytecode shape candidates by a selected dimension.
+    LoopBucket(ShapeBucketArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ShapePolicyArgs {
+    /// Shape level recorded in the hash policy.
+    #[arg(long, default_value = "bytecode")]
+    pub level: String,
+    /// Bind hashes to OriginExportKeys or compare anonymous content shape.
+    #[arg(long, value_enum, default_value = "identity-bound")]
+    pub view_mode: ShapeViewModeArg,
+    /// Dimensions to hash.
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        default_value = "structure,names,constants,types,trace-events"
+    )]
+    pub dimensions: Vec<ShapeDimensionArg>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ShapeViewModeArg {
+    IdentityBound,
+    AnonymousShape,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ShapeDimensionArg {
+    Structure,
+    Names,
+    Constants,
+    Types,
+    TraceEvents,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ShapeBytecodeArgs {
+    /// Owner part for generated bytecode OriginExportKeys.
+    #[arg(long, default_value = "contract:shape-demo")]
+    pub owner: String,
+    /// Function local key for the generated bytecode function OriginExportKey.
+    #[arg(long, default_value = "function:runtime")]
+    pub function: String,
+    /// EVM bytecode as hex, with or without 0x.
+    #[arg(long = "bytecode-hex")]
+    pub bytecode_hex: String,
+    #[command(flatten)]
+    pub policy: ShapePolicyArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ShapeEmitArgs {
+    #[command(flatten)]
+    pub input: ShapeBytecodeArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ShapeExplainArgs {
+    #[command(flatten)]
+    pub input: ShapeBytecodeArgs,
+    /// Explain a specific bytecode PC node instead of the graph root.
+    #[arg(long)]
+    pub pc: Option<u32>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ShapeDiffArgs {
+    /// Owner part for generated bytecode OriginExportKeys.
+    #[arg(long, default_value = "contract:shape-demo")]
+    pub owner: String,
+    /// Function local key for the generated bytecode function OriginExportKey.
+    #[arg(long, default_value = "function:runtime")]
+    pub function: String,
+    /// Left EVM bytecode as hex, with or without 0x.
+    #[arg(long = "left-bytecode-hex")]
+    pub left_bytecode_hex: String,
+    /// Right EVM bytecode as hex, with or without 0x.
+    #[arg(long = "right-bytecode-hex")]
+    pub right_bytecode_hex: String,
+    #[command(flatten)]
+    pub policy: ShapePolicyArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ShapeBucketArgs {
+    /// Owner part for generated bytecode OriginExportKeys.
+    #[arg(long, default_value = "contract:shape-demo")]
+    pub owner: String,
+    /// Function local key for the generated bytecode function OriginExportKey.
+    #[arg(long, default_value = "function:runtime")]
+    pub function: String,
+    /// EVM bytecode variant as hex. Repeat to compare variants.
+    #[arg(long = "bytecode-hex", required = true)]
+    pub bytecode_hex: Vec<String>,
+    /// Dimension to bucket by.
+    #[arg(long, value_enum, default_value = "structure")]
+    pub dimension: ShapeDimensionArg,
+    #[command(flatten)]
+    pub policy: ShapePolicyArgs,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum DevTraceCommand {
+    /// Show trace fact/report availability and confidence boundaries.
+    Status,
+    /// Emit compiler-derived trace JSONL for a Fe target.
+    Emit(DevTraceEmitArgs),
+    /// Execute a compiled trace target in revm and append runtime facts.
+    Run(DevTraceRunArgs),
+    /// Validate a trace JSONL bundle before running reports.
+    Validate(DevTraceInputArgs),
+    /// Write a standalone browser demo for origin tracing through source, Sonatina, and bytecode.
+    WebDemo(DevTraceWebDemoArgs),
+    /// Deterministically classify every trace selection used by the web demo.
+    AuditClosures(DevTraceAuditClosuresArgs),
+    /// Run a report query against a validated trace snapshot.
+    Query {
+        #[command(subcommand)]
+        command: DevTraceQueryCommand,
+    },
+    /// Export engine-agnostic Datalog base relations from a validated trace snapshot.
+    ExportDatalog(DevTraceDatalogExportArgs),
+    /// Experimental Datalog rulepack wrappers over validated trace snapshots.
+    Datalog {
+        #[command(subcommand)]
+        command: DevTraceDatalogCommand,
+    },
+    /// Query a live LSP introspection endpoint discovered from .fe-lsp.json.
+    Live {
+        #[command(subcommand)]
+        command: DevTraceLiveCommand,
+    },
+    /// Summarize static per-iteration loop cost from a validated trace JSONL bundle.
+    LoopCost(DevTraceInputArgs),
+    /// Show compiler-derived loop block and instruction membership.
+    LoopContents(DevTraceInputArgs),
+    /// Explain one local from a validated trace JSONL bundle.
+    ExplainLocal(DevTraceExplainLocalArgs),
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum DevTraceQueryCommand {
+    /// Summarize static per-iteration loop cost from a validated trace snapshot.
+    LoopCost(DevTraceInputArgs),
+    /// Show compiler-derived loop block and instruction membership.
+    LoopContents(DevTraceInputArgs),
+    /// Explain one local from a validated trace snapshot.
+    ExplainLocal(DevTraceExplainLocalArgs),
+    /// Summarize conservative static gas from opcode facts in a trace snapshot.
+    GasBreakdown(DevTraceGasArgs),
+    /// Explain the instruction and source attribution at a bytecode PC.
+    ExplainPc(DevTracePcArgs),
+    /// Summarize conservative static gas by source attribution.
+    GasBySource(DevTraceGasArgs),
+    /// Summarize emitted bytecode size by source attribution.
+    BytecodeSizeBySource(DevTraceAttributionArgs),
+    /// Summarize measured runtime gas by source attribution.
+    DynamicGasBySource(DevTraceDynamicGasArgs),
+    /// Combine static opcode gas and measured runtime gas by source attribution.
+    GasToSource(DevTraceGasToSourceArgs),
+    /// Report ambiguous, synthetic, and unmapped optimized-code attribution.
+    OptimizedCodeHonesty(DevTraceInputArgs),
+    /// Audit bytecode attribution edge classes and source-line concentration.
+    AttributionAudit(DevTraceInputArgs),
+    /// Emit the Argot static-analysis correctness report over a validated trace snapshot.
+    StaticAnalysis(DevTraceInputArgs),
+    /// Show variable locations active at a bytecode PC.
+    VariablesAtPc(DevTracePcArgs),
+    /// Summarize observed runtime step gas by source attribution.
+    RuntimeGasBySource(DevTraceRuntimeAttributionArgs),
+    /// Summarize observed runtime storage writes by source attribution.
+    StorageWritesBySource(DevTraceRuntimeAttributionArgs),
+    /// Group observed runtime storage accesses by storage slot.
+    StorageAccessesBySlot(DevTraceStorageSlotArgs),
+    /// Summarize observed runtime call-frame cost by callsite.
+    CallCostByCallsite(DevTraceRuntimeArgs),
+    /// Summarize observed runtime memory access extents by source attribution.
+    MemoryGrowthBySource(DevTraceRuntimeAttributionArgs),
+    /// Attribute observed runtime reverts back to source where possible.
+    RevertAttribution(DevTraceRuntimeArgs),
+    /// Summarize hot runtime PCs, scoped to loop membership when present.
+    HotPathByIteration(DevTraceRuntimeAttributionArgs),
+    /// Show runtime stack/storage/memory evidence at a bytecode PC.
+    ValueFlowAtPc(DevTraceRuntimePcArgs),
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum DevTraceDatalogCommand {
+    /// Run a built-in rulepack query or load a custom rulepack directory.
+    Run(DevTraceDatalogRunArgs),
+    /// Initialize a skeleton custom rulepack directory.
+    InitRulepack(DevTraceDatalogInitArgs),
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum DevDebugCommand {
+    /// Emit an experimental debug artifact from a validated trace snapshot.
+    Emit(DevDebugEmitArgs),
+    /// Validate an experimental debug artifact.
+    Validate(DevDebugValidateArgs),
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum DevTraceLiveCommand {
+    /// Ask the live LSP endpoint for loop-cost status.
+    LoopCost {
+        /// Source file URI or path to query.
+        #[arg(long)]
+        uri: Option<String>,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "text")]
+        format: TraceReportFormat,
+    },
+    /// Ask the live LSP endpoint to explain a local.
+    ExplainLocal {
+        /// Source local to explain.
+        #[arg(long)]
+        local: String,
+        /// Source file URI or path to query.
+        #[arg(long)]
+        uri: Option<String>,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "text")]
+        format: TraceReportFormat,
+    },
+    /// Ask the live LSP endpoint for static gas status.
+    GasBreakdown {
+        /// Source file URI or path to query.
+        #[arg(long)]
+        uri: Option<String>,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "text")]
+        format: TraceReportFormat,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum TraceFixtureCommand {
+    /// Emit fixture-backed Fibonacci facts as trace JSONL.
+    Emit(TraceFixtureEmitArgs),
+    /// Summarize static per-iteration loop cost using hard-coded Fibonacci fixture facts.
+    LoopCost(TraceFixtureLoopCostArgs),
+    /// Explain one local using hard-coded Fibonacci fixture facts.
+    ExplainLocal(TraceFixtureExplainLocalArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DevTraceEmitArgs {
+    /// Path to an ingot/workspace directory, a workspace member name, or a .fe file.
+    #[arg(default_value_t = default_project_path())]
+    pub path: Utf8PathBuf,
+    /// Output trace JSONL bundle path.
+    #[arg(long)]
+    pub out: Utf8PathBuf,
+    /// Treat a `.fe` file target as standalone, even if it is inside an ingot.
+    #[arg(long)]
+    pub standalone: bool,
+    /// Compilation profile to use when resolving profile-aware config.
+    #[arg(long, default_value = "dev", value_name = "PROFILE")]
+    pub profile: String,
+    /// Optimization level for emitted bytecode facts.
+    #[arg(long = "optimize", short = 'O', default_value = "1", value_parser = ["0", "1", "2", "s"])]
+    pub optimize: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DevTraceRunArgs {
+    /// Static compiler trace JSONL bundle to extend with runtime facts.
+    #[arg(long = "static", value_name = "TRACE_JSONL")]
+    pub static_trace: Utf8PathBuf,
+    /// Source file to compile for execution. Defaults to the static trace input path.
+    #[arg(long)]
+    pub source: Option<Utf8PathBuf>,
+    /// Entry label in the form Contract or Contract::Message. Used only to select the contract.
+    #[arg(long)]
+    pub entry: String,
+    /// Explicit 4-byte message selector as hex. This command does not infer ABI selectors.
+    #[arg(long)]
+    pub selector: String,
+    /// ABI word arguments as decimal integers or 0x-prefixed hex. Repeat or comma-separate.
+    #[arg(long = "args", value_delimiter = ',')]
+    pub args: Vec<String>,
+    /// Runtime capture detail level.
+    #[arg(long = "runtime-capture", value_enum, default_value = "standard")]
+    pub runtime_capture: RuntimeCaptureModeArg,
+    /// Runtime value capture policy.
+    #[arg(long = "value-policy", value_enum, default_value = "hash-only")]
+    pub value_policy: RuntimeValuePolicyArg,
+    /// Output combined trace JSONL bundle path.
+    #[arg(long)]
+    pub out: Utf8PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DevTraceInputArgs {
+    /// Trace JSONL bundle to read.
+    #[arg(long = "from", value_name = "TRACE_JSONL")]
+    pub from: Utf8PathBuf,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: TraceReportFormat,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DevTraceWebDemoArgs {
+    /// Trace JSONL bundle to read.
+    #[arg(long = "from", value_name = "TRACE_JSONL", conflicts_with = "source")]
+    pub from: Option<Utf8PathBuf>,
+    /// Fe source file to compile with a long-lived salsa database.
+    #[arg(long, value_name = "FE_FILE", conflicts_with = "from")]
+    pub source: Option<Utf8PathBuf>,
+    /// Output standalone HTML path.
+    #[arg(long)]
+    pub out: Option<Utf8PathBuf>,
+    /// Serve the demo and live-reload when the source or JSONL input changes.
+    #[arg(long)]
+    pub serve: bool,
+    /// HTTP port for --serve.
+    #[arg(long, default_value_t = 5179)]
+    pub port: u16,
+    /// Treat --source as a standalone Fe file even if it lives under an ingot.
+    #[arg(long)]
+    pub standalone: bool,
+    /// Compilation profile for --source.
+    #[arg(long, default_value = "debug")]
+    pub profile: String,
+    /// Optimization level for --source: 0, 1, 2, or s.
+    #[arg(long, default_value = "0")]
+    pub optimize: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DevTraceAuditClosuresArgs {
+    /// Trace JSONL bundle to read.
+    #[arg(long = "from", value_name = "TRACE_JSONL", conflicts_with = "source")]
+    pub from: Option<Utf8PathBuf>,
+    /// Fe source file to compile before auditing trace selections.
+    #[arg(long, value_name = "FE_FILE", conflicts_with = "from")]
+    pub source: Option<Utf8PathBuf>,
+    /// Treat --source as a standalone Fe file even if it lives under an ingot.
+    #[arg(long)]
+    pub standalone: bool,
+    /// Compilation profile for --source.
+    #[arg(long, default_value = "debug")]
+    pub profile: String,
+    /// Optimization level for --source: 0, 1, 2, or s.
+    #[arg(long, default_value = "2")]
+    pub optimize: String,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: TraceReportFormat,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DevTraceDatalogExportArgs {
+    /// Trace JSONL bundle to read.
+    #[arg(long = "from", value_name = "TRACE_JSONL")]
+    pub from: Utf8PathBuf,
+    /// Output directory for relation files and manifest.
+    #[arg(long)]
+    pub out: Utf8PathBuf,
+    /// Relation row file format.
+    #[arg(long, value_enum, default_value = "csv")]
+    pub format: DatalogExportFormat,
+    /// Export only typed base relations generated from TraceFact rows.
+    #[arg(long)]
+    pub base_only: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DevTraceDatalogRunArgs {
+    /// Trace JSONL bundle to read.
+    #[arg(long = "from", value_name = "TRACE_JSONL")]
+    pub from: Utf8PathBuf,
+    /// Built-in rulepack id or custom rulepack directory.
+    #[arg(long)]
+    pub rulepack: String,
+    /// Rulepack query name.
+    #[arg(long)]
+    pub query: String,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: TraceReportFormat,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DevTraceDatalogInitArgs {
+    /// Directory to create for the rulepack skeleton.
+    pub path: Utf8PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DevDebugEmitArgs {
+    /// Debug export format.
+    #[arg(long, value_enum)]
+    pub format: DebugExportFormat,
+    /// Trace JSONL bundle to read.
+    #[arg(long = "from", value_name = "TRACE_JSONL")]
+    pub from: Utf8PathBuf,
+    /// Output artifact path.
+    #[arg(long)]
+    pub out: Utf8PathBuf,
+    /// DWARF sections to emit, or ethdebug phase list.
+    #[arg(long)]
+    pub sections: Option<String>,
+    /// Compilation unit display name for DWARF metadata.
+    #[arg(long)]
+    pub unit_name: Option<String>,
+    /// Source language label for debug metadata.
+    #[arg(long, default_value = "fe")]
+    pub language: String,
+    /// Minimum source confidence label for debug rows.
+    #[arg(long, default_value = "compiler-emitted")]
+    pub confidence: String,
+    /// ethdebug schema version; use `pinned` for the vendored schema.
+    #[arg(long, default_value = "pinned")]
+    pub schema_version: String,
+    /// ethdebug phase list.
+    #[arg(long)]
+    pub phase: Option<String>,
+    /// Optional Fe origin/confidence sidecar output path for ethdebug.
+    #[arg(long)]
+    pub sidecar: Option<Utf8PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DevDebugValidateArgs {
+    /// Debug export format.
+    #[arg(long, value_enum)]
+    pub format: DebugExportFormat,
+    /// Input artifact path.
+    #[arg(long)]
+    pub input: Utf8PathBuf,
+    /// ethdebug schema version; use `pinned` for the vendored schema.
+    #[arg(long, default_value = "pinned")]
+    pub schema_version: String,
+    /// Optional Fe origin/confidence sidecar to validate alongside ethdebug.
+    #[arg(long)]
+    pub sidecar: Option<Utf8PathBuf>,
+    /// Optional validation JSON output path.
+    #[arg(long)]
+    pub verify_json: Option<Utf8PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DevTraceExplainLocalArgs {
+    /// Trace JSONL bundle to read.
+    #[arg(long = "from", value_name = "TRACE_JSONL")]
+    pub from: Utf8PathBuf,
+    /// Source local to explain.
+    #[arg(long)]
+    pub local: String,
+    /// Exact origin key display label for ambiguous locals.
+    #[arg(long)]
+    pub local_key: Option<String>,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: TraceReportFormat,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DevTraceGasArgs {
+    /// Trace JSONL bundle to read.
+    #[arg(long = "from", value_name = "TRACE_JSONL")]
+    pub from: Utf8PathBuf,
+    /// Named EVM gas schedule.
+    #[arg(long, default_value = "cancun")]
+    pub schedule: String,
+    /// Source-attribution policy.
+    #[arg(long, default_value = "exclusive-primary")]
+    pub policy: String,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: TraceReportFormat,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DevTraceAttributionArgs {
+    /// Trace JSONL bundle to read.
+    #[arg(long = "from", value_name = "TRACE_JSONL")]
+    pub from: Utf8PathBuf,
+    /// Source-attribution policy.
+    #[arg(long, default_value = "exclusive-primary")]
+    pub policy: String,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: TraceReportFormat,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DevTraceDynamicGasArgs {
+    /// Trace JSONL bundle to read.
+    #[arg(long = "from", value_name = "TRACE_JSONL")]
+    pub from: Utf8PathBuf,
+    /// Optional dynamic execution trace id to filter.
+    #[arg(long)]
+    pub trace_id: Option<String>,
+    /// Source-attribution policy.
+    #[arg(long, default_value = "exclusive-primary")]
+    pub policy: String,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: TraceReportFormat,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DevTraceGasToSourceArgs {
+    /// Trace JSONL bundle to read.
+    #[arg(long = "from", value_name = "TRACE_JSONL")]
+    pub from: Utf8PathBuf,
+    /// Named EVM gas schedule for static opcode gas.
+    #[arg(long, default_value = "cancun")]
+    pub schedule: String,
+    /// Optional dynamic execution trace id to filter.
+    #[arg(long)]
+    pub trace_id: Option<String>,
+    /// Source-attribution policy.
+    #[arg(long, default_value = "exclusive-primary")]
+    pub policy: String,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: TraceReportFormat,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DevTraceRuntimeArgs {
+    /// Trace JSONL bundle to read.
+    #[arg(long = "from", value_name = "TRACE_JSONL")]
+    pub from: Utf8PathBuf,
+    /// Optional runtime execution trace/session id to filter.
+    #[arg(long)]
+    pub trace_id: Option<String>,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: TraceReportFormat,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DevTraceRuntimeAttributionArgs {
+    /// Trace JSONL bundle to read.
+    #[arg(long = "from", value_name = "TRACE_JSONL")]
+    pub from: Utf8PathBuf,
+    /// Optional runtime execution trace/session id to filter.
+    #[arg(long)]
+    pub trace_id: Option<String>,
+    /// Source-attribution policy.
+    #[arg(long, default_value = "runtime-step-exclusive")]
+    pub policy: String,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: TraceReportFormat,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DevTraceStorageSlotArgs {
+    /// Trace JSONL bundle to read.
+    #[arg(long = "from", value_name = "TRACE_JSONL")]
+    pub from: Utf8PathBuf,
+    /// Optional runtime execution trace/session id to filter.
+    #[arg(long)]
+    pub trace_id: Option<String>,
+    /// Optional rendered storage slot label to filter.
+    #[arg(long)]
+    pub slot: Option<String>,
+    /// Source-attribution policy.
+    #[arg(long, default_value = "runtime-step-exclusive")]
+    pub policy: String,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: TraceReportFormat,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DevTraceRuntimePcArgs {
+    /// Trace JSONL bundle to read.
+    #[arg(long = "from", value_name = "TRACE_JSONL")]
+    pub from: Utf8PathBuf,
+    /// Bytecode PC to inspect.
+    #[arg(long)]
+    pub pc: u32,
+    /// Optional runtime execution trace/session id to filter.
+    #[arg(long)]
+    pub trace_id: Option<String>,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: TraceReportFormat,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DevTracePcArgs {
+    /// Trace JSONL bundle to read.
+    #[arg(long = "from", value_name = "TRACE_JSONL")]
+    pub from: Utf8PathBuf,
+    /// Bytecode PC to inspect.
+    #[arg(long)]
+    pub pc: u32,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: TraceReportFormat,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TraceFixtureEmitArgs {
+    /// Path to fib_demo.fe.
+    #[arg(default_value_t = default_project_path())]
+    pub path: Utf8PathBuf,
+    /// Output trace JSONL bundle path.
+    #[arg(long)]
+    pub out: Utf8PathBuf,
+    /// Function label to record in trace metadata.
+    #[arg(long, default_value = "Fib.recv Compute handler")]
+    pub function: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TraceFixtureLoopCostArgs {
+    /// Path to fib_demo.fe.
+    #[arg(default_value_t = default_project_path())]
+    pub path: Utf8PathBuf,
+    /// Function label to display in the report.
+    #[arg(long, default_value = "Fib.recv Compute handler")]
+    pub function: String,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: TraceReportFormat,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TraceFixtureExplainLocalArgs {
+    /// Path to fib_demo.fe.
+    #[arg(default_value_t = default_project_path())]
+    pub path: Utf8PathBuf,
+    /// Source local to explain.
+    #[arg(long)]
+    pub local: String,
+    /// Function label to display in the report.
+    #[arg(long, default_value = "Fib.recv Compute handler")]
+    pub function: String,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: TraceReportFormat,
 }
 
 fn main() {
@@ -519,6 +1328,51 @@ pub fn run(opts: &Options) {
                 }
             }
         }
+        Command::Analyze {
+            path,
+            ingot,
+            standalone,
+            profile,
+            format,
+            tests,
+            origin_facts,
+            fact_relation_tables,
+            recovery_mode,
+        } => match analyze::analyze(
+            path,
+            ingot.as_deref(),
+            *standalone,
+            profile,
+            *format,
+            *tests,
+            *origin_facts,
+            *fact_relation_tables,
+            *recovery_mode,
+        ) {
+            Ok(has_errors) => {
+                if has_errors {
+                    std::process::exit(1);
+                }
+            }
+            Err(err) => {
+                eprintln!("Error: {err}");
+                std::process::exit(1);
+            }
+        },
+        Command::Dev { command } => match trace::run_dev_command(command) {
+            Ok(output) => print!("{output}"),
+            Err(err) => {
+                eprintln!("Error: {err}");
+                std::process::exit(1);
+            }
+        },
+        Command::Shape { command } => match shape_cli::run_shape_command(command) {
+            Ok(output) => print!("{output}"),
+            Err(err) => {
+                eprintln!("Error: {err}");
+                std::process::exit(1);
+            }
+        },
         Command::Doc {
             path,
             output,
@@ -687,6 +1541,44 @@ pub fn run(opts: &Options) {
                 }
                 language_server::setup_panic_hook();
                 match mode {
+                    Some(LspMode::Status) => match lsp_status(resolved_root.as_ref()) {
+                        Ok(output) => println!("{output}"),
+                        Err(err) => {
+                            eprintln!("Error: {err}");
+                            std::process::exit(1);
+                        }
+                    },
+                    Some(LspMode::Doctor) => match lsp_doctor(resolved_root.as_ref()) {
+                        Ok(output) => println!("{output}"),
+                        Err(err) => {
+                            eprintln!("Error: {err}");
+                            std::process::exit(1);
+                        }
+                    },
+                    Some(LspMode::Stop) => match lsp_stop(resolved_root.as_ref()) {
+                        Ok(output) => println!("{output}"),
+                        Err(err) => {
+                            eprintln!("Error: {err}");
+                            std::process::exit(1);
+                        }
+                    },
+                    Some(LspMode::Config { effective: _ }) => {
+                        let root = resolved_root
+                            .as_ref()
+                            .map(|root| root.as_std_path())
+                            .unwrap_or_else(|| std::path::Path::new("."));
+                        let config =
+                            introspection_config::FeToolingConfig::load_from_workspace(root)
+                                .unwrap_or_else(|err| {
+                                    eprintln!("Error: {err}");
+                                    std::process::exit(1);
+                                });
+                        let output = serde_json::json!({
+                            "config_hash": config.stable_hash(),
+                            "config": config,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&output).unwrap());
+                    }
                     Some(LspMode::Tcp { port, timeout }) => {
                         language_server::run_tcp_server(
                             *port,
@@ -735,6 +1627,22 @@ async fn run_lsp_with_combined_server(resolved_root: Option<Utf8PathBuf>, port: 
         .as_ref()
         .map(|r| r.as_std_path().to_path_buf())
         .unwrap_or_else(|| std::env::current_dir().unwrap());
+    let tooling_config =
+        match introspection_config::FeToolingConfig::load_from_workspace(&workspace_root_path) {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("Warning: could not load tooling config: {err}");
+                introspection_config::FeToolingConfig::default()
+            }
+        };
+    eprintln!("Tooling config hash: {}", tooling_config.stable_hash());
+    let config_hash = tooling_config.stable_hash();
+    let capabilities = vec![
+        "trace.query".to_string(),
+        "ir.view".to_string(),
+        "gas.static".to_string(),
+        "graph.origin".to_string(),
+    ];
 
     // Inspect any existing .fe-lsp.json. This is purely diagnostic: we
     // always proceed with writing our own, since the file is a discovery
@@ -799,28 +1707,283 @@ async fn run_lsp_with_combined_server(resolved_root: Option<Utf8PathBuf>, port: 
         }
     }
 
-    let server_info = doc::LspServerInfo {
-        pid: our_pid,
-        port: Some(actual_port),
-        workspace_root: Some(workspace_root_path.display().to_string()),
-        docs_url: Some(format!("http://127.0.0.1:{actual_port}")),
-    };
-    if let Err(e) = server_info.write_to_workspace(&workspace_root_path) {
-        eprintln!(
-            "fe-language-server: could not write .fe-lsp.json at {workspace_root_display}: {e}"
-        );
+    if tooling_config.lsp.live.write_server_info {
+        let token_file = ".fe-lsp.token";
+        let token = lsp_auth_token();
+        if let Err(err) = fs::write(workspace_root_path.join(token_file), token) {
+            eprintln!("fe-language-server: could not write {token_file}: {err}");
+        }
+        let docs_url = format!("http://127.0.0.1:{actual_port}");
+        let server_info = doc::LspServerInfo {
+            schema_version: 1,
+            pid: our_pid,
+            started_at_ms: Some(unix_time_ms()),
+            port: Some(actual_port),
+            workspace_root: Some(workspace_root_path.display().to_string()),
+            docs_url: Some(docs_url.clone()),
+            lsp: Some(doc::LspEndpointInfo {
+                transport: "websocket".to_string(),
+                port: Some(actual_port),
+                ws_url: Some(format!("ws://127.0.0.1:{actual_port}/lsp")),
+            }),
+            http: Some(doc::HttpEndpointInfo {
+                base_url: docs_url.clone(),
+                docs_url,
+                trace_api_url: format!("http://127.0.0.1:{actual_port}/trace"),
+            }),
+            capabilities: capabilities.clone(),
+            config_hash: Some(config_hash.clone()),
+            auth: Some(doc::LspAuthInfo {
+                mode: "localhost-token".to_string(),
+                token_file: token_file.to_string(),
+            }),
+        };
+        if let Err(e) = server_info.write_to_workspace(&workspace_root_path) {
+            eprintln!(
+                "fe-language-server: could not write .fe-lsp.json at {workspace_root_display}: {e}"
+            );
+        }
     }
 
     let config = language_server::CombinedServerConfig {
         listener,
         doc_html,
         docs_url: Some(format!("http://127.0.0.1:{actual_port}")),
+        tooling_config,
+        config_hash,
+        workspace_root: Some(workspace_root_path.display().to_string()),
+        capabilities,
     };
 
     language_server::run_stdio_server(Some(config)).await;
 
     // Cleanup on exit
     doc::LspServerInfo::remove_from_workspace(&workspace_root_path);
+}
+
+#[cfg(feature = "lsp")]
+fn lsp_status(resolved_root: Option<&Utf8PathBuf>) -> Result<String, String> {
+    let root = lsp_discovery_root(resolved_root)?;
+    let info = doc::LspServerInfo::read_from_workspace(root.as_std_path())
+        .ok_or_else(|| format!("no .fe-lsp.json found at {root}"))?;
+    let check = doc::ExistingInstanceCheck::inspect(root.as_std_path());
+    let mut out = String::new();
+    out.push_str("Fe LSP status\n\n");
+    out.push_str(&format!("status: {}\n", lsp_check_status(&check)));
+    out.push_str(&format!("schema_version: {}\n", info.schema_version));
+    if info.schema_version != 1 {
+        out.push_str("schema_status: unsupported; restart fe lsp with the current binary\n");
+    }
+    out.push_str(&format!("pid: {}\n", info.pid));
+    out.push_str(&format!("alive: {}\n", info.is_alive()));
+    out.push_str(&format!(
+        "workspace_root: {}\n",
+        info.workspace_root.as_deref().unwrap_or("<unknown>")
+    ));
+    if let Some(hash) = &info.config_hash {
+        out.push_str(&format!("config_hash: {hash}\n"));
+    }
+    if let Some(status) = lsp_config_hash_status(&root, &info) {
+        out.push_str(&format!("{status}\n"));
+    }
+    if let Some(http) = &info.http {
+        out.push_str(&format!("http: {}\n", http.base_url));
+        if matches!(check, doc::ExistingInstanceCheck::SiblingLive { .. }) {
+            match http_get_text(&format!("{}/health", http.base_url.trim_end_matches('/'))) {
+                Ok(body) => out.push_str(&format!("health: {body}\n")),
+                Err(err) => out.push_str(&format!("health: unavailable ({err})\n")),
+            }
+        } else {
+            out.push_str("health: skipped because server info is not a live matching instance\n");
+        }
+    } else if let Some(docs_url) = &info.docs_url {
+        out.push_str(&format!("docs_url: {docs_url}\n"));
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "lsp")]
+fn lsp_doctor(resolved_root: Option<&Utf8PathBuf>) -> Result<String, String> {
+    let root = lsp_discovery_root(resolved_root)?;
+    let check = doc::ExistingInstanceCheck::inspect(root.as_std_path());
+    let mut out = String::new();
+    out.push_str("Fe LSP doctor\n\n");
+    out.push_str(&format!("workspace_root: {root}\n"));
+    if let Some(info) = doc::LspServerInfo::read_from_workspace(root.as_std_path()) {
+        out.push_str(&format!("schema_version: {}\n", info.schema_version));
+        if info.schema_version != 1 {
+            out.push_str("schema_status: unsupported; restart fe lsp with the current binary\n");
+        }
+        if let Some(status) = lsp_config_hash_status(&root, &info) {
+            out.push_str(&format!("{status}\n"));
+        }
+    }
+    match check {
+        doc::ExistingInstanceCheck::None => out.push_str("status: no server info file found\n"),
+        doc::ExistingInstanceCheck::StaleFound {
+            stale_pid,
+            recorded_workspace_root,
+        } => out.push_str(&format!(
+            "status: stale server info (pid {stale_pid}, recorded workspace_root={recorded_workspace_root:?})\n"
+        )),
+        doc::ExistingInstanceCheck::SiblingLive {
+            sibling_pid,
+            sibling_docs_url,
+        } => out.push_str(&format!(
+            "status: live server discovered (pid {sibling_pid}, docs_url={sibling_docs_url:?})\n"
+        )),
+        doc::ExistingInstanceCheck::RootMismatch {
+            other_pid,
+            other_workspace_root,
+            our_workspace_root,
+        } => out.push_str(&format!(
+            "status: root mismatch (pid {other_pid}, recorded={other_workspace_root:?}, detected={our_workspace_root})\n"
+        )),
+        doc::ExistingInstanceCheck::Malformed => {
+            out.push_str("status: malformed .fe-lsp.json\n")
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "lsp")]
+fn lsp_check_status(check: &doc::ExistingInstanceCheck) -> String {
+    match check {
+        doc::ExistingInstanceCheck::None => "no server info file found".to_string(),
+        doc::ExistingInstanceCheck::StaleFound {
+            stale_pid,
+            recorded_workspace_root,
+        } => format!(
+            "stale server info (pid {stale_pid}, recorded workspace_root={recorded_workspace_root:?})"
+        ),
+        doc::ExistingInstanceCheck::SiblingLive {
+            sibling_pid,
+            sibling_docs_url,
+        } => format!("live matching server (pid {sibling_pid}, docs_url={sibling_docs_url:?})"),
+        doc::ExistingInstanceCheck::RootMismatch {
+            other_pid,
+            other_workspace_root,
+            our_workspace_root,
+        } => format!(
+            "root mismatch (pid {other_pid}, recorded={other_workspace_root:?}, detected={our_workspace_root})"
+        ),
+        doc::ExistingInstanceCheck::Malformed => "malformed .fe-lsp.json".to_string(),
+    }
+}
+
+#[cfg(feature = "lsp")]
+fn lsp_config_hash_status(root: &Utf8PathBuf, info: &doc::LspServerInfo) -> Option<String> {
+    let current = introspection_config::FeToolingConfig::load_from_workspace(root.as_std_path())
+        .ok()?
+        .stable_hash();
+    Some(match info.config_hash.as_deref() {
+        Some(recorded) if recorded == current => "config_hash_status: match".to_string(),
+        Some(recorded) => {
+            format!("config_hash_status: mismatch (server={recorded}, current={current})")
+        }
+        None => format!("config_hash_status: missing (current={current})"),
+    })
+}
+
+#[cfg(feature = "lsp")]
+fn lsp_stop(resolved_root: Option<&Utf8PathBuf>) -> Result<String, String> {
+    let root = lsp_discovery_root(resolved_root)?;
+    let info = doc::LspServerInfo::read_from_workspace(root.as_std_path())
+        .ok_or_else(|| format!("no .fe-lsp.json found at {root}"))?;
+    if !info.is_alive() {
+        doc::LspServerInfo::remove_from_workspace(root.as_std_path());
+        return Ok(format!(
+            "removed stale .fe-lsp.json for non-live pid {}\n",
+            info.pid
+        ));
+    }
+    terminate_process(info.pid)?;
+    Ok(format!("sent stop signal to Fe LSP pid {}\n", info.pid))
+}
+
+#[cfg(feature = "lsp")]
+fn lsp_discovery_root(resolved_root: Option<&Utf8PathBuf>) -> Result<Utf8PathBuf, String> {
+    if let Some(root) = resolved_root {
+        return Ok(root.clone());
+    }
+    Utf8PathBuf::from_path_buf(std::env::current_dir().map_err(|err| err.to_string())?)
+        .map_err(|path| format!("current directory is not UTF-8: {}", path.display()))
+}
+
+#[cfg(feature = "lsp")]
+fn terminate_process(pid: u32) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let status = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status()
+            .map_err(|err| format!("failed to run kill: {err}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("kill exited with status {status}"))
+        }
+    }
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string()])
+            .status()
+            .map_err(|err| format!("failed to run taskkill: {err}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("taskkill exited with status {status}"))
+        }
+    }
+}
+
+fn http_get_text(url: &str) -> Result<String, String> {
+    http_request("GET", url, None)
+}
+
+pub(crate) fn http_post_json(url: &str, body: &serde_json::Value) -> Result<String, String> {
+    http_request("POST", url, Some(body.to_string()))
+}
+
+fn http_request(method: &str, url: &str, body: Option<String>) -> Result<String, String> {
+    use std::io::Write;
+    use std::net::TcpStream;
+
+    let url = url::Url::parse(url).map_err(|err| format!("invalid URL {url}: {err}"))?;
+    if url.scheme() != "http" {
+        return Err(format!("unsupported URL scheme: {}", url.scheme()));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| format!("URL has no host: {url}"))?;
+    let port = url.port_or_known_default().unwrap_or(80);
+    let path = if let Some(query) = url.query() {
+        format!("{}?{query}", url.path())
+    } else {
+        url.path().to_string()
+    };
+    let mut stream = TcpStream::connect((host, port))
+        .map_err(|err| format!("failed to connect to {host}:{port}: {err}"))?;
+    let body = body.unwrap_or_default();
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| format!("failed to write HTTP request: {err}"))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|err| format!("failed to read HTTP response: {err}"))?;
+    let Some((headers, body)) = response.split_once("\r\n\r\n") else {
+        return Err("malformed HTTP response".to_string());
+    };
+    if !headers.starts_with("HTTP/1.1 200") && !headers.starts_with("HTTP/1.0 200") {
+        return Err(headers.lines().next().unwrap_or(headers).to_string());
+    }
+    Ok(body.to_string())
 }
 
 /// Initial doc data generation from a workspace root.

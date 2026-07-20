@@ -9,6 +9,29 @@ It is not a stability guarantee.
 
 - `--color <auto|always|never>`: controls colored output (default: `auto`).
 
+### Unstable developer tracing
+
+`fe dev trace-fixture ...` is a fixture-backed UX prototype for Fibonacci diagnostics. It emits trace JSONL with fixture metadata derived from `fib_demo.fe` markers and must not be read as compiler-derived instrumentation.
+
+`fe dev trace ...` reads validated trace JSONL bundles. `fe dev trace emit` produces compiler-derived JSONL with phase-owned MIR facts, source-local display names, MIR storage decisions, Sonatina trace-view CFG/loop facts through a Fe adapter, and actual EVM bytecode instruction/gas facts. Backend storage allocation, target bytecode loop membership, MIR-to-bytecode origin edges, and zext causality are still explicit gaps. Whole-file code-object source attribution is coarse and should be read as low confidence.
+`fe dev trace zext-report` is intentionally absent until compiler phases emit `InsertIntegerZeroExtend` events and value-property facts.
+
+Current fixture and JSONL report commands:
+
+```
+fe dev trace emit fib_demo.fe --out target/fib.trace.jsonl
+fe dev trace validate --from target/fib.trace.jsonl
+fe dev trace loop-cost --from target/fib.trace.jsonl
+fe dev trace explain-local --from target/fib.trace.jsonl --local b
+fe dev trace-fixture emit fib_demo.fe --out target/fib.fixture.trace.jsonl
+fe dev trace validate --from target/fib.fixture.trace.jsonl
+fe dev trace loop-cost --from target/fib.fixture.trace.jsonl
+fe dev trace explain-local --from target/fib.fixture.trace.jsonl --local b
+fe dev trace-fixture loop-cost fib_demo.fe
+fe dev trace-fixture explain-local fib_demo.fe --local b
+fe dev trace status
+```
+
 ### Output streams
 
 - **Stdout**: “normal” command output (e.g. artifact paths, formatted file paths, dependency trees).

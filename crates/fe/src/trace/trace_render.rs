@@ -1,0 +1,1723 @@
+use common::origin::OriginExportKey;
+use serde::Serialize;
+use trace_facts::{TraceBundle, TraceMetadata, TraceSnapshot, TraceValidationReport};
+use trace_query::{
+    AttributionAuditReport, BytecodeSizeBySourceReport, BytecodeSizeBySourceRequest,
+    CallCostByCallsiteReport, Confidence, DynamicGasBySourceReport, DynamicGasBySourceRequest,
+    ExplainLocalReport, ExplainLocalRequest, ExplainPcReport, ExplainPcRequest,
+    GasAttributionPolicy, GasBreakdownReport, GasBreakdownRequest, GasBySourceReport,
+    GasBySourceRequest, GasToSourceReport, GasToSourceRequest, HotPathByIterationReport,
+    IntrospectionService, LoopContentsReport, LoopContentsRequest, LoopCostReport, LoopCostRequest,
+    MemoryGrowthBySourceReport, OptimizedCodeHonestyReport, OptimizedCodeHonestyRequest,
+    ReportMetadata, RevertAttributionReport, RuntimeGasBySourceReport, RuntimeGasBySourceRequest,
+    RuntimeTraceFilterRequest, SourceAttribution, StorageAccessesBySlotReport,
+    StorageAccessesBySlotRequest, StorageWritesBySourceReport, TraceIntrospectionService,
+    ValueFlowAtPcReport, ValueFlowAtPcRequest, VariablesAtPcReport, VariablesAtPcRequest,
+    static_analysis::{StaticAnalysisReport, static_analysis_report},
+};
+
+use crate::TraceReportFormat;
+
+#[allow(dead_code)]
+pub(super) fn render_validation_summary(
+    metadata: &TraceMetadata,
+    report: &TraceValidationReport,
+) -> String {
+    render_validation_summary_with_format(metadata, report, TraceReportFormat::Text)
+        .expect("text validation summary rendering cannot fail")
+}
+
+pub(super) fn render_validation_summary_with_format(
+    metadata: &TraceMetadata,
+    report: &TraceValidationReport,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    if format == TraceReportFormat::Json {
+        return render_json(&serde_json::json!({
+            "metadata": metadata,
+            "summary": {
+                "fact_count": report.summary.fact_count,
+                "node_count": report.summary.node_count,
+                "edge_count": report.summary.edge_count,
+                "instruction_count": report.summary.instruction_count,
+            },
+            "diagnostics": {
+                "errors": report.error_count(),
+                "warnings": report.warning_count(),
+                "info": report.info_count(),
+            }
+        }));
+    }
+    let data_source = super::format_data_source(metadata);
+    Ok(format!(
+        "Trace validation: passed\n\
+         Data source: {}\n\
+         Fact basis: {}\n\
+         Report basis: schema validation only; no inference or posthoc attribution.\n\
+         Schema version: {}\n\
+         Compiler commit: {}\n\
+         Target: {}\n\
+         Input: {}\n\
+         Facts: {}\n\
+         Origin nodes: {}\n\
+         Origin edges: {}\n\
+         Instructions: {}\n\
+         Confidence: n/a (schema validation)\n\
+         Diagnostics: {} error, {} warning, {} info\n",
+        data_source,
+        fact_basis_from_data_source(&data_source),
+        metadata.schema_version,
+        metadata.compiler_commit,
+        metadata.target,
+        metadata.input_path,
+        report.summary.fact_count,
+        report.summary.node_count,
+        report.summary.edge_count,
+        report.summary.instruction_count,
+        report.error_count(),
+        report.warning_count(),
+        report.info_count()
+    ))
+}
+
+#[cfg(test)]
+pub(super) fn render_loop_cost_bundle(bundle: TraceBundle) -> Result<String, String> {
+    render_loop_cost_bundle_with_format(bundle, TraceReportFormat::Text)
+}
+
+pub(super) fn render_loop_cost_bundle_with_format(
+    bundle: TraceBundle,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    render_loop_cost_snapshot_with_format(
+        TraceSnapshot::new(bundle).map_err(|err| format!("trace validation failed: {err}"))?,
+        format,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn render_explain_local_bundle(
+    bundle: TraceBundle,
+    local_name: &str,
+) -> Result<String, String> {
+    render_explain_local_bundle_with_format(bundle, local_name, TraceReportFormat::Text)
+}
+
+pub(super) fn render_explain_local_bundle_with_format(
+    bundle: TraceBundle,
+    local_name: &str,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    render_explain_local_snapshot_with_format(
+        TraceSnapshot::new(bundle).map_err(|err| format!("trace validation failed: {err}"))?,
+        local_name,
+        None,
+        format,
+    )
+}
+
+pub(super) fn render_loop_cost_snapshot_with_format(
+    snapshot: TraceSnapshot,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    let service = TraceIntrospectionService::new(snapshot);
+    let report = service
+        .loop_cost(LoopCostRequest::default())
+        .map_err(|err| err.to_string())?;
+    render_report(format, &report, render_loop_cost_report)
+}
+
+#[cfg(test)]
+pub(super) fn render_loop_contents_snapshot(snapshot: TraceSnapshot) -> Result<String, String> {
+    render_loop_contents_snapshot_with_format(snapshot, TraceReportFormat::Text)
+}
+
+pub(super) fn render_loop_contents_snapshot_with_format(
+    snapshot: TraceSnapshot,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    let service = TraceIntrospectionService::new(snapshot);
+    let report = service
+        .loop_contents(LoopContentsRequest::default())
+        .map_err(|err| err.to_string())?;
+    render_report(format, &report, render_loop_contents_report)
+}
+
+pub(super) fn render_explain_local_snapshot_with_format(
+    snapshot: TraceSnapshot,
+    local_name: &str,
+    local_key_arg: Option<&str>,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    let local_key = local_key_arg
+        .map(|key| resolve_origin_key_argument(&snapshot, key))
+        .transpose()?;
+    let service = TraceIntrospectionService::new(snapshot);
+    let report = service
+        .explain_local(ExplainLocalRequest {
+            local: local_name.to_string(),
+            local_key,
+        })
+        .map_err(|err| err.to_string())?;
+    render_report(format, &report, render_explain_local_report)
+}
+
+pub(super) fn render_gas_breakdown_snapshot_with_format(
+    snapshot: TraceSnapshot,
+    schedule: &str,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    let service = TraceIntrospectionService::new(snapshot);
+    let report = service
+        .gas_breakdown(GasBreakdownRequest {
+            schedule: schedule.to_string(),
+        })
+        .map_err(|err| err.to_string())?;
+    render_report(format, &report, render_gas_breakdown_report)
+}
+
+pub(super) fn render_explain_pc_snapshot_with_format(
+    snapshot: TraceSnapshot,
+    pc: u32,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    let service = TraceIntrospectionService::new(snapshot);
+    let report = service
+        .explain_pc(ExplainPcRequest { pc })
+        .map_err(|err| err.to_string())?;
+    render_report(format, &report, render_explain_pc_report)
+}
+
+#[cfg(test)]
+pub(super) fn render_gas_by_source_snapshot(
+    snapshot: TraceSnapshot,
+    schedule: &str,
+    policy: &str,
+) -> Result<String, String> {
+    render_gas_by_source_snapshot_with_format(snapshot, schedule, policy, TraceReportFormat::Text)
+}
+
+pub(super) fn render_gas_by_source_snapshot_with_format(
+    snapshot: TraceSnapshot,
+    schedule: &str,
+    policy: &str,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    let service = TraceIntrospectionService::new(snapshot);
+    let report = service
+        .gas_by_source(GasBySourceRequest {
+            schedule: schedule.to_string(),
+            policy: parse_gas_policy(policy)?,
+        })
+        .map_err(|err| err.to_string())?;
+    render_report(format, &report, render_gas_by_source_report)
+}
+
+pub(super) fn render_dynamic_gas_by_source_snapshot_with_format(
+    snapshot: TraceSnapshot,
+    trace_id: Option<String>,
+    policy: &str,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    let service = TraceIntrospectionService::new(snapshot);
+    let report = service
+        .dynamic_gas_by_source(DynamicGasBySourceRequest {
+            trace_id,
+            policy: parse_gas_policy(policy)?,
+        })
+        .map_err(|err| err.to_string())?;
+    render_report(format, &report, render_dynamic_gas_by_source_report)
+}
+
+#[cfg(test)]
+pub(super) fn render_bytecode_size_by_source_snapshot(
+    snapshot: TraceSnapshot,
+    policy: &str,
+) -> Result<String, String> {
+    render_bytecode_size_by_source_snapshot_with_format(snapshot, policy, TraceReportFormat::Text)
+}
+
+pub(super) fn render_bytecode_size_by_source_snapshot_with_format(
+    snapshot: TraceSnapshot,
+    policy: &str,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    let service = TraceIntrospectionService::new(snapshot);
+    let report = service
+        .bytecode_size_by_source(BytecodeSizeBySourceRequest {
+            policy: parse_gas_policy(policy)?,
+        })
+        .map_err(|err| err.to_string())?;
+    render_report(format, &report, render_bytecode_size_by_source_report)
+}
+
+pub(super) fn render_gas_to_source_snapshot_with_format(
+    snapshot: TraceSnapshot,
+    schedule: &str,
+    trace_id: Option<String>,
+    policy: &str,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    let service = TraceIntrospectionService::new(snapshot);
+    let report = service
+        .gas_to_source(GasToSourceRequest {
+            schedule: schedule.to_string(),
+            trace_id,
+            policy: parse_gas_policy(policy)?,
+        })
+        .map_err(|err| err.to_string())?;
+    render_report(format, &report, render_gas_to_source_report)
+}
+
+pub(super) fn render_optimized_code_honesty_snapshot_with_format(
+    snapshot: TraceSnapshot,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    let service = TraceIntrospectionService::new(snapshot);
+    let report = service
+        .optimized_code_honesty(OptimizedCodeHonestyRequest::default())
+        .map_err(|err| err.to_string())?;
+    render_report(format, &report, render_optimized_code_honesty_report)
+}
+
+pub(super) fn render_attribution_audit_snapshot_with_format(
+    snapshot: TraceSnapshot,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    let service = TraceIntrospectionService::new(snapshot);
+    let report = service.attribution_audit().map_err(|err| err.to_string())?;
+    render_report(format, &report, render_attribution_audit_report)
+}
+
+pub(super) fn render_static_analysis_snapshot_with_format(
+    snapshot: TraceSnapshot,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    let report = static_analysis_report(&snapshot);
+    render_report(format, &report, render_static_analysis_report)
+}
+
+pub(super) fn render_variables_at_pc_snapshot_with_format(
+    snapshot: TraceSnapshot,
+    pc: u32,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    let service = TraceIntrospectionService::new(snapshot);
+    let report = service
+        .variables_at_pc(VariablesAtPcRequest {
+            pc,
+            code_object: None,
+        })
+        .map_err(|err| err.to_string())?;
+    render_report(format, &report, render_variables_at_pc_report)
+}
+
+pub(super) fn render_runtime_gas_by_source_snapshot_with_format(
+    snapshot: TraceSnapshot,
+    trace_id: Option<String>,
+    policy: &str,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    let service = TraceIntrospectionService::new(snapshot);
+    let report = service
+        .runtime_gas_by_source(RuntimeGasBySourceRequest {
+            trace_id,
+            policy: parse_gas_policy(policy)?,
+        })
+        .map_err(|err| err.to_string())?;
+    render_report(format, &report, render_runtime_gas_by_source_report)
+}
+
+pub(super) fn render_storage_writes_by_source_snapshot_with_format(
+    snapshot: TraceSnapshot,
+    trace_id: Option<String>,
+    policy: &str,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    let service = TraceIntrospectionService::new(snapshot);
+    let report = service
+        .storage_writes_by_source(RuntimeTraceFilterRequest {
+            trace_id,
+            policy: parse_gas_policy(policy)?,
+        })
+        .map_err(|err| err.to_string())?;
+    render_report(format, &report, render_storage_writes_by_source_report)
+}
+
+pub(super) fn render_storage_accesses_by_slot_snapshot_with_format(
+    snapshot: TraceSnapshot,
+    trace_id: Option<String>,
+    slot: Option<String>,
+    policy: &str,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    let service = TraceIntrospectionService::new(snapshot);
+    let report = service
+        .storage_accesses_by_slot(StorageAccessesBySlotRequest {
+            trace_id,
+            slot,
+            policy: parse_gas_policy(policy)?,
+        })
+        .map_err(|err| err.to_string())?;
+    render_report(format, &report, render_storage_accesses_by_slot_report)
+}
+
+pub(super) fn render_call_cost_by_callsite_snapshot_with_format(
+    snapshot: TraceSnapshot,
+    trace_id: Option<String>,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    let service = TraceIntrospectionService::new(snapshot);
+    let report = service
+        .call_cost_by_callsite(RuntimeTraceFilterRequest {
+            trace_id,
+            ..Default::default()
+        })
+        .map_err(|err| err.to_string())?;
+    render_report(format, &report, render_call_cost_by_callsite_report)
+}
+
+pub(super) fn render_memory_growth_by_source_snapshot_with_format(
+    snapshot: TraceSnapshot,
+    trace_id: Option<String>,
+    policy: &str,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    let service = TraceIntrospectionService::new(snapshot);
+    let report = service
+        .memory_growth_by_source(RuntimeTraceFilterRequest {
+            trace_id,
+            policy: parse_gas_policy(policy)?,
+        })
+        .map_err(|err| err.to_string())?;
+    render_report(format, &report, render_memory_growth_by_source_report)
+}
+
+pub(super) fn render_revert_attribution_snapshot_with_format(
+    snapshot: TraceSnapshot,
+    trace_id: Option<String>,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    let service = TraceIntrospectionService::new(snapshot);
+    let report = service
+        .revert_attribution(RuntimeTraceFilterRequest {
+            trace_id,
+            ..Default::default()
+        })
+        .map_err(|err| err.to_string())?;
+    render_report(format, &report, render_revert_attribution_report)
+}
+
+pub(super) fn render_hot_path_by_iteration_snapshot_with_format(
+    snapshot: TraceSnapshot,
+    trace_id: Option<String>,
+    policy: &str,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    let service = TraceIntrospectionService::new(snapshot);
+    let report = service
+        .hot_path_by_iteration(RuntimeTraceFilterRequest {
+            trace_id,
+            policy: parse_gas_policy(policy)?,
+        })
+        .map_err(|err| err.to_string())?;
+    render_report(format, &report, render_hot_path_by_iteration_report)
+}
+
+pub(super) fn render_value_flow_at_pc_snapshot_with_format(
+    snapshot: TraceSnapshot,
+    pc: u32,
+    trace_id: Option<String>,
+    format: TraceReportFormat,
+) -> Result<String, String> {
+    let service = TraceIntrospectionService::new(snapshot);
+    let report = service
+        .value_flow_at_pc(ValueFlowAtPcRequest {
+            pc,
+            code_object: None,
+            trace_id,
+        })
+        .map_err(|err| err.to_string())?;
+    render_report(format, &report, render_value_flow_at_pc_report)
+}
+
+fn render_report<T: Serialize>(
+    format: TraceReportFormat,
+    report: &T,
+    render_text: fn(&T) -> String,
+) -> Result<String, String> {
+    match format {
+        TraceReportFormat::Text => Ok(render_text(report)),
+        TraceReportFormat::Json => render_json(report),
+    }
+}
+
+fn render_json<T: Serialize>(value: &T) -> Result<String, String> {
+    serde_json::to_string_pretty(value)
+        .map(|mut json| {
+            json.push('\n');
+            json
+        })
+        .map_err(|err| format!("failed to render trace report JSON: {err}"))
+}
+
+fn render_loop_cost_report(report: &LoopCostReport) -> String {
+    let mut out = String::new();
+    out.push_str("Fe dev trace loop-cost\n\n");
+    push_report_header(&mut out, &report.metadata, report.confidence);
+    if let Some(function_label) = report.metadata.function_label() {
+        out.push_str(&format!("Function: {function_label}\n"));
+    }
+    if !report.available {
+        out.push('\n');
+        out.push_str("Loop cost unavailable from this trace.\n");
+        if let Some(reason) = &report.unavailable_reason {
+            out.push_str(&format!("Reason: {reason}.\n\n"));
+        }
+        out.push_str("Available compiler-derived bytecode summary:\n");
+    } else if let Some(loop_label) = &report.loop_label {
+        out.push_str(&format!("Loop: {loop_label}\n\n"));
+        if is_fixture_report(&report.metadata) {
+            out.push_str("Static per-iteration cost (fixture target UX):\n");
+        } else {
+            out.push_str("Compiler-derived loop instruction summary:\n");
+            out.push_str("  cost basis: compiler-emitted loop membership; target bytecode loop membership is only reported when bytecode PC origin edges are present.\n");
+        }
+    }
+
+    out.push_str(&format!(
+        "  total instructions: {}\n",
+        report.summary.total_instructions
+    ));
+    out.push_str(&format!(
+        "  zero-extends: {}\n",
+        report.summary.zero_extends
+    ));
+    out.push_str(&format!("  stack loads: {}\n", report.summary.stack_loads));
+    out.push_str(&format!(
+        "  stack stores: {}\n",
+        report.summary.stack_stores
+    ));
+    out.push_str(&format!("  moves: {}\n", report.summary.moves));
+    out.push_str(&format!(
+        "  branches/jumps: {}\n",
+        report.summary.branch_like()
+    ));
+    out.push_str(&format!("  arithmetic: {}\n", report.summary.arithmetic));
+    if !report.available {
+        out.push_str(&format!("  loads: {}\n", report.summary.loads));
+        out.push_str(&format!("  stores: {}\n\n", report.summary.stores));
+        out.push_str("Required next facts: loop membership, MIR-to-codegen origin edges, backend storage allocation, and zext compiler events.\n");
+        return out;
+    }
+
+    out.push_str("\nRepeated zero-extensions:\n");
+    if report.repeated_zero_extends.is_empty() {
+        out.push_str("  none attributed\n");
+    }
+    for group in &report.repeated_zero_extends {
+        let labels = group
+            .instructions
+            .iter()
+            .map(|inst| format!("asm[{}] {}", inst.index, inst.mnemonic))
+            .collect::<Vec<_>>();
+        out.push_str(&format!(
+            "  {}: {} zero-extend instructions",
+            group.local,
+            group.instructions.len()
+        ));
+        if !labels.is_empty() {
+            out.push_str(&format!(" ({})", labels.join(", ")));
+        }
+        out.push('\n');
+        let reason = group
+            .reason
+            .as_deref()
+            .unwrap_or("missing compiler event reason");
+        out.push_str(&format!(
+            "    cause: backend integer legalization; {reason}\n"
+        ));
+    }
+
+    if let Some(impact) = report
+        .storage_impacts
+        .iter()
+        .find(|impact| impact.local == "b")
+    {
+        out.push_str("\nStorage impact:\n");
+        let stack_slot = impact
+            .storage_history
+            .iter()
+            .find(|step| step.location.contains("stack slot"));
+        let memory_place = impact
+            .storage_history
+            .iter()
+            .find(|step| step.location == "memory place");
+        if let Some(step) = stack_slot {
+            out.push_str(&format!(
+                "  b: {}, earliest memory-like phase: MIR\n",
+                step.location
+            ));
+            out.push_str("  evidence: backend storage fact assigns the local to a stack slot.\n");
+        } else if memory_place.is_some() {
+            out.push_str(
+                "  b: MIR memory place; backend stack/register allocation fact unavailable.\n",
+            );
+            out.push_str("  evidence: MIR storage fact only, not final frame layout.\n");
+        } else {
+            out.push_str("  b: storage facts are incomplete; no stack residency claim.\n");
+        }
+        out.push_str(
+            "  reason: mutable-local lowering made b a memory place before backend frame layout\n",
+        );
+        out.push_str(&format!(
+            "  loop traffic: {} load + {} store per iteration\n",
+            impact.loads, impact.stores
+        ));
+        if stack_slot.is_some() || memory_place.is_some() {
+            out.push_str(
+                "  suggested area: scalar promotion / mem2reg for loop-carried u32 locals\n",
+            );
+        }
+    }
+
+    out.push_str("\nSummary:\n");
+    if report
+        .metadata
+        .data_source
+        .starts_with("fixture (fib_demo_codegen_ux_v1")
+    {
+        out.push_str("  Fe loop: 13 static instructions; Rust reference: 6.\n");
+        out.push_str("  Excess work is dominated by 4 repeated zero-extends and 2 stack-memory ops per iteration.\n");
+    } else {
+        out.push_str(&format!(
+            "  Derived loop contains {} static instructions, {} zero-extends, and {} stack-memory ops.\n",
+            report.summary.total_instructions,
+            report.summary.zero_extends,
+            report.summary.stack_loads + report.summary.stack_stores
+        ));
+        out.push_str("  Target bytecode loop membership is not proven until Sonatina-to-bytecode edges exist.\n");
+    }
+    out
+}
+
+fn render_loop_contents_report(report: &LoopContentsReport) -> String {
+    let mut out = String::new();
+    out.push_str("Fe dev trace loop-contents\n\n");
+    push_report_header(&mut out, &report.metadata, report.confidence);
+    if let Some(function_label) = report.metadata.function_label() {
+        out.push_str(&format!("Function: {function_label}\n"));
+    }
+
+    if !report.available {
+        out.push('\n');
+        out.push_str("Loop contents unavailable from this trace.\n");
+        if let Some(reason) = &report.unavailable_reason {
+            out.push_str(&format!("Reason: {reason}.\n"));
+        }
+        out.push_str("Required facts: LoopFact, LoopBlockFact, and LoopMembershipFact from a phase-owned CFG analysis.\n");
+        return out;
+    }
+
+    if let Some(loop_label) = &report.loop_label {
+        out.push_str(&format!("Loop: {loop_label}\n"));
+    }
+    out.push_str(
+        "Membership source: compiler-emitted Sonatina trace-view CFG natural-loop analysis\n",
+    );
+    if report.bytecode_bridge_available {
+        out.push_str(
+            "Scope: Sonatina post-optimization loop membership with bytecode PCs linked by observability origin edges.\n",
+        );
+    } else if report.bytecode_origin_edges_available {
+        out.push_str("Scope: Sonatina loop membership only; bytecode PC origin edges exist, but none join to this loop yet.\n");
+    } else {
+        out.push_str("Scope: Sonatina loop membership only; target bytecode PC membership requires bytecode-to-Sonatina observability edges.\n");
+    }
+    out.push_str(&format!("Blocks: {}\n", report.blocks.len()));
+    out.push_str(&format!("Instructions: {}\n\n", report.instructions.len()));
+    out.push_str("Loop blocks:\n");
+    for block in &report.blocks {
+        out.push_str(&format!(
+            "  {} [{}]\n",
+            block.block.display_label(),
+            block.role
+        ));
+        if block.instructions.is_empty() {
+            out.push_str("    <no instructions>\n");
+        }
+        for instruction in &block.instructions {
+            out.push_str(&format!(
+                "    ir[{}] {}\n",
+                instruction.index, instruction.mnemonic
+            ));
+        }
+    }
+    if report.bytecode_bridge_available {
+        out.push_str("\nTarget bytecode PCs linked to this loop:\n");
+        for instruction in &report.target_instructions {
+            out.push_str(&format!(
+                "  asm[{}] {}\n",
+                instruction.index, instruction.mnemonic
+            ));
+        }
+    }
+
+    out.push_str("\nFindings:\n");
+    for finding in &report.findings {
+        out.push_str(&format!("  {}: {}\n", finding.title, finding.summary));
+    }
+    out
+}
+
+fn render_explain_local_report(report: &ExplainLocalReport) -> String {
+    let mut out = String::new();
+    out.push_str("Fe dev trace explain-local\n\n");
+    push_report_header(&mut out, &report.metadata, report.confidence);
+    if let Some(function_label) = report.metadata.function_label() {
+        out.push_str(&format!("Function: {function_label}\n"));
+    }
+    out.push_str(&format!("Local: {}\n", report.local));
+
+    let Some(local_key) = &report.local_key else {
+        out.push('\n');
+        out.push_str("Local explanation unavailable from this trace.\n");
+        if let Some(reason) = &report.unavailable_reason {
+            out.push_str(&format!("Reason: {reason}.\n"));
+        }
+        if report.available_locals.is_empty() {
+            out.push_str("Available runtime local identities: none emitted.\n");
+        } else {
+            out.push_str(&format!(
+                "Available runtime local identities: {} emitted; showing first 20.\n",
+                report.available_locals.len()
+            ));
+            for local in &report.available_locals {
+                out.push_str(&format!("  {local}\n"));
+            }
+        }
+        if !report.candidate_local_keys.is_empty() {
+            out.push_str("Candidate local keys:\n");
+            for key in &report.candidate_local_keys {
+                out.push_str(&format!("  {}\n", key.display_label()));
+            }
+        }
+        return out;
+    };
+
+    out.push_str(&format!("Identity: {}\n\n", local_key.display_label()));
+    out.push_str("Storage history:\n");
+    for storage in &report.storage_history {
+        out.push_str(&format!(
+            "  {}: {} ({})\n",
+            storage.phase, storage.location, storage.reason
+        ));
+    }
+
+    if report.local == "b" {
+        let has_stack_slot = report
+            .storage_history
+            .iter()
+            .any(|step| step.location.contains("stack slot"));
+        let has_memory_place = report
+            .storage_history
+            .iter()
+            .any(|step| step.location == "memory place");
+        if has_stack_slot {
+            out.push_str("\nWhy b is stack-resident:\n");
+            out.push_str("  earliest memory-like phase: MIR\n");
+            out.push_str("  b is mutable and loop-carried, and current MIR lowering materializes it as a memory place.\n");
+            out.push_str("  A backend storage fact assigns that memory place to a stack slot.\n");
+            out.push_str("  This trace does not blame late register allocation; the first recorded memory decision is MIR mutable-local lowering.\n");
+        } else if has_memory_place {
+            out.push_str("\nWhy b is memory-backed in MIR:\n");
+            out.push_str("  earliest memory-like phase: MIR\n");
+            out.push_str("  b is mutable in source, and current MIR lowering materializes it as a memory place.\n");
+            out.push_str("  No backend stack/register allocation fact is emitted yet, so this real trace stops at the MIR storage decision.\n");
+            out.push_str(
+                "  The fixture demo still shows the intended post-backend stack-slot story.\n",
+            );
+        }
+    }
+
+    out.push_str("\nRelated loop instructions:\n");
+    for related in &report.related_instructions {
+        out.push_str(&format!(
+            "  asm[{}] {:<18} {:?}\n",
+            related.instruction.index, related.instruction.mnemonic, related.edge_label
+        ));
+    }
+
+    if matches!(report.local.as_str(), "i" | "n") {
+        out.push_str("\nZero-extension diagnosis:\n");
+        if report.zero_extends.is_empty() {
+            out.push_str("  unavailable: no compiler-emitted IntegerLegalizationFor edges link final instructions to this local.\n");
+            out.push_str(
+                "  MIR value-property facts alone do not prove target zero-extension causality.\n",
+            );
+        } else {
+            let reason = report
+                .zero_extends
+                .first()
+                .and_then(|related| related.reason.as_deref())
+                .unwrap_or("compiler event reason unavailable");
+            out.push_str(&format!(
+                "  repeated zero-extensions for {}: {}\n",
+                report.local,
+                report.zero_extends.len()
+            ));
+            out.push_str(&format!("  cause: {reason}\n"));
+        }
+    }
+
+    out
+}
+
+fn render_gas_breakdown_report(report: &GasBreakdownReport) -> String {
+    let mut out = String::new();
+    out.push_str("Fe dev trace gas-breakdown\n\n");
+    push_report_header(&mut out, &report.metadata, report.confidence);
+    out.push_str(&format!("Schedule: {}\n", report.schedule));
+    out.push_str(&format!("Attribution policy: {}\n", report.policy));
+    out.push_str(
+        "Mode: static opcode-table estimate; runtime gas depends on path and EVM state.\n\n",
+    );
+    if !report.available {
+        out.push_str("Gas breakdown unavailable from this trace.\n");
+        for finding in &report.findings {
+            out.push_str(&format!("  {}: {}\n", finding.title, finding.summary));
+        }
+        return out;
+    }
+    out.push_str(&format!(
+        "Total static opcode gas: {}\n",
+        report.total_gas.unwrap_or_default()
+    ));
+    out.push_str("Top opcode contributors:\n");
+    let mut rows = report.rows.clone();
+    rows.sort_by_key(|b| std::cmp::Reverse(b.gas));
+    for row in rows.iter().take(12) {
+        out.push_str(&format!(
+            "  {:>4} gas  {:<24} {} ({})\n",
+            row.gas, row.label, row.confidence, row.source
+        ));
+    }
+    out
+}
+
+fn render_explain_pc_report(report: &ExplainPcReport) -> String {
+    let mut out = String::new();
+    out.push_str("Fe dev trace explain-pc\n\n");
+    push_report_header(&mut out, &report.metadata, report.confidence);
+    out.push_str(&format!(
+        "Attribution route: {}\n",
+        attribution_route_from_keys(
+            report
+                .source_candidates
+                .iter()
+                .map(|source| Some(&source.origin))
+        )
+    ));
+    out.push_str(&format!("PC: {}\n", report.pc));
+
+    let Some(instruction) = &report.instruction else {
+        out.push('\n');
+        out.push_str("PC explanation unavailable from this trace.\n");
+        if let Some(reason) = &report.unavailable_reason {
+            out.push_str(&format!("Reason: {reason}.\n"));
+        }
+        return out;
+    };
+
+    out.push_str(&format!(
+        "Instruction: asm[{}] {}\n",
+        instruction.index, instruction.mnemonic
+    ));
+    if let Some(category) = report.category {
+        out.push_str(&format!("Category: {category:?}\n"));
+    }
+    if let Some(gas) = report.static_gas {
+        out.push_str(&format!("Static gas (cancun): {gas}\n"));
+    }
+
+    out.push('\n');
+    out.push_str("Source attribution:\n");
+    if let Some(source) = &report.primary_source {
+        out.push_str(&format!("  primary: {}\n", format_source(source)));
+    } else if report.source_candidates.is_empty() {
+        out.push_str("  none emitted\n");
+    } else {
+        out.push_str("  ambiguous; no single primary source\n");
+    }
+    for source in &report.source_candidates {
+        out.push_str(&format!("  candidate: {}\n", format_source(source)));
+    }
+    out
+}
+
+fn render_gas_by_source_report(report: &GasBySourceReport) -> String {
+    let mut out = String::new();
+    out.push_str("Fe dev trace gas-by-source\n\n");
+    push_report_header(&mut out, &report.metadata, report.confidence);
+    out.push_str(&format!("Schedule: {}\n", report.schedule));
+    out.push_str(&format!("Attribution policy: {}\n", report.policy));
+    out.push_str(&format!(
+        "Attribution route: {}\n\n",
+        attribution_route_from_keys(report.rows.iter().map(|row| row.source.as_ref()))
+    ));
+    out.push_str(&format!("Total static opcode gas: {}\n", report.total_gas));
+
+    if report.rows.is_empty() {
+        out.push_str("No static gas rows were present in this trace.\n");
+        return out;
+    }
+
+    out.push_str("Source contributors:\n");
+    for row in report.rows.iter().take(20) {
+        out.push_str(&format!(
+            "  {:>4} gas  {:>3} inst  {:<8?} {}\n",
+            row.gas, row.instruction_count, row.confidence, row.label
+        ));
+    }
+    out
+}
+
+fn render_dynamic_gas_by_source_report(report: &DynamicGasBySourceReport) -> String {
+    let mut out = String::new();
+    out.push_str("Fe dev trace dynamic-gas-by-source\n\n");
+    push_report_header(&mut out, &report.metadata, report.confidence);
+    out.push_str(&format!("Target schedule: {}\n", report.target_schedule));
+    out.push_str(&format!("Attribution policy: {}\n", report.policy));
+    out.push_str(&format!(
+        "Attribution route: {}\n",
+        attribution_route_from_keys(report.rows.iter().map(|row| row.source.as_ref()))
+    ));
+    if let Some(trace_id) = &report.trace_id {
+        out.push_str(&format!("Trace id: {trace_id}\n"));
+    }
+    out.push('\n');
+    out.push_str(&format!("Total measured gas: {}\n", report.total_gas));
+    out.push_str(&format!(
+        "Unattributed dynamic steps: {}\n",
+        report.unattributed_steps
+    ));
+
+    if report.rows.is_empty() {
+        out.push_str("No dynamic gas rows were present in this trace.\n");
+        return out;
+    }
+
+    out.push_str("Source contributors:\n");
+    for row in report.rows.iter().take(20) {
+        out.push_str(&format!(
+            "  {:>4} gas  {:>3} steps  {:<8?} {}\n",
+            row.gas, row.instruction_count, row.confidence, row.label
+        ));
+    }
+    out
+}
+
+fn render_bytecode_size_by_source_report(report: &BytecodeSizeBySourceReport) -> String {
+    let mut out = String::new();
+    out.push_str("Fe dev trace bytecode-size-by-source\n\n");
+    push_report_header(&mut out, &report.metadata, report.confidence);
+    out.push_str(&format!("Attribution policy: {}\n", report.policy));
+    out.push_str(&format!(
+        "Attribution route: {}\n\n",
+        attribution_route_from_keys(report.rows.iter().map(|row| row.source.as_ref()))
+    ));
+    out.push_str(&format!(
+        "Total emitted bytecode bytes: {}\n",
+        report.total_bytes
+    ));
+
+    if report.rows.is_empty() {
+        out.push_str("No instruction extent rows were present in this trace.\n");
+        return out;
+    }
+
+    out.push_str("Source contributors:\n");
+    for row in report.rows.iter().take(20) {
+        out.push_str(&format!(
+            "  {:>4} bytes  {:>3} inst  {:<8?} {}\n",
+            row.bytes, row.instruction_count, row.confidence, row.label
+        ));
+    }
+    out
+}
+
+fn render_gas_to_source_report(report: &GasToSourceReport) -> String {
+    let mut out = String::new();
+    out.push_str("Fe dev trace gas-to-source\n\n");
+    push_report_header(&mut out, &report.metadata, report.confidence);
+    out.push_str(&format!("Target schedule: {}\n", report.schedule));
+    out.push_str(&format!("Attribution policy: {}\n", report.policy));
+    out.push_str(&format!(
+        "Attribution route: {}\n",
+        attribution_route_from_keys(report.rows.iter().map(|row| row.source.as_ref()))
+    ));
+    if let Some(trace_id) = &report.trace_id {
+        out.push_str(&format!("Trace id: {trace_id}\n"));
+    }
+    out.push('\n');
+    out.push_str(&format!("Static gas: {}\n", report.static_gas));
+    out.push_str(&format!("Dynamic gas: {}\n", report.dynamic_gas));
+    out.push_str(&format!("Combined gas: {}\n", report.total_gas));
+
+    if report.rows.is_empty() {
+        out.push_str("No gas rows were present in this trace.\n");
+        return out;
+    }
+
+    out.push_str("Source contributors:\n");
+    for row in report.rows.iter().take(20) {
+        out.push_str(&format!(
+            "  {:>4} total  {:>4} static  {:>4} dynamic  {:<8?} {}\n",
+            row.total_gas, row.static_gas, row.dynamic_gas, row.confidence, row.label
+        ));
+    }
+    out
+}
+
+fn render_optimized_code_honesty_report(report: &OptimizedCodeHonestyReport) -> String {
+    let mut out = String::new();
+    out.push_str("Fe dev trace optimized-code-honesty\n\n");
+    push_report_header(&mut out, &report.metadata, report.confidence);
+    out.push_str(&format!("Target schedule: {}\n", report.schedule));
+    out.push_str(&format!("Attribution policy: {}\n", report.policy));
+    out.push('\n');
+
+    out.push_str(&format!(
+        "Ambiguous instructions: {}\n",
+        report.ambiguous_instructions.len()
+    ));
+    out.push_str(&format!(
+        "Synthetic overhead instructions: {}\n",
+        report.synthetic_overheads.len()
+    ));
+    out.push_str(&format!(
+        "Unmapped instructions: {}\n",
+        report.unmapped_instructions.len()
+    ));
+
+    if !report.ambiguous_instructions.is_empty() {
+        out.push_str("\nAmbiguous source candidates:\n");
+        for row in report.ambiguous_instructions.iter().take(12) {
+            out.push_str(&format!(
+                "  asm[{}] {}: {} candidate source(s)",
+                row.instruction.index,
+                row.instruction.mnemonic,
+                row.source_candidates.len()
+            ));
+            if let Some(gas) = row.static_gas {
+                out.push_str(&format!(", static gas {gas}"));
+            }
+            if row.dynamic_gas > 0 {
+                out.push_str(&format!(", dynamic gas {}", row.dynamic_gas));
+            }
+            out.push('\n');
+            for source in &row.source_candidates {
+                out.push_str(&format!("    candidate: {}\n", format_source(source)));
+            }
+        }
+    }
+
+    if !report.synthetic_overheads.is_empty() {
+        out.push_str("\nSynthetic compiler overhead:\n");
+        for row in report.synthetic_overheads.iter().take(12) {
+            let labels = row
+                .edge_labels
+                .iter()
+                .map(|label| format!("{label:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "  asm[{}] {} ({labels})",
+                row.instruction.index, row.instruction.mnemonic
+            ));
+            if let Some(gas) = row.static_gas {
+                out.push_str(&format!(", static gas {gas}"));
+            }
+            if row.dynamic_gas > 0 {
+                out.push_str(&format!(", dynamic gas {}", row.dynamic_gas));
+            }
+            out.push('\n');
+            for source in &row.cause_sources {
+                out.push_str(&format!("    caused by: {}\n", format_source(source)));
+            }
+        }
+    }
+
+    if !report.unmapped_instructions.is_empty() {
+        out.push_str("\nUnmapped instructions:\n");
+        for instruction in report.unmapped_instructions.iter().take(20) {
+            out.push_str(&format!(
+                "  asm[{}] {} has no recorded source or synthetic-cause edge\n",
+                instruction.index, instruction.mnemonic
+            ));
+        }
+    }
+
+    if report.ambiguous_instructions.is_empty()
+        && report.synthetic_overheads.is_empty()
+        && report.unmapped_instructions.is_empty()
+    {
+        out.push_str("\nNo attribution ambiguity, synthetic overhead, or unmapped instructions were reported.\n");
+    } else {
+        out.push_str(
+            "\nHonesty note: this report preserves ambiguity instead of selecting a source the compiler did not record.\n",
+        );
+    }
+    out
+}
+
+fn render_attribution_audit_report(report: &AttributionAuditReport) -> String {
+    let mut out = String::new();
+    out.push_str("Fe dev trace attribution-audit\n\n");
+    push_report_header(&mut out, &report.metadata, Confidence::Medium);
+    out.push_str(
+        "Policy: exactness is derived from OriginEdgeLabel + introduced_by + endpoint kinds.\n",
+    );
+    out.push_str(&format!(
+        "Bytecode PCs: {} total\n",
+        report.total_bytecode_pcs
+    ));
+    out.push_str(&format!(
+        "  source-exact: {}\n  ambiguous source: {}\n  no exact source: {}\n",
+        report.source_exact_pcs, report.source_ambiguous_pcs, report.unmapped_pcs
+    ));
+    out.push_str(&format!(
+        "  optimized-Sonatina linked: {}\n  prepared-linked: {}\n  missing optimized->prepared lineage: {}\n  non-exact optimized->prepared explanation: {}\n\n",
+        report.optimized_sonatina_linked_pcs,
+        report.prepared_linked_pcs,
+        report.missing_optimized_to_prepared_lineage_pcs,
+        report.non_exact_optimized_to_prepared_lineage_pcs
+    ));
+
+    out.push_str("Direct bytecode edge classes:\n");
+    for row in &report.direct_edges_by_class {
+        out.push_str(&format!("  {:>5} {:?}\n", row.count, row.traversal_class));
+    }
+
+    out.push_str("\nDirect bytecode edges:\n");
+    for row in report.direct_bytecode_edges.iter().take(16) {
+        out.push_str(&format!(
+            "  {:>5} {:?} -> {} introduced_by={:?} class={:?}\n",
+            row.count, row.label, row.to_kind, row.introduced_by, row.traversal_class
+        ));
+    }
+
+    out.push_str("\nTop exact source lines:\n");
+    if report.source_lines.is_empty() {
+        out.push_str("  none\n");
+    } else {
+        for row in report.source_lines.iter().take(16) {
+            out.push_str(&format!(
+                "  {:>5} {} ({})\n",
+                row.count, row.label, row.origin_kind
+            ));
+        }
+    }
+
+    out.push_str("\nTop Sonatina targets:\n");
+    if report.sonatina_targets.is_empty() {
+        out.push_str("  none\n");
+    } else {
+        for row in report.sonatina_targets.iter().take(12) {
+            out.push_str(&format!(
+                "  {:>5} {}\n",
+                row.count,
+                row.target.display_label()
+            ));
+        }
+    }
+
+    out.push_str("\nTop optimized Sonatina targets:\n");
+    if report.optimized_sonatina_targets.is_empty() {
+        out.push_str("  none\n");
+    } else {
+        for row in report.optimized_sonatina_targets.iter().take(12) {
+            out.push_str(&format!(
+                "  {:>5} {}\n",
+                row.count,
+                row.target.display_label()
+            ));
+        }
+    }
+
+    out.push_str("\nTop EVM prepared targets:\n");
+    if report.prepared_targets.is_empty() {
+        out.push_str("  none\n");
+    } else {
+        for row in report.prepared_targets.iter().take(12) {
+            out.push_str(&format!(
+                "  {:>5} {}\n",
+                row.count,
+                row.target.display_label()
+            ));
+        }
+    }
+
+    if !report.missing_lineage_targets.is_empty() {
+        out.push_str("\nPrepared targets missing optimized lineage:\n");
+        for row in report.missing_lineage_targets.iter().take(12) {
+            out.push_str(&format!(
+                "  {:>5} {}\n",
+                row.count,
+                row.target.display_label()
+            ));
+        }
+    }
+
+    if !report.non_exact_lineage_targets.is_empty() {
+        out.push_str("\nPrepared targets with non-exact optimized lineage:\n");
+        for row in report.non_exact_lineage_targets.iter().take(12) {
+            out.push_str(&format!(
+                "  {:>5} {}\n",
+                row.count,
+                row.target.display_label()
+            ));
+        }
+    }
+
+    if !report.lineage_gaps.is_empty() {
+        out.push_str("\nSample optimized->prepared lineage findings:\n");
+        for gap in report.lineage_gaps.iter().take(12) {
+            out.push_str(&format!(
+                "  {} -> {}: {} ({:?})\n",
+                gap.bytecode_pc.display_label(),
+                gap.prepared_origin.display_label(),
+                gap.reason,
+                gap.status
+            ));
+        }
+    }
+
+    if !report.suspicious_edges.is_empty() {
+        out.push_str("\nContextual exact-looking bytecode edges:\n");
+        for edge in report.suspicious_edges.iter().take(12) {
+            out.push_str(&format!(
+                "  {:?} {} -> {} class={:?}: {}\n",
+                edge.label,
+                edge.from.display_label(),
+                edge.to.display_label(),
+                edge.traversal_class,
+                edge.reason
+            ));
+        }
+    }
+    out
+}
+
+fn render_static_analysis_report(report: &StaticAnalysisReport) -> String {
+    let mut out = String::new();
+    out.push_str("Fe dev trace static-analysis\n\n");
+    out.push_str(
+        "Claim: artifact-specific static checks over validated trace evidence; not formal compiler verification.\n",
+    );
+    out.push_str(&format!(
+        "Data source: {}\nCompiler commit: {}\nTarget: {}\nInput: {}\n",
+        report.metadata.data_source,
+        report.metadata.compiler_commit,
+        report.metadata.target,
+        report.metadata.input_path
+    ));
+    out.push_str(&format!(
+        "Optimization: {}\nTrace schema: {}\nQuery pack: {} {}\nRelation schema: {}\n",
+        report
+            .metadata
+            .optimization_level
+            .as_deref()
+            .unwrap_or("unknown"),
+        report.metadata.trace_schema_version,
+        report.metadata.query_pack_id,
+        report.metadata.query_pack_version,
+        report.metadata.relation_schema_version
+    ));
+    out.push_str(&format!(
+        "Confidence: source={:?}, bytecode_attribution={:?}, runtime={:?}\n",
+        report.metadata.source_confidence,
+        report.metadata.bytecode_attribution_confidence,
+        report.metadata.runtime_trace_source
+    ));
+    out.push_str(&format!(
+        "Evidence flags: inferred_boundaries={}, derived_bytecode_blocks={}, runtime_facts={}, posthoc_classification={}\n\n",
+        report.metadata.uses_inferred_boundaries,
+        report.metadata.uses_derived_bytecode_blocks,
+        report.metadata.uses_runtime_facts,
+        report.metadata.uses_posthoc_classification
+    ));
+
+    out.push_str("Checks\n");
+    for check in &report.checks {
+        out.push_str(&format!(
+            "- {}: {:?} ({:?})\n  Policy: {}\n  Summary: {}\n  Witnesses: {}, gaps: {}\n",
+            check.check_id,
+            check.status,
+            check.confidence,
+            check.policy,
+            check.summary,
+            check.witnesses.len(),
+            check.gaps.len()
+        ));
+    }
+
+    if !report.gaps.is_empty() {
+        out.push_str("\nGaps\n");
+        for gap in &report.gaps {
+            out.push_str(&format!(
+                "- {}: {:?}\n  {}\n",
+                gap.id, gap.kind, gap.summary
+            ));
+            if let Some(next_fact) = &gap.suggested_next_fact {
+                out.push_str(&format!("  Suggested next fact: {next_fact}\n"));
+            }
+        }
+    }
+
+    if !report.witnesses.is_empty() {
+        out.push_str("\nWitnesses\n");
+        for witness in &report.witnesses {
+            out.push_str(&format!(
+                "- {}: {:?}\n  {}\n",
+                witness.id, witness.kind, witness.summary
+            ));
+        }
+    }
+
+    out
+}
+
+fn render_variables_at_pc_report(report: &VariablesAtPcReport) -> String {
+    let mut out = String::new();
+    out.push_str("Fe dev trace variables-at-pc\n\n");
+    push_report_header(&mut out, &report.metadata, report.confidence);
+    out.push_str(&format!("PC: {}\n\n", report.pc));
+
+    if report.variables.is_empty() {
+        out.push_str("No variable location ranges cover this PC.\n");
+        return out;
+    }
+
+    out.push_str("Variables in scope:\n");
+    for variable in &report.variables {
+        out.push_str(&format!(
+            "  {:<20} {:<24} {} ({})\n",
+            variable.name, variable.location, variable.reason, variable.confidence
+        ));
+    }
+    out
+}
+
+fn render_runtime_gas_by_source_report(report: &RuntimeGasBySourceReport) -> String {
+    let mut out = String::new();
+    out.push_str("Fe dev trace runtime-gas-by-source\n\n");
+    push_runtime_report_header(
+        &mut out,
+        &report.metadata,
+        report.confidence,
+        &report.runtime,
+    );
+    out.push_str(&format!("Attribution policy: {}\n", report.policy));
+    if let Some(trace_id) = &report.trace_id {
+        out.push_str(&format!("Trace id: {trace_id}\n"));
+    }
+    out.push_str(&format!("Total runtime gas: {}\n", report.total_gas));
+    out.push_str(&format!(
+        "Unattributed runtime steps: {}\n\n",
+        report.unattributed_steps
+    ));
+    push_gas_source_rows(&mut out, &report.rows);
+    out
+}
+
+fn render_storage_writes_by_source_report(report: &StorageWritesBySourceReport) -> String {
+    let mut out = String::new();
+    out.push_str("Fe dev trace storage-writes-by-source\n\n");
+    push_runtime_report_header(
+        &mut out,
+        &report.metadata,
+        report.confidence,
+        &report.runtime,
+    );
+    out.push_str(&format!("Attribution policy: {}\n", report.policy));
+    out.push_str(&format!("Storage writes: {}\n", report.total_writes));
+    out.push_str(&format!(
+        "Step-exclusive gas at write PCs: {}\n\n",
+        report.total_gas
+    ));
+    if report.rows.is_empty() {
+        out.push_str("No runtime storage write facts were present in this trace.\n");
+        return out;
+    }
+    out.push_str("Source contributors:\n");
+    for row in report.rows.iter().take(20) {
+        out.push_str(&format!(
+            "  {:>3} writes  {:>4} gas  {:<8?} {}  slots={}\n",
+            row.writes,
+            row.gas,
+            row.confidence,
+            row.label,
+            row.slots.join(",")
+        ));
+    }
+    out
+}
+
+fn render_storage_accesses_by_slot_report(report: &StorageAccessesBySlotReport) -> String {
+    let mut out = String::new();
+    out.push_str("Fe dev trace storage-accesses-by-slot\n\n");
+    push_runtime_report_header(
+        &mut out,
+        &report.metadata,
+        report.confidence,
+        &report.runtime,
+    );
+    out.push_str(&format!("Attribution policy: {}\n", report.policy));
+    if let Some(slot) = &report.slot_filter {
+        out.push_str(&format!("Slot filter: {slot}\n"));
+    }
+    out.push_str(&format!(
+        "Storage reads: {}  writes: {}\n\n",
+        report.total_reads, report.total_writes
+    ));
+    if report.rows.is_empty() {
+        out.push_str("No runtime storage access facts matched this trace.\n");
+        return out;
+    }
+    out.push_str("Slots:\n");
+    for row in report.rows.iter().take(20) {
+        let sources = row
+            .sources
+            .iter()
+            .map(format_source)
+            .collect::<Vec<_>>()
+            .join("; ");
+        out.push_str(&format!(
+            "  reads={} writes={} gas={} {:<8?} {}",
+            row.reads, row.writes, row.gas, row.confidence, row.slot
+        ));
+        if !sources.is_empty() {
+            out.push_str(&format!("  source={sources}"));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn render_call_cost_by_callsite_report(report: &CallCostByCallsiteReport) -> String {
+    let mut out = String::new();
+    out.push_str("Fe dev trace call-cost-by-callsite\n\n");
+    push_runtime_report_header(
+        &mut out,
+        &report.metadata,
+        report.confidence,
+        &report.runtime,
+    );
+    out.push_str(&format!("Gas policy: {}\n", report.policy));
+    out.push_str(&format!(
+        "Runtime calls: {}  inclusive gas: {}\n\n",
+        report.total_calls, report.total_gas_used
+    ));
+    if report.rows.is_empty() {
+        out.push_str("No runtime call facts were present in this trace.\n");
+        return out;
+    }
+    out.push_str("Callsites:\n");
+    for row in report.rows.iter().take(20) {
+        let source = row
+            .source
+            .as_ref()
+            .map(format_source)
+            .unwrap_or_else(|| "<unmapped>".to_string());
+        out.push_str(&format!(
+            "  gas_used={:?} requested={:?} success={:?} kind={} callee={} {:<8?} {}\n",
+            row.gas_used,
+            row.gas_requested,
+            row.success,
+            row.kind,
+            row.callee.as_deref().unwrap_or("<unknown>"),
+            row.confidence,
+            source
+        ));
+    }
+    out
+}
+
+fn render_memory_growth_by_source_report(report: &MemoryGrowthBySourceReport) -> String {
+    let mut out = String::new();
+    out.push_str("Fe dev trace memory-growth-by-source\n\n");
+    push_runtime_report_header(
+        &mut out,
+        &report.metadata,
+        report.confidence,
+        &report.runtime,
+    );
+    out.push_str(&format!("Attribution policy: {}\n", report.policy));
+    out.push_str(
+        "Growth note: current facts expose observed memory access ranges, not allocator intent.\n",
+    );
+    out.push_str(&format!(
+        "Memory accesses: {}  bytes touched: {}  max end offset: {}\n\n",
+        report.total_accesses, report.total_bytes_touched, report.max_end_offset
+    ));
+    if report.rows.is_empty() {
+        out.push_str("No runtime memory access facts were present in this trace.\n");
+        return out;
+    }
+    out.push_str("Source contributors:\n");
+    for row in report.rows.iter().take(20) {
+        out.push_str(&format!(
+            "  accesses={} bytes={} max_end={} gas={} {:<8?} {}\n",
+            row.accesses, row.bytes_touched, row.max_end_offset, row.gas, row.confidence, row.label
+        ));
+    }
+    out
+}
+
+fn render_revert_attribution_report(report: &RevertAttributionReport) -> String {
+    let mut out = String::new();
+    out.push_str("Fe dev trace revert-attribution\n\n");
+    push_runtime_report_header(
+        &mut out,
+        &report.metadata,
+        report.confidence,
+        &report.runtime,
+    );
+    out.push_str(&format!("Attribution policy: {}\n", report.policy));
+    out.push_str(&format!("Runtime reverts: {}\n\n", report.total_reverts));
+    if report.rows.is_empty() {
+        out.push_str("No runtime revert facts were present in this trace.\n");
+        return out;
+    }
+    out.push_str("Reverts:\n");
+    for row in report.rows.iter().take(20) {
+        let source = row
+            .source
+            .as_ref()
+            .map(format_source)
+            .unwrap_or_else(|| "<unmapped>".to_string());
+        out.push_str(&format!(
+            "  reason={} data={} {:<8?} {}\n",
+            row.reason.as_deref().unwrap_or("<undecoded>"),
+            row.data,
+            row.confidence,
+            source
+        ));
+    }
+    out
+}
+
+fn render_hot_path_by_iteration_report(report: &HotPathByIterationReport) -> String {
+    let mut out = String::new();
+    out.push_str("Fe dev trace hot-path-by-iteration\n\n");
+    push_runtime_report_header(
+        &mut out,
+        &report.metadata,
+        report.confidence,
+        &report.runtime,
+    );
+    out.push_str(&format!("Attribution policy: {}\n", report.policy));
+    out.push_str(&format!("Scope: {}\n", report.scope));
+    out.push_str(&format!(
+        "Runtime steps: {}  gas: {}\n\n",
+        report.total_steps, report.total_gas
+    ));
+    if report.rows.is_empty() {
+        out.push_str("No runtime step facts were present in this trace.\n");
+        return out;
+    }
+    out.push_str("Hot PCs:\n");
+    for row in report.rows.iter().take(20) {
+        let source = row
+            .source
+            .as_ref()
+            .map(format_source)
+            .unwrap_or_else(|| "<unmapped>".to_string());
+        out.push_str(&format!(
+            "  pc={} opcode={} executions={} gas={} {:<8?} {}\n",
+            row.pc, row.opcode, row.executions, row.gas, row.confidence, source
+        ));
+    }
+    out
+}
+
+fn render_value_flow_at_pc_report(report: &ValueFlowAtPcReport) -> String {
+    let mut out = String::new();
+    out.push_str("Fe dev trace value-flow-at-pc\n\n");
+    push_runtime_report_header(
+        &mut out,
+        &report.metadata,
+        report.confidence,
+        &report.runtime,
+    );
+    out.push_str(&format!("PC: {}\n\n", report.pc));
+    if report.rows.is_empty() {
+        out.push_str("No runtime execution steps matched this PC.\n");
+        return out;
+    }
+    out.push_str("Runtime values:\n");
+    for row in report.rows.iter().take(20) {
+        out.push_str(&format!(
+            "  step={} opcode={} gas={} {:<8?}\n",
+            row.step.display_label(),
+            row.opcode,
+            row.gas_cost,
+            row.confidence
+        ));
+        if !row.stack_top.is_empty() {
+            out.push_str(&format!("    stack_top: {}\n", row.stack_top.join(", ")));
+        }
+        for access in &row.storage_accesses {
+            out.push_str(&format!(
+                "    storage {} {} before={:?} after={:?}\n",
+                access.kind, access.location, access.value_before, access.value_after
+            ));
+        }
+        for access in &row.memory_accesses {
+            out.push_str(&format!(
+                "    memory {} {} value={:?}\n",
+                access.kind, access.location, access.value
+            ));
+        }
+    }
+    out
+}
+
+fn push_gas_source_rows(out: &mut String, rows: &[trace_query::GasBySourceRow]) {
+    if rows.is_empty() {
+        out.push_str("No runtime gas rows were present in this trace.\n");
+        return;
+    }
+    out.push_str("Source contributors:\n");
+    for row in rows.iter().take(20) {
+        out.push_str(&format!(
+            "  {:>4} gas  {:>3} steps  {:<8?} {}\n",
+            row.gas, row.instruction_count, row.confidence, row.label
+        ));
+    }
+}
+
+fn push_runtime_report_header(
+    out: &mut String,
+    metadata: &ReportMetadata,
+    confidence: Confidence,
+    runtime: &trace_query::RuntimeEvidenceSummary,
+) {
+    push_report_header(out, metadata, confidence);
+    out.push_str(&format!("Runtime sessions: {}\n", runtime.session_count));
+    out.push_str(&format!(
+        "Runtime source: {}\n",
+        join_or_none(&runtime.runtime_sources)
+    ));
+    out.push_str(&format!(
+        "Runtime value policy: {}\n",
+        join_or_none(&runtime.value_policies)
+    ));
+    out.push_str(&format!(
+        "Join confidence: exact={} pc_only={} ambiguous={} missing={}\n",
+        runtime.exact_join_steps,
+        runtime.pc_only_join_steps,
+        runtime.ambiguous_join_steps,
+        runtime.missing_join_steps
+    ));
+}
+
+fn join_or_none(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join(",")
+    }
+}
+
+fn push_report_header(out: &mut String, metadata: &ReportMetadata, confidence: Confidence) {
+    out.push_str(&format!("Data source: {}\n", metadata.data_source));
+    out.push_str(&format!("Fact basis: {}\n", fact_basis(metadata)));
+    out.push_str(
+        "Report basis: derived read-only view; inferred/posthoc/unavailable details stay labeled.\n",
+    );
+    out.push_str("Trace validation: passed\n");
+    out.push_str(&format!("Target: {}\n", metadata.target));
+    out.push_str(&format!("Input: {}\n", metadata.input_path));
+    out.push_str(&format!("Confidence: {confidence:?}\n"));
+}
+
+fn is_fixture_report(metadata: &ReportMetadata) -> bool {
+    metadata.data_source.starts_with("fixture ")
+}
+
+fn fact_basis(metadata: &ReportMetadata) -> &'static str {
+    fact_basis_from_data_source(&metadata.data_source)
+}
+
+fn fact_basis_from_data_source(data_source: &str) -> &'static str {
+    if data_source.starts_with("fixture ") {
+        "fixture-backed demo facts; not compiler-derived"
+    } else if data_source == "compiler_emitted" {
+        "compiler-emitted base facts"
+    } else {
+        "metadata-declared trace facts"
+    }
+}
+
+fn attribution_route_from_keys<'a>(
+    keys: impl IntoIterator<Item = Option<&'a OriginExportKey>>,
+) -> &'static str {
+    let mut saw_any = false;
+    let mut saw_unmapped = false;
+    let mut saw_whole_file = false;
+    for key in keys {
+        saw_any = true;
+        match key {
+            Some(key) if key.kind() == "code.object" => saw_whole_file = true,
+            Some(_) => {}
+            None => saw_unmapped = true,
+        }
+    }
+    if !saw_any {
+        "unmapped"
+    } else if saw_unmapped {
+        "mixed_with_unmapped"
+    } else if saw_whole_file {
+        "code_object_whole_file_fallback (low confidence)"
+    } else {
+        "direct_source"
+    }
+}
+
+fn resolve_origin_key_argument(
+    snapshot: &TraceSnapshot,
+    value: &str,
+) -> Result<OriginExportKey, String> {
+    let matches = snapshot
+        .facts()
+        .iter()
+        .filter_map(|fact| match fact {
+            trace_facts::TraceFact::OriginNode(node)
+                if node.key.display_label() == value
+                    || node.key.canonical_storage_key() == value =>
+            {
+                Some(node.key.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [key] => Ok(key.clone()),
+        [] => Err(format!("--local-key did not match any origin key: {value}")),
+        _ => Err(format!(
+            "--local-key matched multiple origin keys; use the exact canonical key: {value}"
+        )),
+    }
+}
+
+fn format_source(source: &SourceAttribution) -> String {
+    format!("{} ({})", source.label, source.origin.display_label())
+}
+
+fn parse_gas_policy(policy: &str) -> Result<GasAttributionPolicy, String> {
+    policy
+        .parse()
+        .map_err(|err: trace_query::QueryError| err.to_string())
+}
