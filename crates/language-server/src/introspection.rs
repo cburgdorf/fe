@@ -1044,6 +1044,15 @@ mod tests {
     fn trace_workbench_visible_projection_fingerprint(
         model: &serde_json::Value,
     ) -> serde_json::Value {
+        let indexes = model.get("indexes").unwrap_or(&serde_json::Value::Null);
+        let index_fingerprint = serde_json::json!({
+            "source_lines": indexes.get("source_lines").cloned().unwrap_or(serde_json::Value::Null),
+            "source_intervals": indexes.get("source_intervals").cloned().unwrap_or(serde_json::Value::Null),
+            "pc_intervals": indexes.get("pc_intervals").cloned().unwrap_or(serde_json::Value::Null),
+            "origin_to_rows": indexes.get("origin_to_rows").cloned().unwrap_or(serde_json::Value::Null),
+            "component_to_rows": indexes.get("component_to_rows").cloned().unwrap_or(serde_json::Value::Null),
+            "stable_identities": indexes.get("stable_identities").cloned().unwrap_or(serde_json::Value::Null),
+        });
         serde_json::json!({
             "provenance": model.get("provenance").cloned().unwrap_or(serde_json::Value::Null),
             "parity_summary": model.get("parity_summary").cloned().unwrap_or(serde_json::Value::Null),
@@ -1052,17 +1061,7 @@ mod tests {
                 model.get("source").unwrap_or(&serde_json::Value::Null)
             ),
             "panels": trace_workbench_panel_fingerprints(model),
-            "indexes": {
-                let indexes = model.get("indexes").unwrap_or(&serde_json::Value::Null);
-                serde_json::json!({
-                    "source_lines": indexes.get("source_lines").cloned().unwrap_or(serde_json::Value::Null),
-                    "source_intervals": indexes.get("source_intervals").cloned().unwrap_or(serde_json::Value::Null),
-                    "pc_intervals": indexes.get("pc_intervals").cloned().unwrap_or(serde_json::Value::Null),
-                    "origin_to_rows": indexes.get("origin_to_rows").cloned().unwrap_or(serde_json::Value::Null),
-                    "component_to_rows": indexes.get("component_to_rows").cloned().unwrap_or(serde_json::Value::Null),
-                    "stable_identities": indexes.get("stable_identities").cloned().unwrap_or(serde_json::Value::Null),
-                })
-            },
+            "indexes": index_fingerprint,
             "notes": model.get("notes").cloned().unwrap_or(serde_json::Value::Null),
         })
     }
