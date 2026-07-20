@@ -2257,6 +2257,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fe-introspection-config"
+version = "26.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "fe-language-server"
 version = "26.2.0"
 dependencies = [
