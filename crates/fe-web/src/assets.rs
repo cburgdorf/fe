@@ -29,6 +29,9 @@ pub const FE_DOC_NAV_JS: &str = include_str!("../assets/fe-doc-nav.js");
 /// `<fe-doc-viewer>` custom element.
 pub const FE_DOC_VIEWER_JS: &str = include_str!("../assets/fe-doc-viewer.js");
 
+/// `<fe-origin-trace>` custom element.
+pub const FE_ORIGIN_TRACE_JS: &str = include_str!("../assets/fe-origin-trace.js");
+
 /// Standalone syntax highlighting CSS (hardcoded colors, no CSS variables).
 /// For embedding in Starlight/Astro or any external site.
 pub const FE_HIGHLIGHT_CSS: &str = include_str!("../assets/fe-highlight.css");
@@ -154,7 +157,7 @@ pub fn html_shell_full(
 
     format!(
         r#"<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -195,6 +198,344 @@ pub fn html_shell_full(
         search_js = FE_SEARCH_JS,
         doc_nav_js = FE_DOC_NAV_JS,
         doc_viewer_js = FE_DOC_VIEWER_JS,
+    )
+}
+
+/// Generate a standalone HTML shell for the origin trace web component.
+///
+/// The trace view JSON is inlined so the page works from `file://` and from
+/// the existing static HTTP server without a separate bundling step.
+pub fn origin_trace_html_shell(title: &str, trace_view_json: &str) -> String {
+    let safe_title = escape_html_text(title);
+    let safe_json = escape_script_content(trace_view_json);
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{title}</title>
+  <style>{css}</style>
+  <style>
+    html, body {{ margin: 0; min-height: 100%; background: var(--bg); }}
+  </style>
+  <style>{highlight_css}</style>
+</head>
+<body>
+  <script>window.FE_ORIGIN_TRACE_DATA = {json};</script>
+  <script>{origin_trace_js}</script>
+  <fe-origin-trace></fe-origin-trace>
+</body>
+</html>"#,
+        title = safe_title,
+        css = STYLES_CSS,
+        highlight_css = FE_HIGHLIGHT_CSS,
+        json = safe_json,
+        origin_trace_js = FE_ORIGIN_TRACE_JS,
+    )
+}
+
+/// Generate an HTTP-backed shell for the live trace workbench.
+///
+/// The browser fetches the current session model from the local LSP HTTP server.
+/// The token is read from the URL fragment and is not embedded into the HTML.
+pub fn origin_trace_live_html_shell(title: &str) -> String {
+    let safe_title = escape_html_text(title);
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{title}</title>
+  <style>{css}</style>
+  <style>
+    html, body {{ margin: 0; min-height: 100%; background: var(--bg); }}
+    .trace-live-loading {{ color: #cdd6f4; font: 13px/1.4 ui-sans-serif, system-ui, sans-serif; padding: 18px; }}
+  </style>
+  <style>{highlight_css}</style>
+</head>
+<body>
+  <div class="trace-live-loading">Loading Fe trace workbench...</div>
+  <script>{origin_trace_js}</script>
+  <script>
+  (function () {{
+    var params = new URLSearchParams(window.location.search || "");
+    var hash = new URLSearchParams((window.location.hash || "").replace(/^#/, ""));
+    var session = params.get("session");
+    var token = hash.get("token") || params.get("token") || "";
+    var loading = document.querySelector(".trace-live-loading");
+    var authHeaders = token ? {{ "Authorization": "Bearer " + token }} : {{}};
+    var storageKey = "fe.trace.workbench.lastReady." + (session || "");
+    var modelRefresh = null;
+    var manifestCache = null;
+    var revisionHistoryCache = null;
+    function cleanTraceAuthFromUrl() {{
+      var nextParams = new URLSearchParams(window.location.search || "");
+      var nextHash = new URLSearchParams((window.location.hash || "").replace(/^#/, ""));
+      var changed = false;
+      if (nextParams.has("token")) {{
+        nextParams.delete("token");
+        changed = true;
+      }}
+      if (nextHash.has("token")) {{
+        nextHash.delete("token");
+        changed = true;
+      }}
+      if (!changed || !window.history || !window.history.replaceState) return;
+      var next = window.location.pathname
+        + (nextParams.toString() ? "?" + nextParams.toString() : "")
+        + (nextHash.toString() ? String.fromCharCode(35) + nextHash.toString() : "");
+      window.history.replaceState(null, "", next);
+    }}
+    cleanTraceAuthFromUrl();
+    function fail(message) {{
+      if (loading) loading.textContent = message;
+      console.error("[fe trace workbench]", message);
+    }}
+    function renderModel(model, staleMessage) {{
+      model = model || {{}};
+      if (staleMessage) {{
+        model = Object.assign({{}}, model);
+        model.revision = Object.assign({{}}, model.revision || {{}}, {{ status: "stale_but_usable" }});
+        model.notes = (model.notes || []).concat([staleMessage]);
+      }}
+      window.FE_ORIGIN_TRACE_DATA = model;
+      window.FE_TRACE_WORKBENCH_REVISION = model && model.revision && model.revision.id || 0;
+      if (loading) loading.remove();
+      var existing = document.querySelector("fe-origin-trace");
+      if (existing && typeof existing.setTraceData === "function") {{
+        existing.setTraceData(model);
+      }} else {{
+        if (existing) existing.remove();
+        document.body.appendChild(document.createElement("fe-origin-trace"));
+      }}
+    }}
+    function rememberModel(model) {{
+      try {{
+        window.sessionStorage && window.sessionStorage.setItem(storageKey, JSON.stringify(model));
+      }} catch (_) {{}}
+    }}
+    function renderCachedModel(reason) {{
+      try {{
+      var cached = window.sessionStorage && window.sessionStorage.getItem(storageKey);
+      if (!cached) return false;
+      renderModel(JSON.parse(cached), "Showing last ready trace revision because live refresh failed: " + reason);
+      return true;
+      }} catch (_) {{
+        return false;
+      }}
+    }}
+    function fetchJson(path) {{
+      return fetch(path, {{ headers: authHeaders }}).then(function (response) {{
+        if (!response.ok) throw new Error(path + " fetch failed: " + response.status);
+        return response.json();
+      }});
+    }}
+    function fetchChunk(digest) {{
+      return fetchJson("/trace/session/" + encodeURIComponent(session) + "/chunk/" + encodeURIComponent(digest));
+    }}
+    function fetchChunks(digests) {{
+      return fetch("/trace/session/" + encodeURIComponent(session) + "/chunks/missing", {{
+        method: "POST",
+        headers: Object.assign({{ "Content-Type": "application/json" }}, authHeaders),
+        body: JSON.stringify({{ digests: digests }})
+      }}).then(function (response) {{
+        if (!response.ok) throw new Error("chunk batch fetch failed: " + response.status);
+        return response.json();
+      }});
+    }}
+    function refreshRevisionHistory() {{
+      if (!session) return Promise.resolve(null);
+      return fetchJson("/trace/session/" + encodeURIComponent(session) + "/revisions")
+        .then(function (history) {{
+          revisionHistoryCache = history;
+          window.FE_TRACE_WORKBENCH_REVISIONS = history;
+          return history;
+        }}, function () {{
+          return revisionHistoryCache;
+        }});
+    }}
+    function applyChunkedManifest(manifest) {{
+      var previous = manifestCache;
+      var current = window.FE_ORIGIN_TRACE_DATA || {{}};
+      window.FE_TRACE_WORKBENCH_MODEL_DIGEST = (manifest && manifest.root_digest) || "";
+      if (!previous || !current || !current.revision) {{
+        manifestCache = manifest;
+        return fetchJson("/trace/session/" + encodeURIComponent(session) + "/model");
+      }}
+      if (manifest.root_digest && previous.root_digest === manifest.root_digest) {{
+        return Promise.resolve(current);
+      }}
+      var next = Object.assign({{}}, current);
+      var requests = [];
+      function useChunk(digest, previousDigest, apply) {{
+        if (!digest || digest === previousDigest) return;
+        requests.push({{ digest: digest, apply: apply }});
+      }}
+      useChunk(manifest.summary_digest, previous.summary_digest, function (value) {{
+        value = value || {{}};
+        ["revision", "metadata", "provenance", "counts", "salsa", "bytecode_count", "selection_remap", "notes"].forEach(function (key) {{
+          if (Object.prototype.hasOwnProperty.call(value, key)) next[key] = value[key];
+        }});
+      }});
+      useChunk(manifest.source_digest, previous.source_digest, function (value) {{
+        next.source = value;
+      }});
+      useChunk(manifest.indexes_digest, previous.indexes_digest, function (value) {{
+        next.indexes = value;
+      }});
+      useChunk(manifest.rail_components_digest, previous.rail_components_digest, function (value) {{
+        next.rail_components = value;
+      }});
+      var previousPanes = previous.panes || {{}};
+      var nextPanes = Object.assign({{}}, manifest.panes || {{}});
+      var paneById = Object.create(null);
+      (current.panels || []).forEach(function (pane) {{
+        if (pane && pane.id) paneById[pane.id] = pane;
+      }});
+      Object.keys(nextPanes).forEach(function (id) {{
+        useChunk(nextPanes[id], previousPanes[id], function (value) {{
+          paneById[id] = value;
+        }});
+      }});
+      var previousReports = previous.reports || {{}};
+      var nextReports = manifest.reports || {{}};
+      var reportKeys = {{
+        attribution: "attribution_audit",
+        static_analysis: "static_analysis",
+        closure_audit: "audit",
+        duplicate_shapes: "duplicate_shapes"
+      }};
+      Object.keys(reportKeys).forEach(function (id) {{
+        useChunk(nextReports[id], previousReports[id], function (value) {{
+          next[reportKeys[id]] = value;
+        }});
+      }});
+      var chunkPromise = requests.length
+        ? fetchChunks(requests.map(function (request) {{ return request.digest; }})).then(function (response) {{
+            var chunksByDigest = Object.create(null);
+            (response.chunks || []).forEach(function (chunk) {{
+              if (chunk && chunk.digest) chunksByDigest[chunk.digest] = chunk;
+            }});
+            if ((response.missing || []).length) throw new Error("missing trace chunks: " + response.missing.join(","));
+            requests.forEach(function (request) {{
+              var chunk = chunksByDigest[request.digest];
+              if (!chunk || chunk.digest !== request.digest) throw new Error("chunk digest mismatch");
+              request.apply(chunk.value);
+            }});
+          }})
+        : Promise.resolve();
+      return chunkPromise.then(function () {{
+        next.panels = Object.keys(nextPanes).map(function (id) {{
+          return paneById[id];
+        }}).filter(Boolean);
+        manifestCache = manifest;
+        return next;
+      }});
+    }}
+    function applyInitialSelection(bootstrap) {{
+      var selection = bootstrap
+        && bootstrap.session
+        && bootstrap.session.initialSelection;
+      if (!selection) return;
+      var current = new URLSearchParams((window.location.hash || "").replace(/^#/, ""));
+      if (current.get("node") || current.get("source") || current.get("row")) return;
+      current.set("source", "main:" + (Number(selection.startLine || 0) + 1));
+      var nextHash = String.fromCharCode(35) + current.toString();
+      if (window.history && window.history.replaceState) {{
+        window.history.replaceState(null, "", nextHash);
+      }} else {{
+        window.location.hash = nextHash;
+      }}
+    }}
+    function pinResolvedRow(rowId) {{
+      if (!rowId) return;
+      var current = new URLSearchParams((window.location.hash || "").replace(/^#/, ""));
+      current.delete("node");
+      current.delete("source");
+      current.set("row", rowId);
+      window.location.hash = current.toString();
+    }}
+    function fetchAndRenderModel() {{
+      if (modelRefresh) return modelRefresh;
+      modelRefresh = fetchJson("/trace/session/" + encodeURIComponent(session) + "/manifest")
+        .then(function (manifest) {{
+          return applyChunkedManifest(manifest);
+        }})
+        .catch(function () {{
+          return fetchJson("/trace/session/" + encodeURIComponent(session) + "/model")
+            .then(function (model) {{
+              return fetchJson("/trace/session/" + encodeURIComponent(session) + "/manifest")
+                .then(function (manifest) {{
+                  manifestCache = manifest;
+                  return model;
+                }}, function () {{
+                  manifestCache = null;
+                  return model;
+                }});
+            }});
+        }})
+        .then(function (model) {{
+          rememberModel(model);
+          renderModel(model);
+          refreshRevisionHistory();
+          return model;
+        }})
+        .finally(function () {{
+          modelRefresh = null;
+        }});
+      return modelRefresh;
+    }}
+    if (!session) return fail("Missing trace workbench session.");
+    fetch("/trace/session/" + encodeURIComponent(session) + "/bootstrap", {{ headers: authHeaders }})
+      .then(function (response) {{
+        if (!response.ok) throw new Error("bootstrap fetch failed: " + response.status);
+        return response.json();
+      }})
+      .then(function (bootstrap) {{
+        applyInitialSelection(bootstrap);
+        return fetchAndRenderModel();
+      }})
+      .catch(function (err) {{
+        var reason = String(err && err.message || err);
+        if (!renderCachedModel(reason)) fail(reason);
+      }});
+    if (window.EventSource && token) {{
+      var events = new EventSource("/trace/session/" + encodeURIComponent(session) + "/events?token=" + encodeURIComponent(token));
+      events.addEventListener("trace/revision", function (event) {{
+        try {{
+          var payload = JSON.parse(event.data || "{{}}");
+          var revisionChanged = payload.revision && Number(payload.revision) !== Number(window.FE_TRACE_WORKBENCH_REVISION || 0);
+          var digestChanged = payload.modelDigest && payload.modelDigest !== window.FE_TRACE_WORKBENCH_MODEL_DIGEST;
+          var refreshableStatus = payload.status === "ready"
+            || payload.status === "stale_but_usable"
+            || payload.status === "pending";
+          if (refreshableStatus && (revisionChanged || digestChanged)) {{
+            fetchAndRenderModel().catch(function (err) {{
+              var reason = String(err && err.message || err);
+              renderCachedModel(reason);
+            }});
+          }}
+        }} catch (_) {{}}
+      }});
+      events.addEventListener("trace/selection", function (event) {{
+        try {{
+          var payload = JSON.parse(event.data || "{{}}");
+          if (payload.sessionId && payload.sessionId !== session) return;
+          var rows = payload.resolvedRows || [];
+          if (rows.length) pinResolvedRow(rows[0]);
+        }} catch (_) {{}}
+      }});
+    }}
+  }})();
+  </script>
+</body>
+</html>"#,
+        title = safe_title,
+        css = STYLES_CSS,
+        highlight_css = FE_HIGHLIGHT_CSS,
+        origin_trace_js = FE_ORIGIN_TRACE_JS,
     )
 }
 
@@ -444,6 +785,235 @@ mod tests {
         let without = html_shell("Test", json);
         let with_none = html_shell_with_scip("Test", json, None);
         assert_eq!(without, with_none);
+    }
+
+    #[test]
+    fn live_trace_shell_fetches_manifest_and_chunks() {
+        let html = origin_trace_live_html_shell("Trace");
+
+        assert!(html.contains("/trace/session/"));
+        assert!(html.contains("/manifest"));
+        assert!(html.contains("/chunk/"));
+        assert!(html.contains("/chunks/missing"));
+        assert!(html.contains("/revisions"));
+        assert!(html.contains("applyChunkedManifest"));
+        assert!(html.contains("manifestCache"));
+        assert!(html.contains("FE_TRACE_WORKBENCH_MODEL_DIGEST"));
+        assert!(html.contains("modelDigest"));
+        assert!(html.contains("FE_TRACE_WORKBENCH_REVISIONS"));
+        assert!(html.contains("trace/selection"));
+        assert!(html.contains("resolvedRows"));
+        assert!(html.contains("refreshableStatus"));
+        assert!(html.contains("stale_but_usable"));
+        assert!(html.contains("pending"));
+        assert!(html.contains("selection_remap"));
+    }
+
+    #[test]
+    fn live_trace_shell_cleans_auth_token_from_visible_url() {
+        let html = origin_trace_live_html_shell("Trace");
+
+        assert!(html.contains("function cleanTraceAuthFromUrl()"));
+        assert!(html.contains("nextParams.delete(\"token\")"));
+        assert!(html.contains("nextHash.delete(\"token\")"));
+        assert!(html.contains("window.history.replaceState(null, \"\", next)"));
+        assert!(
+            !html.contains("current.set(\"token\", token)"),
+            "hash navigation must not reinsert the auth token after it has been read"
+        );
+        assert!(
+            html.contains("/events?token="),
+            "native EventSource still needs a query token because it cannot set Authorization headers"
+        );
+    }
+
+    #[test]
+    fn origin_trace_default_badges_use_product_language() {
+        assert!(!FE_ORIGIN_TRACE_JS.contains("label: \"compiler-generated\""));
+        assert!(!FE_ORIGIN_TRACE_JS.contains("label: \"needs evidence\""));
+        assert!(!FE_ORIGIN_TRACE_JS.contains("box.append(this._railLegend());"));
+        assert!(!FE_ORIGIN_TRACE_JS.contains(
+            "indexOf(\"exact-c-\") === 0; })) return { kind: \"ok\", label: \"exact\" }"
+        ));
+        assert!(FE_ORIGIN_TRACE_JS.contains("if (kind === \"exact\") return null;"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("if (kind === \"source_exact\")"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("suppressExact"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("suppressExact: true"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("_explicitInteractionGroups(groups)"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("Array.isArray(groups) ? groups : []"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("this._explicitInteractionGroups(line.hover_groups)"));
+        assert!(
+            FE_ORIGIN_TRACE_JS.contains("this._explicitInteractionGroups(rowData.hover_groups)")
+        );
+        assert!(FE_ORIGIN_TRACE_JS.contains("dataset.hoverGroups"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("dataset.selectionGroups"));
+        assert!(
+            FE_ORIGIN_TRACE_JS
+                .contains("Object.prototype.hasOwnProperty.call(node.dataset, datasetKey)")
+        );
+        assert!(FE_ORIGIN_TRACE_JS.contains("node.dataset.hoverGroups = hover.join(\" \");"));
+        assert!(
+            FE_ORIGIN_TRACE_JS.contains("node.dataset.selectionGroups = selection.join(\" \");")
+        );
+        assert!(FE_ORIGIN_TRACE_JS.contains("node.classList.contains(\"trace-region\")"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("hoverClasses(row)"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("selectionClasses(row)"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("var groups = selectionClasses(row);"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("projection_timings"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("projection ms"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("fallbackScopedTraceClasses"));
+        assert!(!FE_ORIGIN_TRACE_JS.contains("node[cacheKey] = traceClasses(node);"));
+        assert!(!FE_ORIGIN_TRACE_JS.contains("_expandSelectionGroups"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("return exact.concat(generated, prepared);"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("return \"evm-vcode\""));
+        assert!(
+            !FE_ORIGIN_TRACE_JS
+                .contains("_displayStatus(entries, this._railStatus(displayClasses)")
+        );
+        assert!(!FE_ORIGIN_TRACE_JS.contains("label: \"exact link\""));
+        assert!(!FE_ORIGIN_TRACE_JS.contains("satisfied_exact: \"exact\""));
+        assert!(FE_ORIGIN_TRACE_JS.contains("satisfied_exact: \"satisfied\""));
+        assert!(!FE_ORIGIN_TRACE_JS.contains("MIR-only"));
+        assert!(!FE_ORIGIN_TRACE_JS.contains("preopt-only"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("missing downstream"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("missing_source_evidence"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("missing source"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("missing_source_evidence_pcs"));
+        assert!(!FE_ORIGIN_TRACE_JS.contains("rail-legend"));
+        assert!(!FE_ORIGIN_TRACE_JS.contains("legend-chip"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("label: \"generated\""));
+        assert!(FE_ORIGIN_TRACE_JS.contains("label: \"unmapped\""));
+        assert!(FE_ORIGIN_TRACE_JS.contains("No row selected."));
+        assert!(FE_ORIGIN_TRACE_JS.contains("Selected row"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("Missing Link Audit"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("Boundary status"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("linked phases, generated work, and gaps"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("_componentReachedSummary"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("Rail component reaches"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("exact phase link"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("linked regions"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("need compiler evidence"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("_friendlyCheckSummary"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("optimizer-explained"));
+        assert!(
+            FE_ORIGIN_TRACE_JS
+                .contains("Optimized-away code should be marked by explicit optimizer events.")
+        );
+        assert!(!FE_ORIGIN_TRACE_JS.contains("inspect evidence paths"));
+    }
+
+    #[test]
+    fn origin_trace_renders_missing_link_context_from_report() {
+        assert!(FE_ORIGIN_TRACE_JS.contains("_appendMissingLinkClusterContext"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("affected_source_ranges"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("affected_bytecode_ranges"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("Where this shows up"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("_sourceRangeText"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("_bytecodeRangeText"));
+    }
+
+    #[test]
+    fn origin_trace_uses_typed_boundary_rows_without_duplicate_markers() {
+        assert!(FE_ORIGIN_TRACE_JS.contains("if (this._isBoundaryKind(kind)) return null;"));
+        assert!(!FE_ORIGIN_TRACE_JS.contains("_typedBoundaryLabel"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("row-kind-"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("boundary-row"));
+    }
+
+    #[test]
+    fn origin_trace_pane_switches_do_not_rerun_hash_navigation() {
+        assert!(FE_ORIGIN_TRACE_JS.contains("hashNavigation: false"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("hashNavigation: true"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("allowHashNavigation"));
+    }
+
+    #[test]
+    fn origin_trace_bloat_rows_render_attribution_split() {
+        assert!(FE_ORIGIN_TRACE_JS.contains("_bloatSplitText"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("bloatBox.append(row);\n        }, this);"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("source-exact"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("prepared-only"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("generated/backend"));
+    }
+
+    #[test]
+    fn origin_trace_renders_duplicate_shape_report() {
+        assert!(FE_ORIGIN_TRACE_JS.contains("_duplicateShapes"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("Duplicate Shapes"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("not provenance"));
+        assert!(origin_trace_live_html_shell("Trace").contains("duplicate_shapes"));
+    }
+
+    #[test]
+    fn origin_trace_shell_keeps_scroll_pane_local() {
+        assert!(FE_ORIGIN_TRACE_JS.contains("height:100vh"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("overflow:hidden"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("overscroll-behavior:contain"));
+        assert!(FE_ORIGIN_TRACE_JS.contains(".bottom-deck::-webkit-scrollbar"));
+    }
+
+    #[test]
+    fn origin_trace_keeps_trace_notes_from_crowding_selection_details() {
+        assert!(FE_ORIGIN_TRACE_JS.contains("_traceNotes"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("Trace assumptions"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("trace-notes"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("flex:0 0 clamp(260px,38vh,520px)"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("flex:1 1 auto; min-height:220px"));
+        assert!(!FE_ORIGIN_TRACE_JS.contains("page.append(notes);"));
+    }
+
+    #[test]
+    fn origin_trace_scroll_uses_pane_offsets_and_visibility_correction() {
+        assert!(FE_ORIGIN_TRACE_JS.contains("_rowScrollTop"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("_offsetTopWithin"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("_clampScrollTop"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("scroller.scrollTo"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("behavior: behavior"));
+    }
+
+    #[test]
+    fn origin_trace_jump_controls_are_selection_scoped() {
+        assert!(FE_ORIGIN_TRACE_JS.contains("activeRunKey"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("_selectRow"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("_selectGroups"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("_clearSelection"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("_revealSelectionInShell"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("_setActiveRunForRow"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("_runIndexNearestViewport"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("_bestRunIndexForSelection"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("_runGroupScore"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("_runScanNodes"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("source-section-separator"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("_markerTarget"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("preferSectionBoundary: false"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("_withBoundaryPreference(options, false)"));
+    }
+
+    #[test]
+    fn origin_trace_preserves_selection_by_stable_identity() {
+        assert!(FE_ORIGIN_TRACE_JS.contains("stableIdentityToken"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("dataset.stableIdentities"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("_restoreSelectionByStableIdentity"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("[data-stable-identities~="));
+    }
+
+    #[test]
+    fn origin_trace_suppresses_broad_source_span_badges() {
+        assert!(FE_ORIGIN_TRACE_JS.contains("suppress_rail_status"));
+        assert!(FE_ORIGIN_TRACE_JS.contains(
+            "if (!rowStatus && rowOrClasses && rowOrClasses.suppress_rail_status) return wrap;"
+        ));
+        assert!(FE_ORIGIN_TRACE_JS.contains("if (!Array.isArray(rowOrClasses))"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("if (!rowStatus) return wrap;"));
+    }
+
+    #[test]
+    fn origin_trace_shows_live_revision_state_banner() {
+        assert!(FE_ORIGIN_TRACE_JS.contains("_revisionBanner"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("Trace update pending"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("Showing last ready trace"));
+        assert!(FE_ORIGIN_TRACE_JS.contains("Trace update failed"));
+        assert!(FE_ORIGIN_TRACE_JS.contains(".revision-banner"));
     }
 
     #[test]
