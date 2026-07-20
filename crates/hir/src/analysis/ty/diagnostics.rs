@@ -170,6 +170,8 @@ pub enum TyLowerDiag<'db> {
     ConstEvalNegativeExponent(DynLazySpan<'db>),
     ConstEvalStepLimitExceeded(DynLazySpan<'db>),
     ConstEvalRecursionLimitExceeded(DynLazySpan<'db>),
+    ConstEvalRecursiveConst(DynLazySpan<'db>),
+    TypeLoweringCycle(DynLazySpan<'db>),
 
     NonTrailingDefaultGenericParam(LazyGenericParamSpan<'db>),
 
@@ -177,6 +179,41 @@ pub enum TyLowerDiag<'db> {
     GenericDefaultForwardRef {
         span: LazyGenericParamSpan<'db>,
         name: IdentId<'db>,
+    },
+
+    /// A contract field's layout hole (`_`) instantiates the slot parameter of a
+    /// `core::effect_ref::StaticSlot` type whose `const SPACE` does not evaluate
+    /// to a concrete `AddressSpace`, so the slot cannot be assigned from a known
+    /// address-space counter (a silent fallback would risk a cross-space slot
+    /// collision).
+    StaticSlotSpaceUnresolved {
+        span: DynLazySpan<'db>,
+        ty: TyId<'db>,
+    },
+
+    /// A contract field carries an unresolved const hole (`_`) whose type is not
+    /// a storage-slot index (e.g. a defaulted `const SP: AddressSpace = _`).
+    /// Contract layout only assigns slots to slot-index const holes; any other
+    /// unresolved const would be numbered as a bogus slot.
+    ContractFieldNonSlotConstHole {
+        span: DynLazySpan<'db>,
+        ty: TyId<'db>,
+    },
+
+    /// A contract field is a selected `EffectHandle` whose `const SPACE` did not
+    /// resolve to a concrete `AddressSpace`, so the field's storage space is
+    /// unknown (a silent fallback would mis-place the field).
+    ContractFieldHandleSpaceUnresolved {
+        span: DynLazySpan<'db>,
+        ty: TyId<'db>,
+    },
+
+    /// A contract field uses an explicit `_` const argument (e.g. `String<_>`).
+    /// Storage-slot layout holes must be declared by the type author via a `= _`
+    /// parameter default, not requested with an explicit `_` at the use site.
+    ContractFieldExplicitConstHole {
+        span: DynLazySpan<'db>,
+        ty: TyId<'db>,
     },
 }
 
@@ -209,6 +246,8 @@ impl TyLowerDiag<'_> {
             Self::ConstEvalNegativeExponent(_) => 35,
             Self::ConstEvalStepLimitExceeded(_) => 26,
             Self::ConstEvalRecursionLimitExceeded(_) => 27,
+            Self::ConstEvalRecursiveConst(_) => 37,
+            Self::TypeLoweringCycle(_) => 38,
             Self::MixedRefSelfPrefixWithExplicitType { .. } => 28,
             Self::MixedOwnSelfPrefixWithExplicitType { .. } => 29,
             Self::InvalidMutSelfPrefixWithExplicitType { .. } => 30,
@@ -219,6 +258,10 @@ impl TyLowerDiag<'_> {
             Self::DuplicateGenericParamName(..) => 19,
             Self::NonTrailingDefaultGenericParam(_) => 21,
             Self::GenericDefaultForwardRef { .. } => 22,
+            Self::StaticSlotSpaceUnresolved { .. } => 39,
+            Self::ContractFieldNonSlotConstHole { .. } => 40,
+            Self::ContractFieldHandleSpaceUnresolved { .. } => 41,
+            Self::ContractFieldExplicitConstHole { .. } => 42,
         }
     }
 }
@@ -493,11 +536,32 @@ pub enum BodyDiag<'db> {
         ty: TyId<'db>,
     },
 
+    ArrayIndexOutOfBounds {
+        primary: DynLazySpan<'db>,
+        index: usize,
+        len: usize,
+    },
+
     NonAssignableExpr(DynLazySpan<'db>),
 
     ImmutableAssignment {
         primary: DynLazySpan<'db>,
         binding: Option<(IdentId<'db>, DynLazySpan<'db>)>,
+    },
+
+    ImmutableContractFieldNotInitialized {
+        primary: DynLazySpan<'db>,
+        field: IdentId<'db>,
+        init: Option<DynLazySpan<'db>>,
+    },
+    UnsupportedMemoryContractField {
+        primary: DynLazySpan<'db>,
+        field: IdentId<'db>,
+    },
+    ImmutableContractFieldMutBinding {
+        primary: DynLazySpan<'db>,
+        field: IdentId<'db>,
+        field_span: DynLazySpan<'db>,
     },
 
     LoopControlOutsideOfLoop {
@@ -814,8 +878,12 @@ impl<'db> BodyDiag<'db> {
             Self::OwnArgMustBeOwnedMove { .. } => 72,
             Self::MutableBindingCannotBeCapability { .. } => 73,
             Self::ArrayRepeatRequiresCopy { .. } => 71,
+            Self::ArrayIndexOutOfBounds { .. } => 84,
             Self::NonAssignableExpr(..) => 17,
             Self::ImmutableAssignment { .. } => 18,
+            Self::ImmutableContractFieldNotInitialized { .. } => 86,
+            Self::UnsupportedMemoryContractField { .. } => 84,
+            Self::ImmutableContractFieldMutBinding { .. } => 85,
             Self::LoopControlOutsideOfLoop { .. } => 19,
             Self::TraitNotImplemented { .. } => 20,
             Self::NotCallable(..) => 21,
@@ -1022,6 +1090,42 @@ pub enum ImplDiag<'db> {
         const_name: IdentId<'db>,
         trait_: Trait<'db>,
     },
+
+    ConstTyMismatchWithTrait {
+        primary: DynLazySpan<'db>,
+        trait_decl_span: DynLazySpan<'db>,
+        const_name: IdentId<'db>,
+        trait_ty: TyId<'db>,
+        impl_ty: TyId<'db>,
+    },
+
+    RecursiveAssocConst {
+        primary: DynLazySpan<'db>,
+        const_name: IdentId<'db>,
+    },
+
+    InherentConstMissingValue {
+        primary: DynLazySpan<'db>,
+        const_name: IdentId<'db>,
+    },
+
+    InherentConstConflict {
+        primary: DynLazySpan<'db>,
+        conflict_with: DynLazySpan<'db>,
+        const_name: IdentId<'db>,
+    },
+
+    InherentConstShadowsVariant {
+        primary: DynLazySpan<'db>,
+        variant_span: DynLazySpan<'db>,
+        const_name: IdentId<'db>,
+    },
+
+    InherentConstShadowsFn {
+        primary: DynLazySpan<'db>,
+        fn_span: DynLazySpan<'db>,
+        const_name: IdentId<'db>,
+    },
 }
 
 impl ImplDiag<'_> {
@@ -1043,6 +1147,12 @@ impl ImplDiag<'_> {
             Self::MissingAssociatedConstValue { .. } => 13,
             Self::ConstNotDefinedInTrait { .. } => 14,
             Self::MissingAssociatedConst { .. } => 15,
+            Self::ConstTyMismatchWithTrait { .. } => 16,
+            Self::RecursiveAssocConst { .. } => 17,
+            Self::InherentConstMissingValue { .. } => 18,
+            Self::InherentConstConflict { .. } => 19,
+            Self::InherentConstShadowsVariant { .. } => 20,
+            Self::InherentConstShadowsFn { .. } => 21,
         }
     }
 }

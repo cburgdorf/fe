@@ -235,6 +235,10 @@ where
             let assoc = assoc.fold_with(db, folder);
             ConstExprId::new(db, ConstExpr::TraitConst(assoc))
         }
+        ConstExpr::InherentConst(use_) => {
+            let use_ = use_.fold_with(db, folder);
+            ConstExprId::new(db, ConstExpr::InherentConst(use_))
+        }
         ConstExpr::LocalBinding(binding) => ConstExprId::new(db, ConstExpr::LocalBinding(*binding)),
     }
 }
@@ -470,6 +474,42 @@ impl<'db> TyFoldable<'db> for ResolvedEffectArg<'db> {
     }
 }
 
+/// Returns true if `needle` occurs anywhere within `haystack`.
+fn ty_contains<'db>(db: &'db dyn HirAnalysisDb, haystack: TyId<'db>, needle: TyId<'db>) -> bool {
+    use super::visitor::{TyVisitor, walk_ty};
+
+    struct ContainsVisitor<'db> {
+        db: &'db dyn HirAnalysisDb,
+        needle: TyId<'db>,
+        found: bool,
+    }
+
+    impl<'db> TyVisitor<'db> for ContainsVisitor<'db> {
+        fn db(&self) -> &'db dyn HirAnalysisDb {
+            self.db
+        }
+
+        fn visit_ty(&mut self, ty: TyId<'db>) {
+            if self.found {
+                return;
+            }
+            if ty == self.needle {
+                self.found = true;
+                return;
+            }
+            walk_ty(self, ty);
+        }
+    }
+
+    let mut visitor = ContainsVisitor {
+        db,
+        needle,
+        found: false,
+    };
+    haystack.visit_with(&mut visitor);
+    visitor.found
+}
+
 /// A type folder that substitutes associated types based on a trait instance's bindings
 pub struct AssocTySubst<'db> {
     trait_inst: TraitInstId<'db>,
@@ -499,6 +539,14 @@ impl<'db> TyFolder<'db> for AssocTySubst<'db> {
                         if self_ty == ty {
                             return ty;
                         }
+                        // Occurs check: when the replacement itself contains this `Self`
+                        // param (e.g. the instance's self type is a projection rooted at
+                        // `Self`, as in a `Self::Item: Trait` assumption), re-folding it
+                        // would substitute forever. The replacement is already expressed
+                        // in the outer context, so return it as-is.
+                        if ty_contains(db, self_ty, ty) {
+                            return self_ty;
+                        }
                         return self_ty.fold_with(db, self);
                     }
                 }
@@ -509,7 +557,9 @@ impl<'db> TyFolder<'db> for AssocTySubst<'db> {
                 let folded_trait = assoc_ty.trait_.fold_with(db, self);
 
                 // Check if this associated type belongs to our trait instance
-                if assoc_ty.trait_.def(db) == self.trait_inst.def(db) {
+                if folded_trait.def(db) == self.trait_inst.def(db)
+                    && folded_trait.args(db) == self.trait_inst.args(db)
+                {
                     // Check if we have a binding for this associated type
                     if let Some(&bound_ty) =
                         self.trait_inst.assoc_type_bindings(db).get(&assoc_ty.name)

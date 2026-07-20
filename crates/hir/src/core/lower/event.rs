@@ -5,7 +5,7 @@ use super::{
     AbiFieldContext, AbiFieldDiagnostic, FileLowerCtxt,
     attr::{
         AttrForm, AttrRule, AttrTarget, has_named_attr, lower_attrs_without_named,
-        validate_attr_rules,
+        named_attr_specs, validate_attr_rules,
     },
     hir_builder::HirBuilder,
 };
@@ -56,8 +56,7 @@ pub(super) fn lower_event_struct<'db>(
     let struct_name_token = ast.name();
     let struct_name = struct_name_token.as_ref().map(|n| n.text().to_string());
 
-    let stripped_event_attr = lower_attrs_without_named(builder.ctxt(), ast.attr_list(), "event");
-    let attributes = stripped_event_attr.retained;
+    let attributes = lower_attrs_without_named(builder.ctxt(), ast.attr_list(), "event");
 
     let vis = super::lower_visibility(&ast);
     let generic_params = GenericParamListId::lower_ast_opt(builder.ctxt(), ast.generic_params());
@@ -207,9 +206,10 @@ fn parse_event_fields<'db>(
                 "`#[indexed]`",
             )],
         );
-        let stripped_indexed_attr = lower_attrs_without_named(ctxt, field.attr_list(), "indexed");
-        let attrs = stripped_indexed_attr.retained;
-        let indexed_range = stripped_indexed_attr.removed.first().map(|attr| attr.range);
+        super::item::report_unsupported_field_mut(ctxt, &field, "event field");
+        let indexed_attrs = named_attr_specs(field.attr_list(), "indexed");
+        let attrs = lower_attrs_without_named(ctxt, field.attr_list(), "indexed");
+        let indexed_range = indexed_attrs.first().map(|attr| attr.range);
         let is_indexed = indexed_range.is_some();
         if is_indexed {
             indexed_count += 1;
@@ -217,12 +217,7 @@ fn parse_event_fields<'db>(
                 indexed_ranges.push(r);
             }
         }
-        if stripped_indexed_attr
-            .removed
-            .iter()
-            .any(|attr| !attr.is_bare())
-            || stripped_indexed_attr.removed.len() > 1
-        {
+        if indexed_attrs.iter().any(|attr| !attr.is_bare()) || indexed_attrs.len() > 1 {
             is_valid = false;
         }
 
@@ -233,7 +228,9 @@ fn parse_event_fields<'db>(
 
         let vis = super::lower_field_visibility(&field);
 
-        hir_fields.push(FieldDef::new(attrs, name_ident, ty_ref, vis));
+        hir_fields.push(FieldDef::new(
+            attrs, name_ident, ty_ref, vis, is_indexed, false,
+        ));
 
         let (Some(name_ident), Some(ty)) = (name_ident.to_opt(), ty_ref.to_opt()) else {
             is_valid = false;
@@ -367,6 +364,23 @@ fn create_topic0_const<'db>(
     )));
     tuple_elems.push(body_ctxt.push_expr(close_paren, origin.clone()));
 
+    // The `AsBytes` tuple impls in `core` stop at arity 16, so nest the
+    // elements into chunks when the signature is longer. Byte concatenation is
+    // associative, so the nesting doesn't change the hashed bytes.
+    const MAX_TUPLE_ARITY: usize = 16;
+    while tuple_elems.len() > MAX_TUPLE_ARITY {
+        tuple_elems = tuple_elems
+            .chunks(MAX_TUPLE_ARITY)
+            .map(|chunk| {
+                if let [single] = chunk {
+                    *single
+                } else {
+                    body_ctxt.push_expr(Expr::Tuple(chunk.to_vec()), origin.clone())
+                }
+            })
+            .collect();
+    }
+
     // Build the tuple expression and wrap in keccak call
     let tuple_expr = Expr::Tuple(tuple_elems);
     let tuple_id = body_ctxt.push_expr(tuple_expr, origin.clone());
@@ -400,6 +414,7 @@ fn create_topic0_const<'db>(
         name: Partial::Present(topic0_name),
         ty: Partial::Present(topic0_ty),
         value: Partial::Present(body),
+        vis: crate::hir_def::Visibility::Public,
     }
 }
 

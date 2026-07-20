@@ -17,10 +17,14 @@ pub use name_resolver::{
     EarlyNameQueryId, NameDerivation, NameDomain, NameRes, NameResBucket, NameResKind,
     NameResolutionError, QueryDirective,
 };
+pub(crate) use path_resolver::resolve_path_with_minter;
 pub(crate) use path_resolver::{FindAssociatedTypeError, find_associated_type};
 pub use path_resolver::{
     PathRes, PathResError, PathResErrorKind, ResolvedVariant, resolve_ident_to_bucket,
     resolve_name_res, resolve_path, resolve_path_with_observer,
+};
+pub(crate) use path_resolver::{
+    earliest_conflicting_inherent_const_impl, shadowed_inherent_fn_for_const,
 };
 use tracing::debug;
 pub use traits_in_scope::available_traits_in_scope;

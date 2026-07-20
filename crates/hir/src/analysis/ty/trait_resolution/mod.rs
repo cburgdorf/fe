@@ -1,5 +1,7 @@
 use super::{
     canonical::{Canonical, Canonicalized, Solution},
+    const_expr::ConstExpr,
+    const_ty::{ConstTyData, EvaluatedConstTy},
     fold::{AssocTySubst, TyFoldable},
     trait_def::{ImplementorId, TraitInstId},
     ty_def::{TyData, TyFlags, TyId},
@@ -242,7 +244,11 @@ pub(crate) fn normalize_trait_inst_preserving_validity<'db>(
     }
 }
 
-#[salsa::tracked(return_ref)]
+#[salsa::tracked(
+    return_ref,
+    cycle_fn=is_query_satisfiable_cycle_recover,
+    cycle_initial=is_query_satisfiable_cycle_initial
+)]
 fn is_query_satisfiable<'db>(
     db: &'db dyn HirAnalysisDb,
     origin_ingot: Ingot<'db>,
@@ -253,6 +259,28 @@ fn is_query_satisfiable<'db>(
     };
 
     ProofForest::new(db, origin_ingot, query).solve()
+}
+
+fn is_query_satisfiable_cycle_initial<'db>(
+    _db: &'db dyn HirAnalysisDb,
+    _origin_ingot: Ingot<'db>,
+    _query: Canonical<TraitSolverQuery<'db>>,
+) -> GoalSatisfiability<'db> {
+    // A cycle can arise while collecting an impl whose constraints contain an associated-type
+    // projection: resolving the projection needs the trait environment that is currently being
+    // assembled for the outer goal. Treat the incomplete pass as ambiguous so callers keep the
+    // candidate alive; the next fixpoint iteration can decide it once impl collection converges.
+    GoalSatisfiability::NeedsConfirmation(IndexSet::default())
+}
+
+fn is_query_satisfiable_cycle_recover<'db>(
+    _db: &'db dyn HirAnalysisDb,
+    _value: &GoalSatisfiability<'db>,
+    _count: u32,
+    _origin_ingot: Ingot<'db>,
+    _query: Canonical<TraitSolverQuery<'db>>,
+) -> salsa::CycleRecoveryAction<GoalSatisfiability<'db>> {
+    salsa::CycleRecoveryAction::Iterate
 }
 
 pub fn is_goal_query_satisfiable<'db>(
@@ -280,13 +308,44 @@ pub(crate) fn check_ty_wf<'db>(
     solve_cx: TraitSolveCx<'db>,
     ty: TyId<'db>,
 ) -> WellFormedness<'db> {
-    let (_, args) = ty.decompose_ty_app(db);
-
+    // Check the arguments and the structural content of the application base
+    // (projections and const expressions). The base's *constraints* are not
+    // checked here: `ty_constraints` of a partial application instantiates
+    // the constraint binder with missing arguments, producing spurious
+    // unsatisfied goals; the fully-applied type's constraints are checked
+    // below.
+    let (base, args) = ty.decompose_ty_app(db);
     for &arg in args {
         let wf = check_ty_wf(db, solve_cx, arg);
         if !wf.is_wf() {
             return wf;
         }
+    }
+    match base.data(db) {
+        TyData::AssocTy(assoc) => {
+            let wf = check_projected_trait_use_wf(db, solve_cx, assoc.trait_);
+            if !wf.is_wf() {
+                return wf;
+            }
+        }
+        TyData::QualifiedTy(inst) => {
+            let wf = check_projected_trait_use_wf(db, solve_cx, *inst);
+            if !wf.is_wf() {
+                return wf;
+            }
+        }
+        TyData::ConstTy(const_ty) => {
+            let wf = check_const_ty_wf(db, solve_cx, *const_ty);
+            if !wf.is_wf() {
+                return wf;
+            }
+        }
+        TyData::TyApp(..)
+        | TyData::TyVar(_)
+        | TyData::TyParam(_)
+        | TyData::TyBase(_)
+        | TyData::Never
+        | TyData::Invalid(_) => {}
     }
 
     let constraints = ty_constraints(db, ty);
@@ -317,6 +376,139 @@ pub(crate) fn check_ty_wf<'db>(
     WellFormedness::WellFormed
 }
 
+fn check_const_ty_wf<'db>(
+    db: &'db dyn HirAnalysisDb,
+    solve_cx: TraitSolveCx<'db>,
+    const_ty: super::const_ty::ConstTyId<'db>,
+) -> WellFormedness<'db> {
+    let wf = check_ty_wf(db, solve_cx, const_ty.ty(db));
+    if !wf.is_wf() {
+        return wf;
+    }
+
+    match const_ty.data(db) {
+        ConstTyData::Evaluated(EvaluatedConstTy::Tuple(elems), _)
+        | ConstTyData::Evaluated(EvaluatedConstTy::Array(elems), _)
+        | ConstTyData::Evaluated(EvaluatedConstTy::Record(elems), _) => {
+            for &elem in elems {
+                let wf = check_ty_wf(db, solve_cx, elem);
+                if !wf.is_wf() {
+                    return wf;
+                }
+            }
+        }
+        ConstTyData::Abstract(expr, _) => {
+            let wf = check_const_expr_wf(db, solve_cx, *expr);
+            if !wf.is_wf() {
+                return wf;
+            }
+        }
+        ConstTyData::TyVar(..)
+        | ConstTyData::TyParam(..)
+        | ConstTyData::Hole(..)
+        | ConstTyData::Evaluated(..)
+        | ConstTyData::UnEvaluated { .. } => {}
+    }
+
+    WellFormedness::WellFormed
+}
+
+fn check_const_expr_wf<'db>(
+    db: &'db dyn HirAnalysisDb,
+    solve_cx: TraitSolveCx<'db>,
+    expr: super::const_expr::ConstExprId<'db>,
+) -> WellFormedness<'db> {
+    match expr.data(db) {
+        ConstExpr::ExternConstFnCall {
+            generic_args, args, ..
+        }
+        | ConstExpr::UserConstFnCall {
+            generic_args, args, ..
+        } => {
+            for &ty in generic_args.iter().chain(args.iter()) {
+                let wf = check_ty_wf(db, solve_cx, ty);
+                if !wf.is_wf() {
+                    return wf;
+                }
+            }
+        }
+        ConstExpr::ArithBinOp { lhs, rhs, .. } => {
+            for ty in [*lhs, *rhs] {
+                let wf = check_ty_wf(db, solve_cx, ty);
+                if !wf.is_wf() {
+                    return wf;
+                }
+            }
+        }
+        ConstExpr::UnOp { expr, .. } => {
+            let wf = check_ty_wf(db, solve_cx, *expr);
+            if !wf.is_wf() {
+                return wf;
+            }
+        }
+        ConstExpr::Cast { expr, to } => {
+            for ty in [*expr, *to] {
+                let wf = check_ty_wf(db, solve_cx, ty);
+                if !wf.is_wf() {
+                    return wf;
+                }
+            }
+        }
+        ConstExpr::TraitConst(assoc) => {
+            let wf = check_projected_trait_use_wf(db, solve_cx, assoc.inst());
+            if !wf.is_wf() {
+                return wf;
+            }
+        }
+        ConstExpr::InherentConst(use_) => {
+            let wf = check_ty_wf(db, solve_cx, use_.receiver_ty());
+            if !wf.is_wf() {
+                return wf;
+            }
+        }
+        ConstExpr::LocalBinding(_) => {}
+    }
+
+    WellFormedness::WellFormed
+}
+
+fn check_projected_trait_use_wf<'db>(
+    db: &'db dyn HirAnalysisDb,
+    solve_cx: TraitSolveCx<'db>,
+    inst: TraitInstId<'db>,
+) -> WellFormedness<'db> {
+    for &arg in inst.args(db) {
+        let wf = check_ty_wf(db, solve_cx, arg);
+        if !wf.is_wf() {
+            return wf;
+        }
+    }
+    for &ty in inst.assoc_type_bindings(db).values() {
+        let wf = check_ty_wf(db, solve_cx, ty);
+        if !wf.is_wf() {
+            return wf;
+        }
+    }
+
+    unsatisfied_goal(db, solve_cx, inst).unwrap_or(WellFormedness::WellFormed)
+}
+
+fn unsatisfied_goal<'db>(
+    db: &'db dyn HirAnalysisDb,
+    solve_cx: TraitSolveCx<'db>,
+    goal: TraitInstId<'db>,
+) -> Option<WellFormedness<'db>> {
+    let assumptions = solve_cx.assumptions();
+    let mut table = UnificationTable::new(db);
+    let query = CanonicalGoalQuery::new(db, goal, assumptions);
+    if let GoalSatisfiability::UnSat(subgoal) = is_goal_query_satisfiable(db, solve_cx, &query) {
+        let subgoal = subgoal.map(|subgoal| query.extract_subgoal(&mut table, subgoal));
+        Some(WellFormedness::IllFormed { goal, subgoal })
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Update)]
 pub(crate) enum WellFormedness<'db> {
     WellFormed,
@@ -340,6 +532,19 @@ pub(crate) fn check_trait_inst_wf<'db>(
     solve_cx: TraitSolveCx<'db>,
     trait_inst: TraitInstId<'db>,
 ) -> WellFormedness<'db> {
+    for &arg in trait_inst.args(db) {
+        let wf = check_ty_wf(db, solve_cx, arg);
+        if !wf.is_wf() {
+            return wf;
+        }
+    }
+    for &ty in trait_inst.assoc_type_bindings(db).values() {
+        let wf = check_ty_wf(db, solve_cx, ty);
+        if !wf.is_wf() {
+            return wf;
+        }
+    }
+
     let constraints =
         collect_constraints(db, trait_inst.def(db).into()).instantiate(db, trait_inst.args(db));
     let assumptions = solve_cx.assumptions();

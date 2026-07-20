@@ -329,6 +329,7 @@ pub(super) fn create_direct_encode_assoc_const<
         name: Partial::Present(name),
         ty: Partial::Present(ty),
         value: Partial::Present(body),
+        vis: crate::hir_def::Visibility::Public,
     }
 }
 
@@ -470,6 +471,7 @@ fn create_bool_assoc_const<'db, O: Clone + Into<crate::span::DesugaredOrigin>>(
         name: Partial::Present(name),
         ty: Partial::Present(ty),
         value: Partial::Present(body),
+        vis: crate::hir_def::Visibility::Public,
     }
 }
 
@@ -542,6 +544,7 @@ pub(super) fn create_head_size_assoc_const<'db, O: Clone + Into<crate::span::Des
         name: Partial::Present(name),
         ty: Partial::Present(ty),
         value: Partial::Present(body),
+        vis: crate::hir_def::Visibility::Public,
     }
 }
 
@@ -757,11 +760,12 @@ fn lower_msg_variant_fields<'db>(
                         "field",
                         None,
                     );
+                    super::item::report_unsupported_field_mut(ctxt, &field, "msg variant field");
                     let attributes = AttrListId::lower_ast_opt(ctxt, field.attr_list());
                     let name = IdentId::lower_token_partial(ctxt, field.name());
                     let type_ref = TypeId::lower_ast_partial(ctxt, field.ty());
                     // All msg variant fields are public
-                    FieldDef::new(attributes, name, type_ref, Visibility::Public)
+                    FieldDef::new(attributes, name, type_ref, Visibility::Public, false, false)
                 })
                 .collect::<Vec<_>>();
             FieldDefListId::new(db, fields)
@@ -900,6 +904,7 @@ fn create_selector_const<'db>(
         name: Partial::Present(selector_name),
         ty: Partial::Present(selector_ty),
         value: Partial::Present(body),
+        vis: crate::hir_def::Visibility::Public,
     }
 }
 

@@ -334,6 +334,9 @@ pub(super) fn runtime_zero_sized_transport_ty<'db>(
     scope: Option<hir::hir_def::scope_graph::ScopeId<'db>>,
     assumptions: PredicateListId<'db>,
 ) -> bool {
+    if effect_handle_class_for_ty_in_context(db, ty, scope, assumptions).is_some() {
+        return false;
+    }
     let interface_ty = runtime_interface_ty_in_context(db, ty, scope, assumptions);
     if runtime_zero_sized_ty(db, interface_ty, scope, assumptions) {
         return true;
@@ -455,6 +458,7 @@ pub(crate) fn provider_address_space_to_runtime(space: ProviderAddressSpace) -> 
         ProviderAddressSpace::Storage => AddressSpaceKind::Storage,
         ProviderAddressSpace::Transient => AddressSpaceKind::Transient,
         ProviderAddressSpace::Calldata => AddressSpaceKind::Calldata,
+        ProviderAddressSpace::Code => AddressSpaceKind::Code,
     }
 }
 

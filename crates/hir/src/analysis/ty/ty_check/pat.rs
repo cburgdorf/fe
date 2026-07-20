@@ -14,15 +14,17 @@ use crate::analysis::{
     },
     ty::adt_def::AdtRef,
     ty::{
-        assoc_const::AssocConstUse,
+        assoc_const::{AssocConstUse, InherentConstUse},
         binder::Binder,
-        diagnostics::BodyDiag,
+        const_ty::instantiate_inherent_const_decl_ty,
+        diagnostics::{BodyDiag, TraitConstraintDiag, TyDiagCollection},
         fold::TyFoldable,
         pattern_ir::{
             BindingRef, ConstructorKind, PatternAnalysisStatus, ValidatedPat, ValidatedPatKind,
         },
         pattern_types::pattern_match_expected_ty,
         trait_def::TraitInstId,
+        trait_resolution::{GoalSatisfiability, TraitSolveCx, is_goal_satisfiable},
         ty_def::{InvalidCause, Kind, TyId, TyVarSort},
         ty_lower::lower_hir_ty,
     },
@@ -455,6 +457,30 @@ impl<'db> TyChecker<'db> {
                 );
 
                 let trait_ = inst.def(self.db);
+                if !super::trait_const_goal_has_foreign_params(self.db, inst, self.env.scope())
+                    && let GoalSatisfiability::UnSat(_) = is_goal_satisfiable(
+                        self.db,
+                        TraitSolveCx::new(self.db, self.env.scope())
+                            .with_assumptions(self.env.assumptions()),
+                        inst,
+                    )
+                {
+                    self.push_diag(TyDiagCollection::from(
+                        TraitConstraintDiag::TraitBoundNotSat {
+                            span: span.clone().into(),
+                            primary_goal: inst,
+                            unsat_subgoal: None,
+                            required_by: None,
+                        },
+                    ));
+                    return self.finish_pat_check(
+                        pat,
+                        expected,
+                        TyId::invalid(self.db, InvalidCause::Other),
+                        PatternAnalysisStatus::Invalid,
+                    );
+                }
+
                 if let Some(const_view) = trait_.const_(self.db, name)
                     && let Some(ty_binder) = const_view.ty_binder(self.db)
                 {
@@ -464,6 +490,35 @@ impl<'db> TyChecker<'db> {
                         self.env.scope(),
                         self.env.assumptions(),
                         inst,
+                        name,
+                    ));
+                    (
+                        ty,
+                        self.eval_const_pattern_literal(cref, expected)
+                            .map(|lit| self.literal_constructor_status(expected, lit))
+                            .unwrap_or(PatternAnalysisStatus::Unsupported),
+                    )
+                } else {
+                    (
+                        TyId::invalid(self.db, InvalidCause::Other),
+                        PatternAnalysisStatus::Invalid,
+                    )
+                }
+            }
+
+            Ok(PathRes::InherentConst(recv_ty, impl_, name)) => {
+                if let Some(ty) = instantiate_inherent_const_decl_ty(
+                    self.db,
+                    &mut self.table,
+                    impl_,
+                    recv_ty,
+                    name,
+                ) {
+                    let cref = ConstRef::InherentConst(InherentConstUse::new(
+                        self.env.scope(),
+                        self.env.assumptions(),
+                        impl_,
+                        recv_ty,
                         name,
                     ));
                     (
@@ -666,7 +721,8 @@ impl<'db> TyChecker<'db> {
                 | PathRes::TyAlias(_, ty)
                 | PathRes::Func(ty)
                 | PathRes::Const(_, ty)
-                | PathRes::TraitConst(ty, ..) => {
+                | PathRes::TraitConst(ty, ..)
+                | PathRes::InherentConst(ty, ..) => {
                     self.push_diag(BodyDiag::tuple_variant_expected(
                         self.db,
                         pat.span(self.body()).into(),
@@ -856,7 +912,8 @@ impl<'db> TyChecker<'db> {
                 | PathRes::TyAlias(_, ty)
                 | PathRes::Func(ty)
                 | PathRes::Const(_, ty)
-                | PathRes::TraitConst(ty, ..) => {
+                | PathRes::TraitConst(ty, ..)
+                | PathRes::InherentConst(ty, ..) => {
                     let diag = BodyDiag::record_expected(
                         self.db,
                         pat.span(self.body()).into(),

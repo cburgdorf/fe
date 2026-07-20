@@ -119,10 +119,17 @@ fn format_field_def<'db>(field: &FieldDef<'db>, db: &dyn HirDb, indent_level: us
     write_attrs(&mut result, field.attributes, db, indent_level);
 
     let vis = field.vis.pretty_print();
+    let mut_kw = if field.is_mut { "mut " } else { "" };
     let name = unwrap_partial(field.name, "FieldDef::name");
     let ty = unwrap_partial(field.type_ref, "FieldDef::type_ref");
     result.push_str(&indent_text(
-        &format!("{}{}: {}", vis, name.data(db), ty.pretty_print(db)),
+        &format!(
+            "{}{}{}: {}",
+            vis,
+            mut_kw,
+            name.data(db),
+            ty.pretty_print(db)
+        ),
         indent_level,
     ));
 
@@ -1480,6 +1487,28 @@ impl<'db> Impl<'db> {
 
         // Body
         result.push_str(" {\n");
+
+        // Associated consts
+        for assoc_const in self.hir_consts(db) {
+            write_attrs(&mut result, assoc_const.attributes, db, 1);
+            result.push_str("    ");
+            result.push_str(assoc_const.vis.pretty_print());
+            result.push_str("const ");
+            let name = unwrap_partial(assoc_const.name, "AssocConstDef::name");
+            result.push_str(name.data(db));
+            result.push_str(": ");
+            let ty = unwrap_partial(assoc_const.ty, "AssocConstDef::ty");
+            result.push_str(&ty.pretty_print(db));
+            // A parser-valid inherent const may omit its initializer (e.g.
+            // `const X: u256`); that program is diagnosable via
+            // `InherentConstMissingValue`, so print it without `= ...` rather
+            // than panicking on the absent body.
+            if let Some(body) = assoc_const.value.to_opt() {
+                result.push_str(" = ");
+                result.push_str(&body.pretty_print(db));
+            }
+            result.push('\n');
+        }
 
         for func in self.funcs(db) {
             indent_lines(&mut result, &func.pretty_print(db), 1);

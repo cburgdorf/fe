@@ -93,7 +93,7 @@ impl<'db> Visitor<'db> for HirTyErrVisitor<'db> {
             && let Ok(resolved) = resolve_path(self.db, path, ctxt.scope(), self.assumptions, true)
         {
             let is_const_like = match resolved {
-                PathRes::Const(..) | PathRes::TraitConst(..) => true,
+                PathRes::Const(..) | PathRes::TraitConst(..) | PathRes::InherentConst(..) => true,
                 PathRes::Ty(ty) | PathRes::TyAlias(_, ty) => {
                     matches!(ty.data(self.db), TyData::ConstTy(_))
                 }
@@ -481,6 +481,12 @@ fn diag_from_invalid_cause<'db>(
         InvalidCause::ConstEvalRecursionLimitExceeded { body, expr } => {
             TyLowerDiag::ConstEvalRecursionLimitExceeded(expr.span(body).into()).into()
         }
+
+        InvalidCause::ConstEvalRecursiveConst { body, expr } => {
+            TyLowerDiag::ConstEvalRecursiveConst(expr.span(body).into()).into()
+        }
+
+        InvalidCause::TypeLoweringCycle => TyLowerDiag::TypeLoweringCycle(span).into(),
 
         InvalidCause::NotAType(_) => return None,
 

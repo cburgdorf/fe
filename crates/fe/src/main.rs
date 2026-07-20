@@ -17,7 +17,7 @@ mod trace;
 mod tree;
 mod workspace_ingot;
 
-use std::{fs, io::Read};
+use std::{fs, io::Read, sync::OnceLock};
 
 use build::build;
 use camino::Utf8PathBuf;
@@ -43,12 +43,23 @@ pub enum BuildEmit {
     RuntimeBytecode,
     Ir,
     Abi,
+    Metadata,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum TestEmit {
     Ir,
     Rmir,
+}
+
+fn cli_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION
+        .get_or_init(|| match option_env!("FE_GIT_HASH") {
+            Some(hash) if !hash.is_empty() => format!("{} ({hash})", env!("CARGO_PKG_VERSION")),
+            _ => env!("CARGO_PKG_VERSION").to_string(),
+        })
+        .as_str()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -112,7 +123,7 @@ impl From<RuntimeValuePolicyArg> for trace_facts::RuntimeValuePolicy {
 }
 
 #[derive(Debug, Clone, Parser)]
-#[command(version, about, long_about = None)]
+#[command(version = cli_version(), about, long_about = None)]
 pub struct Options {
     /// Control colored output (auto, always, never).
     #[arg(long, global = true, value_enum, default_value = "auto")]
@@ -292,6 +303,12 @@ pub enum Command {
         /// The directory should contain `core/` and `std/` subdirectories.
         #[arg(long)]
         stdlib_path: Option<Utf8PathBuf>,
+        /// Include `#[test]` functions in generated docs.
+        ///
+        /// Off by default to keep sidebars focused on the public API surface;
+        /// turn on for a test-centric overview of an ingot.
+        #[arg(long)]
+        include_tests: bool,
         #[command(subcommand)]
         action: Option<DocAction>,
     },
@@ -1361,6 +1378,7 @@ pub fn run(opts: &Options) {
             output,
             builtins,
             stdlib_path,
+            include_tests,
             action,
         } => {
             if let Some(DocAction::Bundle { with_css }) = action {
@@ -1376,6 +1394,7 @@ pub fn run(opts: &Options) {
                     output.as_ref(),
                     *builtins,
                     stdlib_path.as_ref(),
+                    *include_tests,
                     action.as_ref(),
                 );
             }

@@ -52,16 +52,13 @@ func private %main_root() {
 
 func private %newtype_word_mut_method_call(v0.i256) -> i256 {
     block0:
-        v1.*i256 = alloca i256;
-        mstore v1 v0 i256;
         jump block1;
 
     block1:
-        v2.i256 = mload v1 i256;
-        v5.@layout_0 = insert_value undef.@layout_0 0.i256 v2;
-        v6.@layout_0 = call %bump v5;
-        v7.i256 = extract_value v6 0.i256;
-        return v7;
+        v4.@layout_0 = insert_value undef.@layout_0 0.i256 v0;
+        v5.@layout_0 = call %bump v4;
+        v6.i256 = extract_value v5 0.i256;
+        return v6;
 }
 
 

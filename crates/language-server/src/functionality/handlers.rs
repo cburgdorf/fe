@@ -352,7 +352,7 @@ pub async fn handle_did_change_watched_files(
             FileChangeType::CREATED => ChangeKind::Create,
             FileChangeType::DELETED => ChangeKind::Delete,
             _ => {
-                tracing::warn!("unknown FileChangeType {:?}, skipping", event.typ);
+                warn!("unknown FileChangeType {:?}, skipping", event.typ);
                 continue;
             }
         };

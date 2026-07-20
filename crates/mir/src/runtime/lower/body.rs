@@ -102,15 +102,34 @@ pub fn lower_to_rmir<'db>(
     });
     check_runtime_body_supported(db, semantic.key(db), &normalized_body)?;
     let facts = BodyStaticFacts::new(db, &normalized_body);
+    let signature = instance.interface_signature(db);
     let param_locals =
         crate::runtime::lower::interface::runtime_param_locals(db, semantic, key.params(db));
-    let inferred = LocalStateInferer::new(
+    let mut inferer = LocalStateInferer::new(
         BodyEnv::new(db, &normalized_body, &facts),
         key.params(db),
         &param_locals,
-    )
-    .run();
-    let signature = instance.interface_signature(db);
+    );
+    if let Some(ret_class) = signature
+        .ret
+        .clone()
+        .filter(|class| class.contains_transport(db))
+    {
+        let return_locals = normalized_body
+            .blocks
+            .iter()
+            .filter_map(|block| match &block.terminator.kind {
+                NSTerminatorKind::Return(Some(value)) => Some(value.local),
+                NSTerminatorKind::Goto(_)
+                | NSTerminatorKind::Branch { .. }
+                | NSTerminatorKind::MatchEnum { .. }
+                | NSTerminatorKind::Assert { .. }
+                | NSTerminatorKind::Return(None) => None,
+            })
+            .collect::<Vec<_>>();
+        inferer.seed_return_class(&return_locals, ret_class);
+    }
+    let inferred = inferer.run();
     let mut emitter = RmirEmitter::new(
         db,
         instance,
@@ -131,13 +150,7 @@ fn check_runtime_body_supported<'db>(
     for block in &body.blocks {
         for stmt in &block.stmts {
             if let NSStmtKind::Assign {
-                expr:
-                    NExpr::Call {
-                        callee,
-                        args,
-                        effect_args: _,
-                        ..
-                    },
+                expr: NExpr::Call { callee, args, .. },
                 ..
             } = &stmt.kind
                 && let Some(value_ty) = panic_payload_ty(db, body, *callee, args)
@@ -4990,7 +5003,13 @@ impl<'db> RmirEmitter<'db> {
             .semantic(self.db)
             .expect("runtime const reification requires a semantic instance");
         reify_runtime_const_for_ty(self.db, semantic, expected_ty, value).unwrap_or_else(|| {
-            panic!("semantic const should reify for runtime lowering: {value:?}")
+            panic!(
+                "semantic const should reify for runtime lowering: `{}` (expected type `{}`). \
+                 This is a compiler bug: the const failed to evaluate but no diagnostic was \
+                 reported during type checking.",
+                value.pretty_print(self.db),
+                expected_ty.pretty_print(self.db),
+            )
         })
     }
 

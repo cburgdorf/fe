@@ -46,19 +46,13 @@ func private %sum(v0.@layout_0) -> i256 {
 
 func private %view_param_aggregate_value(v0.i256, v1.i256) -> i256 {
     block0:
-        v2.*i256 = alloca i256;
-        v3.*i256 = alloca i256;
-        mstore v2 v0 i256;
-        mstore v3 v1 i256;
         jump block1;
 
     block1:
-        v4.i256 = mload v2 i256;
-        v5.i256 = mload v3 i256;
-        v8.@layout_0 = insert_value undef.@layout_0 0.i256 v4;
-        v10.@layout_0 = insert_value v8 1.i256 v5;
-        v11.i256 = call %sum v10;
-        return v11;
+        v6.@layout_0 = insert_value undef.@layout_0 0.i256 v0;
+        v8.@layout_0 = insert_value v6 1.i256 v1;
+        v9.i256 = call %sum v8;
+        return v9;
 }
 
 

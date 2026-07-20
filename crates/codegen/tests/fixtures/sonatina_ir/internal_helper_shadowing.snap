@@ -10,17 +10,11 @@ type @layout_1 = {@layout_0, @layout_0};
 
 func private %call_internal_helpers(v0.i64, v1.i64) -> @layout_0 {
     block0:
-        v2.*i64 = alloca i64;
-        v3.*i64 = alloca i64;
-        mstore v2 v0 i64;
-        mstore v3 v1 i64;
         jump block1;
 
     block1:
-        v4.i64 = mload v2 i64;
-        v5.i64 = mload v3 i64;
-        (v6.i64, v7.i1) = uaddo v4 v5;
-        br v7 block2 block3;
+        (v4.i64, v5.i1) = uaddo v0 v1;
+        br v5 block2 block3;
 
     block2:
         mstore 0.i256 35408467139433450592217433187231851964531694900788300625387963629091585785856.i256 i256;
@@ -28,40 +22,26 @@ func private %call_internal_helpers(v0.i64, v1.i64) -> @layout_0 {
         evm_revert 0.i256 36.i256;
 
     block3:
-        v13.i64 = mload v2 i64;
-        v14.i64 = mload v3 i64;
-        v15.i64 = call %saturating_add v13 v14;
-        v17.@layout_0 = insert_value undef.@layout_0 0.i256 v6;
-        v19.@layout_0 = insert_value v17 1.i256 v15;
-        return v19;
+        v13.i64 = call %saturating_add v0 v1;
+        v15.@layout_0 = insert_value undef.@layout_0 0.i256 v4;
+        v17.@layout_0 = insert_value v15 1.i256 v13;
+        return v17;
 }
 
 func private %call_user_helpers(v0.i64, v1.i64) -> @layout_0 {
     block0:
-        v2.*i64 = alloca i64;
-        v3.*i64 = alloca i64;
-        mstore v2 v0 i64;
-        mstore v3 v1 i64;
         jump block1;
 
     block1:
-        v4.i64 = mload v2 i64;
-        v5.i64 = mload v3 i64;
-        v6.i64 = call %checked_add_u64 v4 v5;
-        v7.i64 = mload v2 i64;
-        v8.i64 = mload v3 i64;
-        v9.i64 = call %saturating_add_u64 v7 v8;
-        v12.@layout_0 = insert_value undef.@layout_0 0.i256 v6;
-        v14.@layout_0 = insert_value v12 1.i256 v9;
-        return v14;
+        v4.i64 = call %checked_add_u64 v0 v1;
+        v5.i64 = call %saturating_add_u64 v0 v1;
+        v8.@layout_0 = insert_value undef.@layout_0 0.i256 v4;
+        v10.@layout_0 = insert_value v8 1.i256 v5;
+        return v10;
 }
 
 func private %checked_add_u64(v0.i64, v1.i64) -> i64 {
     block0:
-        v2.*i64 = alloca i64;
-        v3.*i64 = alloca i64;
-        mstore v2 v0 i64;
-        mstore v3 v1 i64;
         jump block1;
 
     block1:
@@ -91,25 +71,15 @@ func private %main_root() {
 
 func private %saturating_add(v0.i64, v1.i64) -> i64 {
     block0:
-        v2.*i64 = alloca i64;
-        v3.*i64 = alloca i64;
-        mstore v2 v0 i64;
-        mstore v3 v1 i64;
         jump block1;
 
     block1:
-        v4.i64 = mload v2 i64;
-        v5.i64 = mload v3 i64;
-        v6.i64 = uaddsat v4 v5;
-        return v6;
+        v4.i64 = uaddsat v0 v1;
+        return v4;
 }
 
 func private %saturating_add_u64(v0.i64, v1.i64) -> i64 {
     block0:
-        v2.*i64 = alloca i64;
-        v3.*i64 = alloca i64;
-        mstore v2 v0 i64;
-        mstore v3 v1 i64;
         jump block1;
 
     block1:

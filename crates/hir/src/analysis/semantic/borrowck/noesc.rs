@@ -77,13 +77,7 @@ impl<'db> NoEsc<'db> {
     ) -> Result<(), SemanticBorrowDiagnostic<'db>> {
         match &stmt.kind {
             NSStmtKind::Assign {
-                expr:
-                    NExpr::Call {
-                        callee,
-                        args,
-                        effect_args: _,
-                        ..
-                    },
+                expr: NExpr::Call { callee, args, .. },
                 ..
             } => self.check_call_args(state, stmt.origin, *callee, args),
             NSStmtKind::Store { dst, src } => self.check_store(state, stmt.origin, dst, *src),
@@ -105,6 +99,9 @@ impl<'db> NoEsc<'db> {
         let spaces = self.address_spaces_for_targets(&targets, origin)?;
         if spaces.contains(&ProviderAddressSpace::Calldata) {
             return Err(self.noesc_diag(origin, "cannot write to calldata".to_string()));
+        }
+        if spaces.contains(&ProviderAddressSpace::Code) {
+            return Err(self.noesc_diag(origin, "cannot write to code".to_string()));
         }
 
         let Some(space) = spaces.iter().copied().find(|space| {
@@ -254,7 +251,8 @@ fn address_space_rank(space: ProviderAddressSpace) -> u8 {
     match space {
         ProviderAddressSpace::Memory => 0,
         ProviderAddressSpace::Calldata => 1,
-        ProviderAddressSpace::Storage => 2,
-        ProviderAddressSpace::Transient => 3,
+        ProviderAddressSpace::Code => 2,
+        ProviderAddressSpace::Storage => 3,
+        ProviderAddressSpace::Transient => 4,
     }
 }

@@ -286,7 +286,7 @@ fn event_struct_to_abi_entry(db: &DriverDataBase, struct_: Struct<'_>) -> Result
         .map(|ty| ty.instantiate_identity())
         .collect();
     let inputs = named_field_param_descs(db, struct_.hir_fields(db), &field_tys, |field| {
-        Some(field.attributes.has_attr(db, "indexed"))
+        Some(field.is_event_indexed)
     })?
     .into_iter()
     .map(NamedAbiParamDesc::into_param)
@@ -881,10 +881,9 @@ fn std_sol_compat_abi_type(
     // Match Uint{N} or Int{N} where N is a valid Solidity bit width (8..=256, multiple of 8)
     let (prefix, digits) = if let Some(rest) = name.strip_prefix("Uint") {
         ("uint", rest)
-    } else if let Some(rest) = name.strip_prefix("Int") {
-        ("int", rest)
     } else {
-        return None;
+        let rest = name.strip_prefix("Int")?;
+        ("int", rest)
     };
 
     let bits: u16 = digits.parse().ok()?;
@@ -1724,6 +1723,49 @@ pub contract C {
         assert_eq!(function["name"], "transfer");
         assert_eq!(function["inputs"][0]["name"], "to");
         assert_eq!(function["inputs"][1]["name"], "amount");
+    }
+
+    #[test]
+    fn event_abi_preserves_indexed_fields() {
+        let code = r#"
+use std::abi::sol
+use std::evm::Log
+
+msg FooMsg {
+    #[selector = sol("ping()")]
+    Ping,
+}
+
+#[event]
+struct Transfer {
+    #[indexed]
+    from: u256,
+    #[indexed]
+    to: u256,
+    value: u256,
+}
+
+pub contract C uses (log: mut Log) {
+    recv FooMsg {
+        Ping uses (mut log) {
+            log.emit(Transfer { from: 1, to: 2, value: 3 })
+        }
+    }
+}
+"#;
+
+        let entries = abi_entries(code, "C");
+        let event = entries
+            .iter()
+            .find(|entry| entry["type"] == "event" && entry["name"] == "Transfer")
+            .expect("event entry");
+
+        assert_eq!(event["inputs"][0]["name"], "from");
+        assert_eq!(event["inputs"][0]["indexed"], true);
+        assert_eq!(event["inputs"][1]["name"], "to");
+        assert_eq!(event["inputs"][1]["indexed"], true);
+        assert_eq!(event["inputs"][2]["name"], "value");
+        assert_eq!(event["inputs"][2]["indexed"], false);
     }
 
     #[test]

@@ -40,6 +40,7 @@ derive_more = { version = "1.0", default-features = false, features = [
 dir-test = "0.4"
 glob = "0.3.2"
 crossbeam-channel = "0.5.15"
+gix = { version = "0.83.0", default-features = false }
 rustc-hash = "2.1.0"
 blake3 = "1"
 num-bigint = "0.4"
@@ -57,10 +58,10 @@ tracing-tree = "0.4.0"
 wasm-bindgen-test = "0.3"
 semver = "1.0.26"
 petgraph = "0.8"
-sonatina-ir = { git = "https://github.com/micahscopes/sonatina", rev = "892129e2f823ee522ade5183d6ac1a535bc8b584" }
-sonatina-triple = { git = "https://github.com/micahscopes/sonatina", rev = "892129e2f823ee522ade5183d6ac1a535bc8b584" }
-sonatina-codegen = { git = "https://github.com/micahscopes/sonatina", rev = "892129e2f823ee522ade5183d6ac1a535bc8b584" }
-sonatina-verifier = { git = "https://github.com/micahscopes/sonatina", rev = "892129e2f823ee522ade5183d6ac1a535bc8b584" }
+sonatina-ir = { git = "https://github.com/cburgdorf/sonatina", rev = "f31f5104737affae034e5840db24b102ff2cd44b" }
+sonatina-triple = { git = "https://github.com/cburgdorf/sonatina", rev = "f31f5104737affae034e5840db24b102ff2cd44b" }
+sonatina-codegen = { git = "https://github.com/cburgdorf/sonatina", rev = "f31f5104737affae034e5840db24b102ff2cd44b" }
+sonatina-verifier = { git = "https://github.com/cburgdorf/sonatina", rev = "f31f5104737affae034e5840db24b102ff2cd44b" }
 
 [profile.dev]
 # Set to 0 to make the build faster and debugging more difficult.

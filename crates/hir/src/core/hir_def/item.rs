@@ -341,7 +341,9 @@ pub enum CallableDef<'db> {
     VariantCtor(EnumVariant<'db>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, derive_more::From)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, derive_more::From, salsa::Update,
+)]
 pub enum WhereClauseOwner<'db> {
     Func(Func<'db>),
     Struct(Struct<'db>),
@@ -1087,6 +1089,8 @@ pub struct Impl<'db> {
     pub(in crate::core) attributes: AttrListId<'db>,
     pub(in crate::core) generic_params: GenericParamListId<'db>,
     pub(in crate::core) where_clause: WhereClauseId<'db>,
+    #[return_ref]
+    pub(in crate::core) consts: Vec<AssocConstDef<'db>>,
     pub top_mod: TopLevelMod<'db>,
 
     #[return_ref]
@@ -1096,6 +1100,11 @@ pub struct Impl<'db> {
 impl<'db> Impl<'db> {
     pub fn span(self) -> LazyImplSpan<'db> {
         LazyImplSpan::new(self)
+    }
+
+    /// Returns the raw associated const definitions from the HIR.
+    pub fn hir_consts(self, db: &'db dyn HirDb) -> &'db [AssocConstDef<'db>] {
+        self.consts(db)
     }
 
     pub fn children_non_nested(
@@ -1290,6 +1299,9 @@ pub struct AssocConstDef<'db> {
     pub name: Partial<IdentId<'db>>,
     pub ty: Partial<TypeId<'db>>,
     pub value: Partial<Body<'db>>,
+    /// Only meaningful for consts in inherent `impl` blocks; consts in trait
+    /// impls inherit their visibility from the trait.
+    pub vis: Visibility,
 }
 
 #[salsa::tracked]
@@ -1555,9 +1567,11 @@ impl<'db> FieldParent<'db> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FieldDef<'db> {
     pub attributes: AttrListId<'db>,
+    pub is_event_indexed: bool,
     pub name: Partial<IdentId<'db>>,
     pub(in crate::core) type_ref: Partial<TypeId<'db>>,
     pub vis: Visibility,
+    pub is_mut: bool,
 }
 
 impl<'db> FieldDef<'db> {
@@ -1566,17 +1580,25 @@ impl<'db> FieldDef<'db> {
         name: Partial<IdentId<'db>>,
         type_ref: Partial<TypeId<'db>>,
         vis: Visibility,
+        is_event_indexed: bool,
+        is_mut: bool,
     ) -> Self {
         Self {
             attributes,
+            is_event_indexed,
             name,
             type_ref,
             vis,
+            is_mut,
         }
     }
 
     pub fn type_ref(&self) -> Partial<TypeId<'db>> {
         self.type_ref
+    }
+
+    pub fn is_mut(&self) -> bool {
+        self.is_mut
     }
 }
 

@@ -688,6 +688,112 @@ fn entry() -> Inner {
 }
 
 #[test]
+fn read_only_scalar_params_used_as_indices_stay_unrooted() {
+    let source = r#"
+const VALS: [u256; 3] = [10, 20, 30]
+
+fn sum_two(i: usize, j: usize) -> u256 {
+    VALS[i] + VALS[j]
+}
+
+fn entry() -> u256 {
+    sum_two(i: 0, j: 1)
+}
+"#;
+
+    with_runtime_package!(
+        "read_only_scalar_params_used_as_indices_stay_unrooted.fe",
+        source,
+        |db, package| {
+            let body = runtime_body_for_symbol(&db, package, "sum_two");
+
+            assert!(
+                matches!(body.locals[0].root, RuntimeLocalRoot::None),
+                "read-only scalar index param `i` should not get a runtime root:\n{body:#?}"
+            );
+            assert!(
+                matches!(body.locals[1].root, RuntimeLocalRoot::None),
+                "read-only scalar index param `j` should not get a runtime root:\n{body:#?}"
+            );
+        }
+    );
+
+    let ir = sonatina_ir_for_source(
+        "read_only_scalar_params_used_as_indices_stay_unrooted.fe",
+        source,
+    );
+    let sum_two = sonatina_function_body(&ir, "sum_two");
+
+    assert!(
+        !sum_two.contains("alloca i256"),
+        "read-only scalar index params should not allocate stack slots:\n{sum_two}"
+    );
+    assert!(
+        !sum_two.contains("mload"),
+        "read-only scalar index params should be used directly, not reloaded:\n{sum_two}"
+    );
+}
+
+#[test]
+fn mutated_scalar_locals_stay_rooted() {
+    with_runtime_package!(
+        "mutated_scalar_locals_stay_rooted.fe",
+        r#"
+fn bump(size: u256) -> u256 {
+    let mut value: u256 = size
+    value += 1
+    value
+}
+
+fn entry() -> u256 {
+    bump(size: 1)
+}
+"#,
+        |db, package| {
+            let body = runtime_body_for_symbol(&db, package, "bump");
+
+            assert!(
+                matches!(body.locals[0].root, RuntimeLocalRoot::None),
+                "read-only scalar param should not get a runtime root:\n{body:#?}"
+            );
+            let rooted_scalar = body
+                .locals
+                .iter()
+                .enumerate()
+                .find_map(|(idx, local)| {
+                    matches!(local.root, RuntimeLocalRoot::Slot(RuntimeClass::Scalar(_)))
+                        .then(|| RLocalId::from_u32(idx as u32))
+                })
+                .unwrap_or_else(|| {
+                    panic!("mutated scalar local should keep runtime storage:\n{body:#?}")
+                });
+            let rooted_ptr = runtime_body_stmts(&body)
+                .find_map(|stmt| match stmt {
+                    RStmt::Assign {
+                        dst,
+                        expr: RExpr::AddrOf { place },
+                    } if place.root == PlaceRoot::Slot(rooted_scalar) => Some(*dst),
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    panic!("mutated scalar local should take the address of its rooted slot:\n{body:#?}")
+                });
+            let stored_ptr = transported_local_from_param(&body, rooted_ptr);
+            assert!(
+                runtime_body_stmts(&body).any(|stmt| {
+                    matches!(
+                        stmt,
+                        RStmt::Store { dst, .. }
+                            if matches!(dst.root, PlaceRoot::Ptr { addr, .. } if addr == stored_ptr)
+                    )
+                }),
+                "mutated scalar local should store through the rooted slot pointer:\n{body:#?}"
+            );
+        }
+    );
+}
+
+#[test]
 fn immutable_own_aggregate_param_field_reads_stay_unrooted() {
     with_runtime_package!(
         "immutable_own_aggregate_param_field_reads_stay_unrooted.fe",

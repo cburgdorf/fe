@@ -12,6 +12,7 @@ use driver::DriverDataBase;
 use fe_codegen::emit_module_sonatina_ir;
 use std::{collections::HashSet, path::Path};
 use test_utils::_macro_support::_insta::{self, Settings};
+use tracing::{info, warn};
 use url::Url;
 
 fn with_top_mod_for_source<T>(
@@ -238,10 +239,20 @@ fn get_balance(addr: u256) -> u256
     balances.get(key: addr)
 }
 
-pub fn main() -> u256 {
-    let mut balances = StorageMap<u256, u256, 0>::new()
-    with (balances) {
-        get_balance(1)
+msg M {
+    #[selector = 0]
+    Get -> u256,
+}
+
+contract C {
+    balances: StorageMap<u256, u256>
+
+    recv M {
+        Get -> u256 uses (balances) {
+            with (balances) {
+                get_balance(addr: 1)
+            }
+        }
     }
 }
 "#,
@@ -251,7 +262,7 @@ pub fn main() -> u256 {
         },
     );
     assert!(
-        output.contains("func private %get_balance") && output.contains("object @main"),
+        output.contains("func private %get_balance") && output.contains("object @C"),
         "concrete-provider StorageMap helper should emit real Sonatina IR:\n{output}"
     );
 }
@@ -410,6 +421,7 @@ pub contract C {
     glob: "*.fe"
 )]
 fn sonatina_ir_snap(fixture: Fixture<&str>) {
+    let _logging = test_utils::setup_test_tracing();
     let mut db = DriverDataBase::default();
     let file_url = Url::from_file_path(fixture.path()).expect("fixture path should be absolute");
     db.workspace().touch(
@@ -426,11 +438,11 @@ fn sonatina_ir_snap(fixture: Fixture<&str>) {
     let output = match emit_module_sonatina_ir(&db, top_mod) {
         Ok(ir) => ir,
         Err(fe_codegen::LowerError::Unsupported(msg)) => {
-            tracing::info!("SKIP {}: unsupported ({msg})", fixture.path());
+            info!("SKIP {}: unsupported ({msg})", fixture.path());
             return;
         }
         Err(fe_codegen::LowerError::Internal(msg)) => {
-            tracing::warn!("SKIP {}: internal error ({msg})", fixture.path());
+            warn!("SKIP {}: internal error ({msg})", fixture.path());
             return;
         }
         Err(err) => panic!("Sonatina IR lowering failed: {err}"),

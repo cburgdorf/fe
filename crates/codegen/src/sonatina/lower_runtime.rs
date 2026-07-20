@@ -227,7 +227,7 @@ impl<'db, 'a> ModuleLowerer<'db, 'a> {
         }
 
         let ty = self.ty_for_layout(region.layout(self.db))?;
-        let init = self.gv_initializer_for_const(region.value(self.db).clone())?;
+        let init = self.gv_initializer_for_const(region.value(self.db).clone(), None)?;
         let name = self.const_name(region);
         let gv = self.builder.declare_gv(GlobalVariableData::constant(
             name,
@@ -242,10 +242,11 @@ impl<'db, 'a> ModuleLowerer<'db, 'a> {
     fn gv_initializer_for_const(
         &mut self,
         node: ConstNode<'db>,
+        class: Option<&RuntimeClass<'db>>,
     ) -> Result<sonatina_ir::global_variable::GvInitializer, LowerError> {
         Ok(match node {
             ConstNode::Scalar(scalar) => sonatina_ir::global_variable::GvInitializer::make_imm(
-                self.immediate_for_const(&scalar, None)?,
+                self.immediate_for_const(&scalar, class)?,
             ),
             ConstNode::Aggregate { layout, fields } => {
                 let ty = self.ty_for_layout(layout)?;
@@ -254,20 +255,37 @@ impl<'db, 'a> ModuleLowerer<'db, 'a> {
                 })?;
                 match compound {
                     CompoundType::Array { .. } => {
+                        let Layout::Array(data) = layout.data(self.db) else {
+                            return Err(LowerError::Internal(format!(
+                                "array const global should have an array layout, got `{layout:?}`"
+                            )));
+                        };
+                        let elem_class = data.elem.clone();
                         sonatina_ir::global_variable::GvInitializer::make_array(
                             fields
                                 .iter()
                                 .cloned()
-                                .map(|field| self.gv_initializer_for_const(field))
+                                .map(|field| {
+                                    self.gv_initializer_for_const(field, Some(&elem_class))
+                                })
                                 .collect::<Result<Vec<_>, _>>()?,
                         )
                     }
                     CompoundType::Struct(_) => {
+                        let Layout::Struct(data) = layout.data(self.db) else {
+                            return Err(LowerError::Internal(format!(
+                                "struct const global should have a struct layout, got `{layout:?}`"
+                            )));
+                        };
+                        let field_classes = data.fields.clone();
                         sonatina_ir::global_variable::GvInitializer::make_struct(
                             fields
                                 .iter()
                                 .cloned()
-                                .map(|field| self.gv_initializer_for_const(field))
+                                .enumerate()
+                                .map(|(idx, field)| {
+                                    self.gv_initializer_for_const(field, field_classes.get(idx))
+                                })
                                 .collect::<Result<Vec<_>, _>>()?,
                         )
                     }
@@ -518,10 +536,19 @@ impl<'db, 'a> ModuleLowerer<'db, 'a> {
                 signed,
                 words,
             } => Immediate::from_i256(bytes_to_i256(words, *signed), int_ty(*bits)),
-            ConstScalar::FixedBytes(bytes) => Immediate::from_i256(
-                bytes_to_i256(bytes, false),
-                fixed_bytes_ty(bytes.len() as u16),
-            ),
+            ConstScalar::FixedBytes(bytes) => {
+                // The value may hold fewer bytes than the declared class
+                // (e.g. a short string literal for a `String<N>` slot), so
+                // type the immediate from the class when we have one.
+                let ty = match class {
+                    Some(RuntimeClass::Scalar(ScalarClass {
+                        repr: mir::ScalarRepr::FixedBytes { len },
+                        ..
+                    })) => fixed_bytes_ty(*len),
+                    _ => fixed_bytes_ty(bytes.len() as u16),
+                };
+                Immediate::from_i256(bytes_to_i256(bytes, false), ty)
+            }
             ConstScalar::Address { bytes, .. } => {
                 Immediate::from_i256(bytes_to_i256(bytes, false), Type::I256)
             }
@@ -1922,21 +1949,61 @@ impl<'ctx, 'db, 'a> FunctionLowerer<'ctx, 'db, 'a> {
                     .insert_inst(Shr::new(self.module.inst_set(), shift, word), Type::I256)
             }
             RuntimeBuiltin::MakeContractFieldRef { slot, class, .. } => {
-                if matches!(
-                    class,
+                match class {
                     RuntimeClass::Ref {
-                        kind: RefKind::Provider {
-                            space: AddressSpaceKind::Memory,
-                            ..
-                        },
+                        pointee,
+                        kind:
+                            RefKind::Provider {
+                                space: AddressSpaceKind::Memory,
+                                ..
+                            },
                         ..
+                    } => {
+                        // Init-time immutable contract fields are represented as memory-backed
+                        // providers, which lower to object references in Sonatina. Allocate a
+                        // fresh object for the field and let the init wrapper serialize its
+                        // final contents into the returned runtime bytecode.
+                        let pointee_ty = self.module.ty_for_class(pointee)?;
+                        let objref_ty = self.fb.module_builder.objref_type(pointee_ty);
+                        self.fb.insert_inst(
+                            ObjAlloc::new(self.module.inst_set(), pointee_ty),
+                            objref_ty,
+                        )
                     }
-                ) {
-                    return Err(LowerError::Unsupported(
-                        "memory contract field handles are not supported".to_string(),
-                    ));
+                    RuntimeClass::Ref {
+                        kind:
+                            RefKind::Provider {
+                                space: AddressSpaceKind::Code,
+                                ..
+                            },
+                        ..
+                    } => {
+                        // Code-backed contract fields are stored in a tail data section appended
+                        // to the deployed runtime bytecode, so the runtime absolute offset is
+                        // `codesize + slot`.
+                        let mir::ContractFieldSlot::CodeTailBytes(tail_offset) = slot else {
+                            return Err(LowerError::Internal(format!(
+                                "code-backed contract field ref should carry a code-tail slot, got {slot}"
+                            )));
+                        };
+                        let code_size = self
+                            .fb
+                            .insert_inst(EvmCodeSize::new(self.module.inst_set()), Type::I256);
+                        let offset = self.fb.make_imm_value(I256::from(*tail_offset));
+                        self.fb.insert_inst(
+                            Add::new(self.module.inst_set(), code_size, offset),
+                            Type::I256,
+                        )
+                    }
+                    _ => {
+                        let mir::ContractFieldSlot::Words(words) = slot else {
+                            return Err(LowerError::Internal(format!(
+                                "contract field ref should carry a word slot, got {slot}"
+                            )));
+                        };
+                        self.fb.make_imm_value(I256::from(*words))
+                    }
                 }
-                self.fb.make_imm_value(I256::from(*slot))
             }
         })
     }
@@ -3553,7 +3620,8 @@ impl<'ctx, 'db, 'a> FunctionLowerer<'ctx, 'db, 'a> {
                         space:
                             AddressSpaceKind::Storage
                             | AddressSpaceKind::Transient
-                            | AddressSpaceKind::Calldata,
+                            | AddressSpaceKind::Calldata
+                            | AddressSpaceKind::Code,
                         ..
                     },
                 ..
@@ -3565,7 +3633,8 @@ impl<'ctx, 'db, 'a> FunctionLowerer<'ctx, 'db, 'a> {
                 )),
                 AddressSpaceKind::Storage
                 | AddressSpaceKind::Transient
-                | AddressSpaceKind::Calldata => self.load_aggregate_from_ptr(addr, space, *layout),
+                | AddressSpaceKind::Calldata
+                | AddressSpaceKind::Code => self.load_aggregate_from_ptr(addr, space, *layout),
             },
             RuntimeClass::Ref { .. } => Err(LowerError::Unsupported(
                 "loading handle values from raw-address places is not supported".to_string(),
@@ -3718,22 +3787,40 @@ impl<'ctx, 'db, 'a> FunctionLowerer<'ctx, 'db, 'a> {
     }
 
     fn load_word(&mut self, addr: ValueId, space: AddressSpaceKind) -> Result<ValueId, LowerError> {
-        Ok(match space {
-            AddressSpaceKind::Memory => self.fb.insert_inst(
+        match space {
+            AddressSpaceKind::Memory => Ok(self.fb.insert_inst(
                 Mload::new(self.module.inst_set(), addr, Type::I256),
                 Type::I256,
-            ),
-            AddressSpaceKind::Storage => self
+            )),
+            AddressSpaceKind::Storage => Ok(self
                 .fb
-                .insert_inst(EvmSload::new(self.module.inst_set(), addr), Type::I256),
-            AddressSpaceKind::Transient => self
+                .insert_inst(EvmSload::new(self.module.inst_set(), addr), Type::I256)),
+            AddressSpaceKind::Transient => Ok(self
                 .fb
-                .insert_inst(EvmTload::new(self.module.inst_set(), addr), Type::I256),
-            AddressSpaceKind::Calldata => self.fb.insert_inst(
+                .insert_inst(EvmTload::new(self.module.inst_set(), addr), Type::I256)),
+            AddressSpaceKind::Calldata => Ok(self.fb.insert_inst(
                 EvmCalldataLoad::new(self.module.inst_set(), addr),
                 Type::I256,
-            ),
-        })
+            )),
+            AddressSpaceKind::Code => {
+                let len = self.fb.make_imm_value(I256::from(32u64));
+                let ptr_ty = self.fb.ptr_type(Type::I8);
+                let ptr = self
+                    .fb
+                    .insert_inst(EvmMalloc::new(self.module.inst_set(), len), ptr_ty);
+                let ptr = self.coerce_value_to_ty(ptr, Type::I256)?;
+                self.fb.insert_inst_no_result(EvmCodeCopy::new(
+                    self.module.inst_set(),
+                    ptr,
+                    addr,
+                    len,
+                ));
+                Ok(self.fb.insert_inst(
+                    Mload::new(self.module.inst_set(), ptr, Type::I256),
+                    Type::I256,
+                ))
+            }
+        }
     }
 
     fn load_scalar(
@@ -3765,7 +3852,8 @@ impl<'ctx, 'db, 'a> FunctionLowerer<'ctx, 'db, 'a> {
                         space:
                             AddressSpaceKind::Storage
                             | AddressSpaceKind::Transient
-                            | AddressSpaceKind::Calldata,
+                            | AddressSpaceKind::Calldata
+                            | AddressSpaceKind::Code,
                         ..
                     },
                 ..
@@ -3793,6 +3881,11 @@ impl<'ctx, 'db, 'a> FunctionLowerer<'ctx, 'db, 'a> {
             AddressSpaceKind::Calldata => {
                 return Err(LowerError::Unsupported(
                     "storing into calldata-backed providers is not supported".to_string(),
+                ));
+            }
+            AddressSpaceKind::Code => {
+                return Err(LowerError::Unsupported(
+                    "storing into code-backed providers is not supported".to_string(),
                 ));
             }
         }
@@ -3940,6 +4033,11 @@ impl<'ctx, 'db, 'a> FunctionLowerer<'ctx, 'db, 'a> {
 
         let from_ptr = from.is_pointer(&self.fb.module_builder.ctx);
         let to_ptr = ty.is_pointer(&self.fb.module_builder.ctx);
+        if !from_ptr && !to_ptr && (!from.is_integral() || !ty.is_integral()) {
+            return Err(LowerError::Internal(format!(
+                "cannot coerce non-scalar value from {from:?} to {ty:?}"
+            )));
+        }
         Ok(match (from_ptr, to_ptr) {
             (true, false) => {
                 if !ty.is_integral() {
@@ -4534,7 +4632,9 @@ impl<'ctx, 'db, 'a> FunctionLowerer<'ctx, 'db, 'a> {
 
     fn scale_for_space(&self, space: AddressSpaceKind, units: u64) -> u64 {
         match space {
-            AddressSpaceKind::Memory | AddressSpaceKind::Calldata => units.saturating_mul(32),
+            AddressSpaceKind::Memory | AddressSpaceKind::Calldata | AddressSpaceKind::Code => {
+                units.saturating_mul(32)
+            }
             AddressSpaceKind::Storage | AddressSpaceKind::Transient => units,
         }
     }

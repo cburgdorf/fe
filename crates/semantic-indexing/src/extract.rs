@@ -6,7 +6,7 @@
 use common::ingot::Ingot;
 use hir::{
     SpannedHirDb,
-    core::semantic::SymbolView,
+    core::semantic::{SignatureWithSpan, SymbolView},
     hir_def::{
         Contract, Enum, FieldParent, HirIngot, Impl, ImplTrait, ItemKind, Struct, TopLevelMod,
         Trait, VariantKind, Visibility, scope_graph::ScopeId,
@@ -26,6 +26,9 @@ pub struct DocExtractor<'db> {
     db: &'db dyn SpannedHirDb,
     /// Root path for computing relative display paths
     root_path: Option<std::path::PathBuf>,
+    /// Include `#[test]` functions in the output.
+    /// Off by default — test fns pollute the public API sidebar.
+    include_tests: bool,
 }
 
 impl<'db> DocExtractor<'db> {
@@ -33,6 +36,7 @@ impl<'db> DocExtractor<'db> {
         Self {
             db,
             root_path: None,
+            include_tests: false,
         }
     }
 
@@ -41,6 +45,24 @@ impl<'db> DocExtractor<'db> {
     pub fn with_root_path(mut self, root: std::path::PathBuf) -> Self {
         self.root_path = Some(root);
         self
+    }
+
+    /// Include `#[test]` functions in the extracted output.
+    pub fn with_include_tests(mut self, include: bool) -> Self {
+        self.include_tests = include;
+        self
+    }
+
+    /// Returns true if `item` is a `#[test(...)]` function that should be
+    /// filtered out unless `include_tests` is enabled.
+    fn is_filtered_test_item(&self, item: ItemKind<'db>) -> bool {
+        if self.include_tests {
+            return false;
+        }
+        matches!(item, ItemKind::Func(_))
+            && item
+                .attrs(self.db)
+                .is_some_and(|attrs| attrs.has_attr(self.db, "test"))
     }
 
     /// Rewrite a path to use the ingot's config name instead of "lib".
@@ -57,6 +79,18 @@ impl<'db> DocExtractor<'db> {
     ) -> Option<DocItem> {
         let mut doc_item = self.extract_item(item)?;
         doc_item.path = self.qualify_path_with_ingot(&doc_item.path, ingot);
+
+        // If this is the ingot root module (name is literally "lib" from
+        // `lib.fe`), substitute the ingot's configured name so pages don't
+        // render `<h1>lib</h1>`. Match on the qualified path being exactly
+        // the ingot name so a nested `foo::lib` submodule is left alone.
+        if matches!(doc_item.kind, DocItemKind::Module)
+            && doc_item.name == "lib"
+            && let Some(cfg_name) = ingot.config(self.db).and_then(|c| c.metadata.name.clone())
+            && doc_item.path == cfg_name.as_str()
+        {
+            doc_item.name = cfg_name.to_string();
+        }
 
         // The display_file from get_source_location is already relative to workspace root,
         // which includes the ingot directory. No need to prepend ingot name again.
@@ -187,7 +221,8 @@ impl<'db> DocExtractor<'db> {
 
     /// Extract methods from an `impl Trait for Type` block as DocImplMethod
     fn extract_impl_trait_methods(&self, it: ImplTrait<'db>) -> Vec<DocImplMethod> {
-        it.methods(self.db)
+        let mut methods: Vec<_> = it
+            .methods(self.db)
             .filter_map(|func| {
                 let name = func.name(self.db).to_opt()?.data(self.db).to_string();
                 let (signature, signature_span) = self.get_signature_with_span(func.into());
@@ -204,12 +239,25 @@ impl<'db> DocExtractor<'db> {
                     docs,
                 })
             })
-            .collect()
+            .collect();
+
+        methods.extend(it.assoc_consts(self.db).filter_map(|assoc_const| {
+            let name = assoc_const.name(self.db)?.data(self.db).to_string();
+            let docs = assoc_const.docs(self.db).map(|s| DocContent::from_raw(&s));
+            let (signature, signature_span) = assoc_const
+                .signature_with_span(self.db)
+                .map(|sig_span| self.signature_span_data(sig_span))
+                .unwrap_or_else(|| (format!("const {name}"), None));
+            Some(self.assoc_const_impl_method(name, signature, signature_span, docs))
+        }));
+
+        methods
     }
 
-    /// Extract methods from an `impl Type` block as DocImplMethod
+    /// Extract methods and associated consts from an `impl Type` block as inline impl members.
     fn extract_impl_methods_for_type(&self, i: Impl<'db>) -> Vec<DocImplMethod> {
-        i.funcs(self.db)
+        let mut methods: Vec<_> = i
+            .funcs(self.db)
             .filter_map(|func| {
                 let name = func.name(self.db).to_opt()?.data(self.db).to_string();
                 let (signature, signature_span) = self.get_signature_with_span(func.into());
@@ -226,7 +274,22 @@ impl<'db> DocExtractor<'db> {
                     docs,
                 })
             })
-            .collect()
+            .collect();
+
+        methods.extend(
+            i.assoc_consts(self.db)
+                .enumerate()
+                .filter_map(|(idx, assoc_const)| {
+                    let scope = ScopeId::ImplConst(i, idx as u16);
+                    let name = assoc_const.name(self.db)?.data(self.db).to_string();
+                    let docs = self.get_docstring(scope).map(|s| DocContent::from_raw(&s));
+                    let (signature, signature_span) =
+                        self.get_symbol_signature_with_span(SymbolView::new(scope));
+                    Some(self.assoc_const_impl_method(name, signature, signature_span, docs))
+                }),
+        );
+
+        methods
     }
 
     /// Extract documentation for a single item
@@ -237,12 +300,43 @@ impl<'db> DocExtractor<'db> {
             _ => {}
         }
 
+        // Skip `#[test]` fns unless explicitly requested. Doc pages should
+        // focus on the public API surface by default.
+        if self.is_filtered_test_item(item) {
+            return None;
+        }
+
+        // Skip the synthetic pieces produced by `msg` desugaring — the
+        // per-variant struct and its accompanying impl blocks. The `msg` Mod
+        // itself is the sole DocItem for that block; variants appear inline
+        // on its page (see `extract_children` for `ItemKind::Mod(_)`).
+        match item {
+            ItemKind::Struct(s) if is_desugared_msg_variant_struct(self.db, s) => return None,
+            ItemKind::ImplTrait(it) if is_desugared_msg_impl_trait(self.db, it) => return None,
+            ItemKind::Impl(i)
+                if matches!(
+                    span::impl_ast(self.db, i),
+                    HirOrigin::Desugared(DesugaredOrigin::Msg(_))
+                ) =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+
         // Skip items nested inside containers (traits, structs, enums, impls) —
         // they are already captured as children of their parent DocItem.
-        if let Some(parent) = item.scope().parent_item(self.db)
-            && crate::index_util::is_container_item(parent)
-        {
-            return None;
+        // For a `msg` Mod the variants are also rendered as children, so
+        // treat that Mod as a container too.
+        if let Some(parent) = item.scope().parent_item(self.db) {
+            if crate::index_util::is_container_item(parent) {
+                return None;
+            }
+            if let ItemKind::Mod(m) = parent
+                && is_desugared_msg_mod(self.db, m)
+            {
+                return None;
+            }
         }
 
         let scope = item.scope();
@@ -282,10 +376,7 @@ impl<'db> DocExtractor<'db> {
         match item {
             ItemKind::TopMod(_) => Some(DocItemKind::Module),
             ItemKind::Mod(m) => {
-                if matches!(
-                    span::mod_ast(self.db, m),
-                    HirOrigin::Desugared(DesugaredOrigin::Msg(_))
-                ) {
+                if is_desugared_msg_mod(self.db, m) {
                     Some(DocItemKind::Msg)
                 } else {
                     Some(DocItemKind::Module)
@@ -293,10 +384,7 @@ impl<'db> DocExtractor<'db> {
             }
             ItemKind::Func(_) => Some(DocItemKind::Function),
             ItemKind::Struct(s) => {
-                if matches!(
-                    span::struct_ast(self.db, s),
-                    HirOrigin::Desugared(DesugaredOrigin::Msg(m)) if m.variant_idx.is_some()
-                ) {
+                if is_desugared_msg_variant_struct(self.db, s) {
                     Some(DocItemKind::MsgVariant)
                 } else {
                     Some(DocItemKind::Struct)
@@ -350,30 +438,87 @@ impl<'db> DocExtractor<'db> {
         }
     }
 
-    /// Get the item's signature and its source span data for SCIP overlay.
-    fn get_signature_with_span(&self, item: ItemKind<'db>) -> (String, Option<SignatureSpanData>) {
-        let sym = SymbolView::from_item(item);
+    fn span_to_sig_data(&self, span: &common::diagnostics::Span) -> Option<SignatureSpanData> {
+        let start: usize = span.range.start().into();
+        let end: usize = span.range.end().into();
+        span.file.url(self.db).map(|u| SignatureSpanData {
+            file_url: u.to_string(),
+            byte_start: start,
+            byte_end: end,
+        })
+    }
+
+    fn signature_span_data(
+        &self,
+        sig_span: SignatureWithSpan,
+    ) -> (String, Option<SignatureSpanData>) {
+        let span_data = sig_span.file.url(self.db).map(|u| SignatureSpanData {
+            file_url: u.to_string(),
+            byte_start: sig_span.byte_start,
+            byte_end: sig_span.byte_end,
+        });
+        (sig_span.text.replace("\r\n", "\n"), span_data)
+    }
+
+    fn get_symbol_signature_with_span(
+        &self,
+        sym: SymbolView<'db>,
+    ) -> (String, Option<SignatureSpanData>) {
         match sym.signature_with_span(self.db) {
-            Some(sig_span) => {
-                let span_data = sig_span.file.url(self.db).map(|u| SignatureSpanData {
-                    file_url: u.to_string(),
-                    byte_start: sig_span.byte_start,
-                    byte_end: sig_span.byte_end,
-                });
-                (sig_span.text.replace("\r\n", "\n"), span_data)
-            }
+            Some(sig_span) => self.signature_span_data(sig_span),
             None => (sym.signature(self.db).unwrap_or_default(), None),
         }
     }
 
-    /// Build `SignatureSpanData` from a resolved `Span`.
-    fn span_to_sig_data(&self, span: &common::diagnostics::Span) -> Option<SignatureSpanData> {
-        let file_url = span.file.url(self.db)?;
-        Some(SignatureSpanData {
-            file_url: file_url.to_string(),
-            byte_start: span.range.start().into(),
-            byte_end: span.range.end().into(),
+    /// Get the item's signature and its source span data for SCIP overlay.
+    fn get_signature_with_span(&self, item: ItemKind<'db>) -> (String, Option<SignatureSpanData>) {
+        self.get_symbol_signature_with_span(SymbolView::from_item(item))
+    }
+
+    fn assoc_const_doc_child(
+        &self,
+        scope: ScopeId<'db>,
+        visibility: DocVisibility,
+    ) -> Option<DocChild> {
+        let name = scope.name(self.db)?.data(self.db).to_string();
+        let docs = self.get_docstring(scope).map(|s| DocContent::from_raw(&s));
+        let (mut signature, signature_span) =
+            self.get_symbol_signature_with_span(SymbolView::new(scope));
+        if signature.is_empty() {
+            signature = format!("const {name}");
+        }
+
+        Some(DocChild {
+            kind: DocChildKind::AssocConst,
+            name,
+            docs,
+            signature,
+            rich_signature: vec![],
+            signature_span,
+            sig_scope: None,
+            visibility,
         })
+    }
+
+    fn assoc_const_impl_method(
+        &self,
+        name: String,
+        mut signature: String,
+        signature_span: Option<SignatureSpanData>,
+        docs: Option<DocContent>,
+    ) -> DocImplMethod {
+        if signature.is_empty() {
+            signature = format!("const {name}");
+        }
+
+        DocImplMethod {
+            name,
+            signature,
+            rich_signature: vec![],
+            signature_span,
+            sig_scope: None,
+            docs,
+        }
     }
 
     /// Build a signature span covering name..type for a field.
@@ -384,6 +529,17 @@ impl<'db> DocExtractor<'db> {
     /// to be resolved. Instead we span from the name token start to the type
     /// node end, which exactly matches the signature text layout.
     fn field_sig_span(&self, field_view: FieldView<'db>) -> Option<SignatureSpanData> {
+        // Desugared msg variant struct fields: the HIR field spans inherit
+        // the variant block's DesugaredOrigin, so `.fields().field(i).name()`
+        // collapses to the entire variant body. Skip the signature span so
+        // the renderer shows the plain signature text (`name: Type`) without
+        // overlaying SCIP occurrences on a span that would shift positions.
+        if let hir::hir_def::FieldParent::Struct(s) = field_view.parent
+            && is_desugared_msg_variant_struct(self.db, s)
+        {
+            return None;
+        }
+
         let name_span = match field_view.parent {
             hir::hir_def::FieldParent::Struct(s) => s
                 .span()
@@ -454,13 +610,182 @@ impl<'db> DocExtractor<'db> {
     fn extract_children(&self, item: ItemKind<'db>) -> Vec<DocChild> {
         match item {
             ItemKind::Struct(s) => self.extract_struct_fields(s),
-            ItemKind::Contract(c) => self.extract_contract_fields(c),
+            ItemKind::Contract(c) => {
+                let mut children = self.extract_contract_fields(c);
+                // init block (if any)
+                if let Some(init_child) = self.extract_contract_init(c) {
+                    children.push(init_child);
+                }
+                // recv handler arms
+                children.extend(self.extract_contract_recv_handlers(c));
+                children
+            }
             ItemKind::Enum(e) => self.extract_enum_variants(e),
             ItemKind::Trait(t) => self.extract_trait_members(t),
             ItemKind::Impl(i) => self.extract_impl_members(i),
             ItemKind::ImplTrait(it) => self.extract_impl_trait_members(it),
+            ItemKind::Mod(m) if is_desugared_msg_mod(self.db, m) => self.extract_msg_variants(m),
             _ => Vec::new(),
         }
+    }
+
+    /// Extract the contract `init(...)` block as a `DocChild` of kind `Init`.
+    ///
+    /// The signature is the source text spanning the `init` keyword through
+    /// the closing paren of the params (and `uses (...)` clause if present),
+    /// i.e. everything up to the opening `{` of the body.
+    fn extract_contract_init(&self, c: Contract<'db>) -> Option<DocChild> {
+        let _init = c.init(self.db)?;
+
+        // Full span of the init block AST (includes body). We'll trim to the
+        // header by cutting at the first `{` so the signature is stable even
+        // if the body uses nested braces.
+        let init_span = c.span().init_block().resolve(self.db)?;
+        let start: usize = init_span.range.start().into();
+        let end: usize = init_span.range.end().into();
+        let file_text = init_span.file.text(self.db);
+        let slice = file_text.get(start..end)?;
+        // Cut at the first `{` to get the header.
+        let header_end_rel = slice.find('{').unwrap_or(slice.len());
+        let header = slice[..header_end_rel].trim_end().to_string();
+
+        let file_url = init_span.file.url(self.db)?;
+        let signature_span = Some(SignatureSpanData {
+            file_url: file_url.to_string(),
+            byte_start: start,
+            byte_end: start + header_end_rel,
+        });
+
+        Some(DocChild {
+            kind: DocChildKind::Init,
+            name: "init".to_string(),
+            docs: None,
+            signature: header,
+            rich_signature: vec![],
+            signature_span,
+            sig_scope: None,
+            visibility: DocVisibility::Public,
+        })
+    }
+
+    /// Extract each arm of every `recv` block in the contract as a
+    /// `DocChild` of kind `RecvHandler`.
+    ///
+    /// Signature is the source text of the arm header (pattern through the
+    /// optional return type and `uses (...)` clause), stopping at the body's
+    /// opening brace.
+    fn extract_contract_recv_handlers(&self, c: Contract<'db>) -> Vec<DocChild> {
+        let mut out = Vec::new();
+        let recvs = c.recvs(self.db);
+        for (recv_idx, recv) in recvs.data(self.db).iter().enumerate() {
+            let msg_type_name = recv
+                .msg_path
+                .and_then(|p| p.ident(self.db).to_opt())
+                .map(|id| id.data(self.db).to_string());
+
+            for (arm_idx, arm) in recv.arms.data(self.db).iter().enumerate() {
+                let arm_lazy = c.span().recv(recv_idx).arms().arm(arm_idx);
+                let Some(arm_span) = arm_lazy.clone().resolve(self.db) else {
+                    continue;
+                };
+
+                let start: usize = arm_span.range.start().into();
+                let end: usize = arm_span.range.end().into();
+                let file_text = arm_span.file.text(self.db);
+                let Some(slice) = file_text.get(start..end) else {
+                    continue;
+                };
+
+                // Header goes up to the body's opening `{`. Use the body
+                // span's start (if resolvable) to find it precisely — a
+                // naive `slice.find('{')` would stop at the first record
+                // pattern brace like `Lock { challenge }`.
+                let header_end_abs = arm_lazy
+                    .body()
+                    .resolve(self.db)
+                    .map(|bs| usize::from(bs.range.start()))
+                    .unwrap_or(end);
+                let header_end_rel = header_end_abs.saturating_sub(start).min(slice.len());
+                let header = slice[..header_end_rel].trim_end().to_string();
+
+                // Name: variant identifier when available; fallback to "_"
+                // for wildcard arms.
+                let name = arm
+                    .variant_path(self.db)
+                    .and_then(|p| p.ident(self.db).to_opt())
+                    .map(|id| id.data(self.db).to_string())
+                    .unwrap_or_else(|| {
+                        if arm.is_fallback(self.db) {
+                            "_".to_string()
+                        } else {
+                            format!("arm{}_{}", recv_idx, arm_idx)
+                        }
+                    });
+
+                // Disambiguate duplicate arm names across multiple recv blocks
+                // (rare, but possible if the same msg type is handled twice).
+                let qualified_name = if let Some(ref msg) = msg_type_name {
+                    format!("{}::{}", msg, name)
+                } else {
+                    name.clone()
+                };
+
+                let file_url = arm_span.file.url(self.db);
+                let signature_span = file_url.map(|u| SignatureSpanData {
+                    file_url: u.to_string(),
+                    byte_start: start,
+                    byte_end: start + header_end_rel,
+                });
+
+                out.push(DocChild {
+                    kind: DocChildKind::RecvHandler,
+                    name: qualified_name,
+                    docs: None,
+                    signature: header,
+                    rich_signature: vec![],
+                    signature_span,
+                    sig_scope: None,
+                    visibility: DocVisibility::Public,
+                });
+            }
+        }
+        out
+    }
+
+    /// Extract variants from a desugared `msg` Mod as `DocChild::Variant`.
+    ///
+    /// A `msg` block desugars into a `Mod` whose children are the per-variant
+    /// structs (plus internal trait impls). For docs we surface each variant
+    /// struct as a child of the msg DocItem so the `msg` page renders like an
+    /// `enum` page — variants listed inline rather than as separate items.
+    fn extract_msg_variants(&self, m: hir::hir_def::Mod<'db>) -> Vec<DocChild> {
+        let mut out = Vec::new();
+        for child in m.children_non_nested(self.db) {
+            let ItemKind::Struct(s) = child else { continue };
+            if !is_desugared_msg_variant_struct(self.db, s) {
+                continue;
+            }
+            let Some(name_ident) = s.name(self.db).to_opt() else {
+                continue;
+            };
+            let name = name_ident.data(self.db).to_string();
+            let docs = self
+                .get_docstring(s.scope())
+                .map(|s| DocContent::from_raw(&s));
+            let (signature, signature_span) = self.get_signature_with_span(child);
+
+            out.push(DocChild {
+                kind: DocChildKind::Variant,
+                name,
+                docs,
+                signature,
+                rich_signature: vec![],
+                signature_span,
+                sig_scope: None,
+                visibility: DocVisibility::Public,
+            });
+        }
+        out
     }
 
     fn extract_struct_fields(&self, s: Struct<'db>) -> Vec<DocChild> {
@@ -633,6 +958,13 @@ impl<'db> DocExtractor<'db> {
             }
         }
 
+        for (idx, _assoc_const) in t.assoc_consts(self.db).enumerate() {
+            let scope = ScopeId::TraitConst(t, idx as u16);
+            if let Some(child) = self.assoc_const_doc_child(scope, DocVisibility::Public) {
+                children.push(child);
+            }
+        }
+
         children
     }
 
@@ -647,7 +979,6 @@ impl<'db> DocExtractor<'db> {
                     .map(|s| DocContent::from_raw(&s));
                 let (signature, signature_span) = self.get_signature_with_span(func.into());
                 let visibility = self.convert_visibility(func.vis(self.db));
-
                 children.push(DocChild {
                     kind: DocChildKind::Method,
                     name: name_str,
@@ -658,6 +989,15 @@ impl<'db> DocExtractor<'db> {
                     sig_scope: None,
                     visibility,
                 });
+            }
+        }
+
+        for (idx, _assoc_const) in i.assoc_consts(self.db).enumerate() {
+            let scope = ScopeId::ImplConst(i, idx as u16);
+            if let Some(child) =
+                self.assoc_const_doc_child(scope, self.convert_visibility(scope.data(self.db).vis))
+            {
+                children.push(child);
             }
         }
 
@@ -685,6 +1025,30 @@ impl<'db> DocExtractor<'db> {
                     signature_span,
                     sig_scope: None,
                     visibility,
+                });
+            }
+        }
+
+        for assoc_const in it.assoc_consts(self.db) {
+            if let Some(name) = assoc_const.name(self.db) {
+                let name = name.data(self.db).to_string();
+                let docs = assoc_const.docs(self.db).map(|s| DocContent::from_raw(&s));
+                let (mut signature, signature_span) = assoc_const
+                    .signature_with_span(self.db)
+                    .map(|sig_span| self.signature_span_data(sig_span))
+                    .unwrap_or_else(|| (format!("const {name}"), None));
+                if signature.is_empty() {
+                    signature = format!("const {name}");
+                }
+                children.push(DocChild {
+                    kind: DocChildKind::AssocConst,
+                    name,
+                    docs,
+                    signature,
+                    rich_signature: vec![],
+                    signature_span,
+                    sig_scope: None,
+                    visibility: DocVisibility::Public,
                 });
             }
         }
@@ -761,6 +1125,52 @@ impl<'db> DocExtractor<'db> {
         vec![self.build_module_node_for_ingot(ingot, root_mod)]
     }
 
+    /// Should this child be skipped when populating a parent module's item
+    /// list in the nav tree? Excludes msg-desugared synthetic impls and the
+    /// per-variant structs (which are siblings of the msg Mod in the HIR but
+    /// should only appear as children of the Msg item, not as top-level
+    /// entries in the enclosing module's sidebar).
+    fn should_skip_module_item(&self, item: ItemKind<'db>) -> bool {
+        // Filter out `#[test]` functions by default so the nav tree is not
+        // dominated by test_* entries.
+        if self.is_filtered_test_item(item) {
+            return true;
+        }
+        match item {
+            ItemKind::Struct(s) if is_desugared_msg_variant_struct(self.db, s) => true,
+            ItemKind::ImplTrait(it) if is_desugared_msg_impl_trait(self.db, it) => true,
+            ItemKind::Impl(i)
+                if matches!(
+                    span::impl_ast(self.db, i),
+                    HirOrigin::Desugared(DesugaredOrigin::Msg(_))
+                ) =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Emit a DocModuleItem entry into `items` for `child`.
+    fn push_item_entry(
+        &self,
+        ingot: Ingot<'db>,
+        child: ItemKind<'db>,
+        items: &mut Vec<DocModuleItem>,
+    ) {
+        if let (Some(name), Some(kind)) = (child.name(self.db), self.item_kind_to_doc_kind(child)) {
+            let raw_child_path = child.scope().pretty_path(self.db).unwrap_or_default();
+            let child_path = self.qualify_path_with_ingot(&raw_child_path, ingot);
+            let summary = self.get_summary(child.scope());
+            items.push(DocModuleItem {
+                name: name.data(self.db).to_string(),
+                path: child_path,
+                kind,
+                summary,
+            });
+        }
+    }
+
     /// Build a module node including file-based children from the ingot's module tree
     fn build_module_node_for_ingot(
         &self,
@@ -792,6 +1202,13 @@ impl<'db> DocExtractor<'db> {
         // Get inline children (defined in this file)
         for child in top_mod.children_non_nested(self.db) {
             match child {
+                ItemKind::Mod(m) if is_desugared_msg_mod(self.db, m) => {
+                    // A msg block desugars to a Mod; surface it as an item
+                    // (kind: msg) in the parent rather than a sub-module, so
+                    // nav links resolve to the msg DocItem instead of a
+                    // non-existent `.../mod` URL.
+                    self.push_item_entry(ingot, child, &mut items);
+                }
                 ItemKind::Mod(_) => {
                     // Use ingot-aware builder for inline modules too
                     children.push(self.build_module_node_for_ingot_inline(ingot, child));
@@ -801,19 +1218,10 @@ impl<'db> DocExtractor<'db> {
                 | ItemKind::Body(_)
                 | ItemKind::TopMod(_) => {}
                 _ => {
-                    if let (Some(name), Some(kind)) =
-                        (child.name(self.db), self.item_kind_to_doc_kind(child))
-                    {
-                        let raw_child_path = child.scope().pretty_path(self.db).unwrap_or_default();
-                        let child_path = self.qualify_path_with_ingot(&raw_child_path, ingot);
-                        let summary = self.get_summary(child.scope());
-                        items.push(DocModuleItem {
-                            name: name.data(self.db).to_string(),
-                            path: child_path,
-                            kind,
-                            summary,
-                        });
+                    if self.should_skip_module_item(child) {
+                        continue;
                     }
+                    self.push_item_entry(ingot, child, &mut items);
                 }
             }
         }
@@ -867,24 +1275,18 @@ impl<'db> DocExtractor<'db> {
 
         for child in direct_children {
             match child {
+                ItemKind::Mod(m) if is_desugared_msg_mod(self.db, m) => {
+                    self.push_item_entry(ingot, child, &mut items);
+                }
                 ItemKind::Mod(_) | ItemKind::TopMod(_) => {
                     children.push(self.build_module_node_for_ingot_inline(ingot, child));
                 }
                 ItemKind::StaticAssert(_) | ItemKind::Use(_) | ItemKind::Body(_) => {}
                 _ => {
-                    if let (Some(name), Some(kind)) =
-                        (child.name(self.db), self.item_kind_to_doc_kind(child))
-                    {
-                        let raw_child_path = child.scope().pretty_path(self.db).unwrap_or_default();
-                        let child_path = self.qualify_path_with_ingot(&raw_child_path, ingot);
-                        let summary = self.get_summary(child.scope());
-                        items.push(DocModuleItem {
-                            name: name.data(self.db).to_string(),
-                            path: child_path,
-                            kind,
-                            summary,
-                        });
+                    if self.should_skip_module_item(child) {
+                        continue;
                     }
+                    self.push_item_entry(ingot, child, &mut items);
                 }
             }
         }
@@ -926,11 +1328,28 @@ impl<'db> DocExtractor<'db> {
 
         for child in direct_children {
             match child {
+                ItemKind::Mod(m) if is_desugared_msg_mod(self.db, m) => {
+                    if let (Some(name), Some(kind)) =
+                        (child.name(self.db), self.item_kind_to_doc_kind(child))
+                    {
+                        let child_path = child.scope().pretty_path(self.db).unwrap_or_default();
+                        let summary = self.get_summary(child.scope());
+                        items.push(DocModuleItem {
+                            name: name.data(self.db).to_string(),
+                            path: child_path,
+                            kind,
+                            summary,
+                        });
+                    }
+                }
                 ItemKind::Mod(_) | ItemKind::TopMod(_) => {
                     children.push(self.build_module_node(child));
                 }
                 ItemKind::StaticAssert(_) | ItemKind::Use(_) | ItemKind::Body(_) => {}
                 _ => {
+                    if self.should_skip_module_item(child) {
+                        continue;
+                    }
                     if let (Some(name), Some(kind)) =
                         (child.name(self.db), self.item_kind_to_doc_kind(child))
                     {
@@ -964,6 +1383,38 @@ impl<'db> DocExtractor<'db> {
             items,
         }
     }
+}
+
+/// Returns true if `m` is a `Mod` synthesized from a `msg` block.
+///
+/// A `msg` block desugars into a `Mod` containing per-variant structs and
+/// their `impl MsgVariant` blocks. We treat that `Mod` as a single
+/// `DocItemKind::Msg` item (not as a navigable sub-module) so the user sees
+/// one "Message" entry in the sidebar rather than a phantom sub-module.
+fn is_desugared_msg_mod<'db>(db: &'db dyn SpannedHirDb, m: hir::hir_def::Mod<'db>) -> bool {
+    matches!(
+        span::mod_ast(db, m),
+        HirOrigin::Desugared(DesugaredOrigin::Msg(_))
+    )
+}
+
+/// Returns true if `s` is a `Struct` synthesized from one variant of a `msg`
+/// block (the per-variant payload struct).
+fn is_desugared_msg_variant_struct<'db>(db: &'db dyn SpannedHirDb, s: Struct<'db>) -> bool {
+    matches!(
+        span::struct_ast(db, s),
+        HirOrigin::Desugared(DesugaredOrigin::Msg(msg)) if msg.variant_idx.is_some()
+    )
+}
+
+/// Returns true if `it` is an `ImplTrait` synthesized by the msg desugaring
+/// (the per-variant `impl MsgVariant for V` block). These are internal and
+/// should not appear in docs.
+fn is_desugared_msg_impl_trait<'db>(db: &'db dyn SpannedHirDb, it: ImplTrait<'db>) -> bool {
+    matches!(
+        span::impl_trait_ast(db, it),
+        HirOrigin::Desugared(DesugaredOrigin::Msg(_))
+    )
 }
 
 /// Extract the simple name from a potentially qualified/generic type.
@@ -1110,6 +1561,163 @@ mod tests {
             original.modules.len(),
             restored.modules.len(),
             "module tree mismatch"
+        );
+    }
+
+    #[test]
+    fn extracts_associated_const_doc_children() {
+        let mut db = DriverDataBase::default();
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let file_path = temp.path().join("assoc_consts.fe");
+        let url = url::Url::from_file_path(&file_path).expect("file url");
+        let file = db.workspace().touch(
+            &mut db,
+            url,
+            Some(
+                r#"pub trait Sizes {
+    /// Width in bytes.
+    const WIDTH: u256 = 32
+}
+
+pub struct Packet {}
+
+impl Packet {
+    /// Maximum payload.
+    pub const MAX: u256 = 1024
+}
+
+impl Sizes for Packet {
+    /// Packet width override.
+    const WIDTH: u256 = 64
+}
+"#
+                .to_string(),
+            ),
+        );
+        let top_mod = db.top_mod(file);
+        let extractor = DocExtractor::new(&db);
+        let index = extractor.extract_module(top_mod);
+
+        let trait_item = index
+            .items
+            .iter()
+            .find(|item| item.name == "Sizes")
+            .expect("trait docs");
+        let width = trait_item
+            .children
+            .iter()
+            .find(|child| child.kind == DocChildKind::AssocConst && child.name == "WIDTH")
+            .expect("trait associated const child");
+        assert_eq!(width.signature, "const WIDTH: u256 = 32");
+        assert_eq!(
+            width.docs.as_ref().map(|docs| docs.summary.as_str()),
+            Some("Width in bytes.")
+        );
+
+        let impl_item = top_mod
+            .all_impls(&db)
+            .iter()
+            .copied()
+            .next()
+            .expect("inherent impl");
+        let max_child = extractor
+            .extract_impl_members(impl_item)
+            .into_iter()
+            .find(|child| child.kind == DocChildKind::AssocConst && child.name == "MAX")
+            .expect("inherent associated const child");
+
+        let impl_trait = top_mod
+            .all_impl_traits(&db)
+            .iter()
+            .copied()
+            .next()
+            .expect("impl trait");
+        let width_impl = extractor
+            .extract_impl_trait_members(impl_trait)
+            .into_iter()
+            .find(|child| child.kind == DocChildKind::AssocConst && child.name == "WIDTH")
+            .expect("impl-trait associated const child");
+        assert_eq!(width_impl.signature, "const WIDTH: u256 = 64");
+        assert_eq!(
+            width_impl.docs.as_ref().map(|docs| docs.summary.as_str()),
+            Some("Packet width override.")
+        );
+        assert_eq!(max_child.signature, "pub const MAX: u256 = 1024");
+        assert_eq!(
+            max_child.docs.as_ref().map(|docs| docs.summary.as_str()),
+            Some("Maximum payload.")
+        );
+    }
+
+    #[test]
+    fn extracts_inherent_assoc_consts_into_impl_links() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(
+            temp.path().join("fe.toml"),
+            "[ingot]\nname = \"doc_assoc_consts\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let src_dir = temp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(
+            src_dir.join("lib.fe"),
+            r#"pub trait Limits {
+    const FLOOR: u256
+}
+
+pub struct Packet {}
+
+impl Packet {
+    /// Maximum payload.
+    pub const MAX: u256 = 1024
+}
+
+impl Limits for Packet {
+    /// Minimum payload.
+    const FLOOR: u256 = 1
+}
+"#,
+        )
+        .unwrap();
+
+        let mut db = DriverDataBase::default();
+        let ingot_url = url::Url::from_directory_path(temp.path()).expect("dir url");
+        driver::init_ingot(&mut db, &ingot_url);
+        let ingot = db
+            .workspace()
+            .containing_ingot(&db, ingot_url)
+            .expect("ingot should exist");
+        let extractor = DocExtractor::new(&db);
+        let links = extractor.extract_trait_impl_links(ingot);
+
+        let (_, impl_link) = links
+            .iter()
+            .find(|(target, link)| target == "Packet" && link.trait_name.is_empty())
+            .expect("inherent impl link");
+        let max = impl_link
+            .methods
+            .iter()
+            .find(|method| method.name == "MAX")
+            .expect("inherent associated const inline member");
+        assert_eq!(max.signature, "pub const MAX: u256 = 1024");
+        assert_eq!(
+            max.docs.as_ref().map(|docs| docs.summary.as_str()),
+            Some("Maximum payload.")
+        );
+
+        let (_, trait_impl_link) = links
+            .iter()
+            .find(|(target, link)| target == "Packet" && link.trait_name.ends_with("Limits"))
+            .expect("trait impl link");
+        let floor = trait_impl_link
+            .methods
+            .iter()
+            .find(|method| method.name == "FLOOR")
+            .expect("impl-trait associated const inline member");
+        assert_eq!(floor.signature, "const FLOOR: u256 = 1");
+        assert_eq!(
+            floor.docs.as_ref().map(|docs| docs.summary.as_str()),
+            Some("Minimum payload.")
         );
     }
 

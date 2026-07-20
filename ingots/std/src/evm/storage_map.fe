@@ -1,4 +1,4 @@
-use super::effects::Address
+use super::effects::{Address, RawStorage}
 use super::mem
 use ingot::evm::ops::{keccak256, mstore, sload, sstore}
 use ingot::evm::word::WordRepr
@@ -123,7 +123,11 @@ impl StorageKey for bool {
 /// `SALT` is the mapping's slot seed (the `slot` component in
 /// `keccak256(key ++ slot)`), chosen explicitly for each mapping instance to
 /// prevent collisions.
-pub struct StorageMap<K, V, const SALT: u256 = _> {}
+struct StorageMapSeal {}
+
+pub struct StorageMap<K, V, const SALT: u256 = _> {
+    seal: StorageMapSeal,
+}
 
 impl<K, V, const SALT: u256> Copy for StorageMap<K, V, SALT> {}
 
@@ -157,18 +161,34 @@ fn storagemap_set_word_with_salt<K>(key: K, salt: u256, word: u256)
 }
 
 impl<K: StorageKey, V: WordRepr, const SALT: u256> StorageMap<K, V, SALT> {
-    pub fn new() -> Self {
-        Self {}
+    pub(ingot) fn new_unchecked() -> Self {
+        Self { seal: StorageMapSeal {} }
+    }
+
+    pub fn new() -> Self
+    uses (storage: mut RawStorage)
+    {
+        Self::new_unchecked()
     }
 
     #[inline(always)]
-    pub fn get(self, _ key: K) -> V {
+    pub(ingot) fn get_unchecked(self, _ key: K) -> V {
         V::from_word(storagemap_get_word_with_salt(key, salt: SALT))
     }
 
     #[inline(always)]
-    pub fn set(self, key: K, value: own V) {
+    pub fn get(self, _ key: K) -> V {
+        self.get_unchecked(key)
+    }
+
+    #[inline(always)]
+    pub(ingot) fn set_unchecked(mut self, key: K, value: own V) {
         storagemap_set_word_with_salt(key, salt: SALT, word: value.to_word())
+    }
+
+    #[inline(always)]
+    pub fn set(mut self, key: K, value: own V) {
+        self.set_unchecked(key: key, value)
     }
 }
 
@@ -182,5 +202,69 @@ where A: StorageKey,
         let a_len = A::write_key(ptr: ptr, self.0)
         let b_len = B::write_key(ptr: ptr + a_len, self.1)
         a_len + b_len
+    }
+}
+
+impl<A, B, C> StorageKey for (A, B, C)
+where A: StorageKey,
+      B: StorageKey,
+      C: StorageKey {
+    #[inline(always)]
+    fn write_key(ptr: u256, self) -> u256 {
+        let a_len = A::write_key(ptr: ptr, self.0)
+        let b_len = B::write_key(ptr: ptr + a_len, self.1)
+        let c_len = C::write_key(ptr: ptr + a_len + b_len, self.2)
+        a_len + b_len + c_len
+    }
+}
+
+impl<A, B, C, D> StorageKey for (A, B, C, D)
+where A: StorageKey,
+      B: StorageKey,
+      C: StorageKey,
+      D: StorageKey {
+    #[inline(always)]
+    fn write_key(ptr: u256, self) -> u256 {
+        let a_len = A::write_key(ptr: ptr, self.0)
+        let b_len = B::write_key(ptr: ptr + a_len, self.1)
+        let c_len = C::write_key(ptr: ptr + a_len + b_len, self.2)
+        let d_len = D::write_key(ptr: ptr + a_len + b_len + c_len, self.3)
+        a_len + b_len + c_len + d_len
+    }
+}
+
+impl<A, B, C, D, E> StorageKey for (A, B, C, D, E)
+where A: StorageKey,
+      B: StorageKey,
+      C: StorageKey,
+      D: StorageKey,
+      E: StorageKey {
+    #[inline(always)]
+    fn write_key(ptr: u256, self) -> u256 {
+        let a_len = A::write_key(ptr: ptr, self.0)
+        let b_len = B::write_key(ptr: ptr + a_len, self.1)
+        let c_len = C::write_key(ptr: ptr + a_len + b_len, self.2)
+        let d_len = D::write_key(ptr: ptr + a_len + b_len + c_len, self.3)
+        let e_len = E::write_key(ptr: ptr + a_len + b_len + c_len + d_len, self.4)
+        a_len + b_len + c_len + d_len + e_len
+    }
+}
+
+impl<A, B, C, D, E, F> StorageKey for (A, B, C, D, E, F)
+where A: StorageKey,
+      B: StorageKey,
+      C: StorageKey,
+      D: StorageKey,
+      E: StorageKey,
+      F: StorageKey {
+    #[inline(always)]
+    fn write_key(ptr: u256, self) -> u256 {
+        let a_len = A::write_key(ptr: ptr, self.0)
+        let b_len = B::write_key(ptr: ptr + a_len, self.1)
+        let c_len = C::write_key(ptr: ptr + a_len + b_len, self.2)
+        let d_len = D::write_key(ptr: ptr + a_len + b_len + c_len, self.3)
+        let e_len = E::write_key(ptr: ptr + a_len + b_len + c_len + d_len, self.4)
+        let f_len = F::write_key(ptr: ptr + a_len + b_len + c_len + d_len + e_len, self.5)
+        a_len + b_len + c_len + d_len + e_len + f_len
     }
 }

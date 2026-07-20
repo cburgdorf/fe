@@ -17,7 +17,7 @@ use smallvec1::SmallVec;
 use trait_def::impls_for_trait_def;
 use trait_resolution::constraint::super_trait_cycle;
 use ty_def::{BorrowKind, InvalidCause, TyBase, TyData, TyId, instantiate_adt_field_ty};
-use ty_lower::lower_type_alias;
+use ty_lower::{collect_generic_params, lower_type_alias};
 
 use crate::analysis::name_resolution::{PathRes, resolve_path};
 use crate::analysis::{
@@ -62,15 +62,17 @@ pub use layout_holes::ty_contains_const_hole;
 pub use msg_selector::MsgSelectorAnalysisPass;
 pub use provider::{
     ProviderAddressSpace, ProviderKind, ProviderSemantics, ProviderTransport,
-    RootProviderRegistration, RootProviderSiteKind, address_space_from_ty, provider_semantics,
-    registered_root_providers,
+    RootProviderRegistration, RootProviderSiteKind, effect_space_from_trait_const,
+    provider_semantics, registered_root_providers,
 };
 
 const DEFAULT_TARGET_TY_PATH: &[&str] = &["std", "evm", "EvmTarget"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EffectHandleMetadata<'db> {
-    pub address_space: TyId<'db>,
+    /// `None` when the handle's impl cannot be selected yet (e.g. the type
+    /// still contains inference variables).
+    pub address_space: Option<provider::ProviderAddressSpace>,
     pub target_ty: TyId<'db>,
 }
 
@@ -392,7 +394,28 @@ impl ModuleAnalysisPass for BodyAnalysisPass {
                     ItemKind::Const(const_) => Some(*const_),
                     _ => None,
                 })
-                .flat_map(|const_| &ty_check::check_const_body(db, const_).0)
+                .flat_map(|const_| {
+                    ty_check::check_const_body(db, const_)
+                        .0
+                        .iter()
+                        .chain(ty_check::check_const_value(db, const_))
+                })
+                .map(|diag| diag.to_voucher()),
+        );
+
+        diags.extend(
+            top_mod
+                .all_impl_traits(db)
+                .iter()
+                .flat_map(|impl_trait| ty_check::check_impl_trait_const_bodies(db, *impl_trait))
+                .map(|diag| diag.to_voucher()),
+        );
+
+        diags.extend(
+            top_mod
+                .all_traits(db)
+                .iter()
+                .flat_map(|trait_| ty_check::check_trait_const_default_bodies(db, *trait_))
                 .map(|diag| diag.to_voucher()),
         );
 
@@ -403,6 +426,36 @@ impl ModuleAnalysisPass for BodyAnalysisPass {
                 .flat_map(|assert_| ty_check::check_static_assert(db, *assert_).iter())
                 .map(|diag| diag.to_voucher()),
         );
+
+        // Associated const bodies in inherent impl blocks live inside the impl
+        // rather than as standalone items, so check them here. A value/declared-type
+        // mismatch surfaces as a plain `TypeMismatch`, same as a top-level `const`.
+        // (Trait impl consts are not included: desugared `#[event]`/`#[error]`
+        // impls rely on cascaded body errors being suppressed.)
+        for &impl_ in top_mod.all_impls(db) {
+            // Consts on generic impls have legitimately parametric values
+            // (e.g. `256 / BITS`), validated per instantiation; only flag a
+            // non-evaluable body, not a type-level result.
+            let allow_type_level = !collect_generic_params(db, impl_.into())
+                .params(db)
+                .is_empty();
+            for c in impl_.assoc_consts(db) {
+                let (Some(body), Some(expected_ty)) = (c.value_body(db), c.ty(db)) else {
+                    continue;
+                };
+                let (body_diags, _) = ty_check::check_anon_const_body(db, body, expected_ty);
+                diags.extend(body_diags.iter().map(|diag| diag.to_voucher()));
+                // CTFE-validate the value, but only when it type-checks cleanly
+                // (otherwise the type error is the real diagnostic).
+                if body_diags.is_empty() {
+                    diags.extend(
+                        ty_check::const_body_ctfe_diags(db, body, expected_ty, allow_type_level)
+                            .iter()
+                            .map(|diag| diag.to_voucher()),
+                    );
+                }
+            }
+        }
 
         diags
     }
@@ -503,6 +556,12 @@ impl ModuleAnalysisPass for ContractAnalysisPass {
                     .map(|diag| diag.to_voucher()),
             );
 
+            diags.extend(
+                ty_check::check_contract_immutable_fields_initialized(db, contract)
+                    .iter()
+                    .map(|diag| diag.to_voucher()),
+            );
+
             if contract.init(db).is_some() {
                 diags.extend(
                     ty_check::check_contract_init_body(db, contract)
@@ -575,7 +634,6 @@ pub fn effect_handle_metadata<'db>(
         return None;
     }
     let effect_handle = corelib::resolve_core_trait(db, scope, &["EffectHandle"])?;
-    let address_space_ident = IdentId::new(db, "AddressSpace".to_string());
     let target_ident = IdentId::new(db, "Target".to_string());
     let inst = trait_def::TraitInstId::new(db, effect_handle, vec![ty], IndexMap::new());
     match is_goal_satisfiable(
@@ -585,22 +643,15 @@ pub fn effect_handle_metadata<'db>(
     ) {
         GoalSatisfiability::ContainsInvalid | GoalSatisfiability::UnSat(_) => None,
         GoalSatisfiability::Satisfied(_) | GoalSatisfiability::NeedsConfirmation(_) => {
-            let address_space = normalize::normalize_ty(
-                db,
-                inst.assoc_ty(db, address_space_ident)?,
-                scope,
-                assumptions,
-            );
+            let address_space =
+                provider::effect_space_from_trait_const(db, scope, assumptions, inst);
             let target_ty = normalize::normalize_ty(
                 db,
                 inst.assoc_ty(db, target_ident).unwrap_or(ty),
                 scope,
                 assumptions,
             );
-            (!address_space.has_invalid(db)
-                && !ty_contains_const_hole(db, address_space)
-                && !target_ty.has_invalid(db))
-            .then_some(EffectHandleMetadata {
+            (!target_ty.has_invalid(db)).then_some(EffectHandleMetadata {
                 address_space,
                 target_ty,
             })
