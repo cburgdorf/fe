@@ -2127,15 +2127,20 @@ dependencies = [
 name = "fe-codegen"
 version = "26.2.0"
 dependencies = [
+ "blake3",
  "dir-test",
  "fe-common",
  "fe-driver",
  "fe-hir",
  "fe-mir",
+ "fe-shape-address",
  "fe-test-utils",
+ "fe-trace-facts",
  "hex",
  "num-bigint",
  "rustc-hash 2.1.1",
+ "serde",
+ "serde_json",
  "smallvec 1.15.1",
  "smallvec 2.0.0-alpha.12",
  "sonatina-codegen",
