@@ -17,6 +17,7 @@ use resolver::{
     files::{FilesResolver, FilesResource},
 };
 use rustc_hash::FxHashSet;
+use std::time::Duration;
 use url::Url;
 
 use super::{capabilities::server_capabilities, hover::hover_helper};
@@ -45,6 +46,7 @@ impl std::fmt::Display for NeedsDiagnostics {
 pub struct FileChange {
     pub uri: url::Url,
     pub kind: ChangeKind,
+    pub version: Option<i32>,
 }
 
 #[derive(Debug)]
@@ -357,6 +359,7 @@ pub async fn handle_did_change_watched_files(
         let _ = backend.client.clone().emit(FileChange {
             uri: event.uri,
             kind,
+            version: None,
         });
     }
     Ok(())
@@ -370,6 +373,7 @@ pub async fn handle_did_open_text_document(
     let _ = backend.client.clone().emit(FileChange {
         uri: message.text_document.uri,
         kind: ChangeKind::Open(message.text_document.text),
+        version: Some(message.text_document.version),
     });
     Ok(())
 }
@@ -396,6 +400,7 @@ pub async fn handle_did_change_text_document(
     let _ = backend.client.clone().emit(FileChange {
         uri: message.text_document.uri,
         kind: ChangeKind::Edit(Some(last.text.clone())),
+        version: Some(message.text_document.version),
     });
     Ok(())
 }
@@ -449,6 +454,7 @@ pub async fn handle_file_change(
             ));
         }
     };
+    let document_version = message.version;
 
     // Check if this is a fe.toml file
     let is_fe_toml = path
@@ -465,6 +471,7 @@ pub async fn handle_file_change(
                     .db
                     .workspace()
                     .update(&mut backend.db, url.clone(), contents);
+                note_document_change(backend, &url, document_version);
             }
         }
         ChangeKind::Create => {
@@ -478,6 +485,7 @@ pub async fn handle_file_change(
                     .db
                     .workspace()
                     .update(&mut backend.db, url.clone(), contents);
+                note_document_change(backend, &url, document_version);
 
                 // If a fe.toml was created, discover and load all files in the new ingot
                 if is_fe_toml && let Some(ingot_dir) = path.parent() {
@@ -501,6 +509,7 @@ pub async fn handle_file_change(
                     .db
                     .workspace()
                     .update(&mut backend.db, url.clone(), contents);
+                note_document_change(backend, &url, document_version);
 
                 // If fe.toml was modified, re-scan the ingot for any new files
                 if is_fe_toml && let Some(ingot_dir) = path.parent() {
@@ -512,6 +521,7 @@ pub async fn handle_file_change(
             debug!("file deleted: {:?}", path_str);
             if let Ok(url) = url::Url::from_file_path(&path) {
                 backend.db.workspace().remove(&mut backend.db, &url);
+                backend.clear_document_version(&url);
             }
 
             // When a fe.toml is deleted, re-init the parent workspace so that
@@ -561,6 +571,14 @@ pub async fn handle_file_change(
     }
 
     Ok(())
+}
+
+fn note_document_change(backend: &mut Backend, url: &Url, version: Option<i32>) {
+    if let Some(version) = version {
+        backend.set_document_version(url.clone(), version);
+    } else {
+        backend.clear_document_version(url);
+    }
 }
 
 fn load_ingot_files(
@@ -806,10 +824,51 @@ pub async fn handle_hover_request(
     };
 
     debug!("handling hover request in file: {:?}", file);
-    let (response, doc_path) = hover_helper(&backend.db, file, message).unwrap_or_else(|e| {
-        error!("Error handling hover: {:?}", e);
-        (None, None)
-    });
+    let trace_service = if (backend.tooling_config().lsp.trace.emit_jsonl
+        || backend.tooling_config().lsp.trace.attached_trace.is_some())
+        && (backend.tooling_config().lsp.hover.storage_history
+            || backend.tooling_config().lsp.hover.gas_breakdown)
+    {
+        let config = backend.tooling_config().clone();
+        let trace_config = config.lsp.trace.clone();
+        if trace_config.debounce_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(trace_config.debounce_ms)).await;
+        }
+        let url_for_trace = url.clone();
+        let worker = backend.spawn_on_workers(move |db| {
+            crate::introspection::service_for_file(db, &url_for_trace, config)
+        });
+        match tokio::time::timeout(
+            Duration::from_millis(trace_config.max_query_ms.max(1)),
+            worker,
+        )
+        .await
+        {
+            Ok(Ok(Ok(service))) => service,
+            Ok(Ok(Err(err))) => {
+                debug!("hover trace service unavailable: {err}");
+                None
+            }
+            Ok(Err(err)) => {
+                debug!("hover trace worker failed: {err}");
+                None
+            }
+            Err(_) => {
+                debug!(
+                    "hover trace service exceeded {}ms budget",
+                    trace_config.max_query_ms.max(1)
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let (response, doc_path) = hover_helper(&backend.db, file, message, trace_service.as_ref())
+        .unwrap_or_else(|e| {
+            error!("Error handling hover: {:?}", e);
+            (None, None)
+        });
 
     if let Some(path) = doc_path {
         backend.notify_doc_navigate(path);

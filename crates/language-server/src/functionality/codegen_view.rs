@@ -10,10 +10,11 @@ use driver::DriverDataBase;
 use hir::hir_def::TopLevelMod;
 use hir::lower::map_file_to_mod;
 use mir::build_runtime_package;
+use serde::Deserialize;
 use serde_json::Value;
 use url::Url;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, TraceViewerSelection};
 
 enum CodegenKind {
     Mir,
@@ -59,6 +60,19 @@ pub async fn handle_execute_command(
     // Handle fe.openDocs separately — it opens a URL, not codegen
     if params.command == "fe.openDocs" {
         return handle_open_docs(backend, &params.arguments).await;
+    }
+    if params.command == "fe.trace.openWorkbench" {
+        return handle_open_trace_workbench(backend, &params.arguments).await;
+    }
+    if matches!(
+        params.command.as_str(),
+        "fe.traceLoop" | "fe.explainLocal" | "fe.gasBreakdown" | "fe.openOriginGraph"
+    ) {
+        return Ok(Some(serde_json::json!({
+            "status": "trace command accepted",
+            "command": params.command,
+            "note": "live CLI/LSP HTTP execution is wired in the next phase; reports are served by trace-query"
+        })));
     }
 
     let kind = match params.command.as_str() {
@@ -201,6 +215,171 @@ pub async fn handle_execute_command(
     Ok(None)
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TraceOpenWorkbenchArgs {
+    uri: Option<String>,
+    #[serde(default)]
+    range: Option<TraceOpenWorkbenchRange>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    opt_level: Option<String>,
+    #[serde(default)]
+    view: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TraceOpenWorkbenchRange {
+    start: TraceOpenWorkbenchPosition,
+    end: TraceOpenWorkbenchPosition,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TraceOpenWorkbenchPosition {
+    line: u32,
+    character: u32,
+}
+
+async fn handle_open_trace_workbench(
+    backend: &mut Backend,
+    arguments: &[Value],
+) -> Result<Option<Value>, ResponseError> {
+    let args = parse_trace_open_workbench_args(arguments)?;
+    let uri_str = args.uri.ok_or_else(|| {
+        ResponseError::new(
+            ErrorCode::INVALID_PARAMS,
+            "missing URI argument for fe.trace.openWorkbench".to_string(),
+        )
+    })?;
+    let client_uri = Url::parse(&uri_str).map_err(|err| {
+        ResponseError::new(ErrorCode::INVALID_PARAMS, format!("invalid URI: {err}"))
+    })?;
+    validate_trace_workbench_uri(backend, &client_uri)?;
+    let base_url = backend.docs_url.clone().ok_or_else(|| {
+        ResponseError::new(
+            ErrorCode::INTERNAL_ERROR,
+            "trace workbench requires the combined local HTTP server".to_string(),
+        )
+    })?;
+    let token = read_trace_auth_token(backend)?;
+    let internal_uri = backend.map_client_uri_to_internal(client_uri.clone());
+    let selection = args.range.map(|range| TraceViewerSelection {
+        start_line: range.start.line,
+        start_character: range.start.character,
+        end_line: range.end.line,
+        end_character: range.end.character,
+    });
+    let session = backend.create_trace_viewer_session(
+        internal_uri,
+        args.target.unwrap_or_else(|| "evm".to_string()),
+        args.opt_level.unwrap_or_else(|| "O2".to_string()),
+        args.view
+            .unwrap_or_else(|| "source-postopt-bytecode".to_string()),
+        selection,
+    );
+    let url = format!(
+        "{}/trace/workbench?session={}#token={}",
+        base_url.trim_end_matches('/'),
+        session.id,
+        token
+    );
+    Ok(Some(serde_json::json!({
+        "sessionId": session.id,
+        "url": url,
+        "uri": client_uri,
+        "configHash": session.config_hash,
+        "capabilities": {
+            "events": "sse",
+            "modelDeltas": false,
+            "chunks": true,
+            "selectionSync": true,
+            "revisionHistory": true
+        }
+    })))
+}
+
+fn parse_trace_open_workbench_args(
+    arguments: &[Value],
+) -> Result<TraceOpenWorkbenchArgs, ResponseError> {
+    if let Some(first) = arguments.first() {
+        if let Some(uri) = first.as_str() {
+            return Ok(TraceOpenWorkbenchArgs {
+                uri: Some(uri.to_string()),
+                ..TraceOpenWorkbenchArgs::default()
+            });
+        }
+        if first.is_object() {
+            return serde_json::from_value(first.clone()).map_err(|err| {
+                ResponseError::new(
+                    ErrorCode::INVALID_PARAMS,
+                    format!("invalid fe.trace.openWorkbench arguments: {err}"),
+                )
+            });
+        }
+    }
+    Ok(TraceOpenWorkbenchArgs::default())
+}
+
+fn validate_trace_workbench_uri(backend: &Backend, uri: &Url) -> Result<(), ResponseError> {
+    if uri.scheme() != "file" {
+        return Err(ResponseError::new(
+            ErrorCode::INVALID_PARAMS,
+            format!("trace workbench only supports file:// URIs, got {uri}"),
+        ));
+    }
+    let path = uri.to_file_path().map_err(|()| {
+        ResponseError::new(
+            ErrorCode::INVALID_PARAMS,
+            format!("trace workbench URI is not a local file path: {uri}"),
+        )
+    })?;
+    if path.extension().is_none_or(|ext| ext != "fe") {
+        return Err(ResponseError::new(
+            ErrorCode::INVALID_PARAMS,
+            format!("trace workbench URI must point to a .fe file: {uri}"),
+        ));
+    }
+    if let Some(root) = backend.lsp_workspace_root.as_ref()
+        && !path.starts_with(root)
+    {
+        return Err(ResponseError::new(
+            ErrorCode::INVALID_PARAMS,
+            format!("trace workbench URI is outside the LSP workspace root: {uri}"),
+        ));
+    }
+    Ok(())
+}
+
+fn read_trace_auth_token(backend: &Backend) -> Result<String, ResponseError> {
+    let root = backend.lsp_workspace_root.as_ref().ok_or_else(|| {
+        ResponseError::new(
+            ErrorCode::INTERNAL_ERROR,
+            "trace workbench requires a workspace root for local auth".to_string(),
+        )
+    })?;
+    let token_path = root.join(".fe-lsp.token");
+    let token = std::fs::read_to_string(&token_path).map_err(|err| {
+        ResponseError::new(
+            ErrorCode::INTERNAL_ERROR,
+            format!(
+                "failed to read LSP auth token {}: {err}",
+                token_path.display()
+            ),
+        )
+    })?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err(ResponseError::new(
+            ErrorCode::INTERNAL_ERROR,
+            "LSP auth token file is empty".to_string(),
+        ));
+    }
+    Ok(token)
+}
+
 /// Handle `fe.openDocs` — open the documentation page for an item.
 ///
 /// Arguments: `[path]` where `path` is a doc URL path like `"mylib::Foo/struct"`,
@@ -269,6 +448,126 @@ async fn handle_open_docs(
     open_in_browser(uri.as_str());
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        handle_open_trace_workbench, parse_trace_open_workbench_args, validate_trace_workbench_uri,
+    };
+    use crate::backend::Backend;
+    use async_lsp::MainLoop;
+    use async_lsp::router::Router;
+    use introspection_config::FeToolingConfig;
+
+    fn test_backend(docs_url: Option<String>) -> Backend {
+        let (_main_loop, client_socket) = MainLoop::new_server(|_client| Router::<()>::new(()));
+        Backend::new(
+            client_socket,
+            None,
+            None,
+            docs_url,
+            FeToolingConfig::default(),
+        )
+    }
+
+    #[test]
+    fn trace_open_workbench_accepts_string_or_object_args() {
+        let parsed =
+            parse_trace_open_workbench_args(&[serde_json::json!("file:///workspace/demo.fe")])
+                .unwrap();
+        assert_eq!(parsed.uri.as_deref(), Some("file:///workspace/demo.fe"));
+
+        let parsed = parse_trace_open_workbench_args(&[serde_json::json!({
+            "uri": "file:///workspace/demo.fe",
+            "target": "evm",
+            "optLevel": "O2",
+            "view": "source-postopt-bytecode"
+        })])
+        .unwrap();
+        assert_eq!(parsed.uri.as_deref(), Some("file:///workspace/demo.fe"));
+        assert_eq!(parsed.target.as_deref(), Some("evm"));
+        assert_eq!(parsed.opt_level.as_deref(), Some("O2"));
+        assert_eq!(parsed.view.as_deref(), Some("source-postopt-bytecode"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn trace_open_workbench_creates_tokenized_session_url() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".fe-lsp.token"), "test-token\n").unwrap();
+        let source = dir.path().join("demo.fe");
+        std::fs::write(&source, "contract Demo {}\n").unwrap();
+        let uri = url::Url::from_file_path(&source).unwrap();
+        let mut backend = test_backend(Some("http://127.0.0.1:5179".to_string()));
+        backend.lsp_workspace_root = Some(dir.path().to_path_buf());
+        backend.set_document_version(uri.clone(), 12);
+
+        let result = handle_open_trace_workbench(
+            &mut backend,
+            &[serde_json::json!({
+                "uri": uri.as_str(),
+                "target": "evm",
+                "optLevel": "O2",
+                "view": "source-postopt-bytecode",
+                "range": {
+                    "start": { "line": 3, "character": 4 },
+                    "end": { "line": 3, "character": 12 }
+                }
+            })],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let session_id = result["sessionId"].as_str().unwrap();
+        assert!(session_id.starts_with("trace-session-"));
+        assert!(result["url"].as_str().unwrap().contains("/trace/workbench"));
+        assert!(
+            result["url"]
+                .as_str()
+                .unwrap()
+                .contains("#token=test-token")
+        );
+        assert_eq!(result["capabilities"]["events"], "sse");
+        assert_eq!(result["capabilities"]["chunks"], true);
+        assert_eq!(result["capabilities"]["selectionSync"], true);
+
+        let session = backend.trace_viewer_session(session_id).unwrap();
+        assert_eq!(session.uri, uri.as_str());
+        assert_eq!(
+            result["configHash"].as_str(),
+            Some(session.config_hash.as_str())
+        );
+        assert_ne!(
+            session.config_hash,
+            backend.tooling_config().stable_hash(),
+            "trace session config hash must include target/opt-level/view, not just compiler tooling config"
+        );
+        assert_eq!(session.document_version, Some(12));
+        assert_eq!(session.initial_selection.unwrap().start_line, 3);
+
+        tokio::task::spawn_blocking(move || drop(backend))
+            .await
+            .expect("backend drop task panicked");
+    }
+
+    #[test]
+    fn trace_open_workbench_rejects_non_fe_and_outside_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let inside_txt = dir.path().join("demo.txt");
+        std::fs::write(&inside_txt, "not fe\n").unwrap();
+        let outside = tempfile::NamedTempFile::with_suffix(".fe").unwrap();
+        let mut backend = test_backend(Some("http://127.0.0.1:5179".to_string()));
+        backend.lsp_workspace_root = Some(dir.path().to_path_buf());
+
+        let inside_txt_uri = url::Url::from_file_path(&inside_txt).unwrap();
+        let err = validate_trace_workbench_uri(&backend, &inside_txt_uri).unwrap_err();
+        assert!(err.message.contains("must point to a .fe file"));
+
+        let outside_uri = url::Url::from_file_path(outside.path()).unwrap();
+        let err = validate_trace_workbench_uri(&backend, &outside_uri).unwrap_err();
+        assert!(err.message.contains("outside the LSP workspace root"));
+    }
 }
 
 fn open_in_browser(url: &str) {

@@ -1,11 +1,15 @@
 use async_lsp::ClientSocket;
 use driver::DriverDataBase;
-use rustc_hash::FxHashSet;
+use introspection_config::FeToolingConfig;
+use rustc_hash::{FxHashMap, FxHashSet};
+use serde::Serialize;
+use std::collections::BTreeMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tokio::sync::broadcast;
+use trace_query::TraceIntrospectionService;
 use url::Url;
 
 use crate::virtual_files::{VirtualFiles, materialize_builtins};
@@ -51,6 +55,29 @@ pub struct Backend {
     pub(super) doc_reload_generation: Arc<AtomicU64>,
     pub(super) docs_url: Option<String>,
     pub(super) lsp_workspace_root: Option<PathBuf>,
+    pub(super) tooling_config: FeToolingConfig,
+    document_versions: FxHashMap<Url, i32>,
+    trace_cache: FxHashMap<TraceCacheKey, TraceIntrospectionService>,
+    trace_viewer_sessions: FxHashMap<String, TraceViewerSession>,
+    trace_viewer_revisions: FxHashMap<String, Vec<TraceViewerRevisionRecord>>,
+    trace_viewer_models: FxHashMap<String, TraceViewerModelCacheEntry>,
+    trace_viewer_generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TraceCacheKey {
+    uri: Url,
+    document_version: i32,
+    config_hash: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TraceViewerModelCacheEntry {
+    pub document_version: i32,
+    pub config_hash: String,
+    pub model: serde_json::Value,
+    pub manifest: serde_json::Value,
+    pub chunks: BTreeMap<String, serde_json::Value>,
 }
 
 impl Backend {
@@ -59,6 +86,7 @@ impl Backend {
         doc_nav_tx: Option<broadcast::Sender<String>>,
         doc_reload_tx: Option<broadcast::Sender<String>>,
         docs_url: Option<String>,
+        tooling_config: FeToolingConfig,
     ) -> Self {
         let db = DriverDataBase::default();
         let mut virtual_files = VirtualFiles::new("fe-language-server-").ok();
@@ -86,6 +114,295 @@ impl Backend {
             doc_reload_generation: Arc::new(AtomicU64::new(0)),
             docs_url,
             lsp_workspace_root: None,
+            tooling_config,
+            document_versions: FxHashMap::default(),
+            trace_cache: FxHashMap::default(),
+            trace_viewer_sessions: FxHashMap::default(),
+            trace_viewer_revisions: FxHashMap::default(),
+            trace_viewer_models: FxHashMap::default(),
+            trace_viewer_generation: 0,
+        }
+    }
+
+    pub fn tooling_config(&self) -> &FeToolingConfig {
+        &self.tooling_config
+    }
+
+    pub fn set_document_version(&mut self, uri: Url, version: i32) {
+        self.document_versions.insert(uri.clone(), version);
+        self.clear_trace_cache_for_uri(&uri);
+    }
+
+    pub fn clear_document_version(&mut self, uri: &Url) {
+        self.document_versions.remove(uri);
+        self.clear_trace_cache_for_uri(uri);
+        self.clear_trace_viewer_model_cache_for_uri(uri);
+    }
+
+    pub fn document_version(&self, uri: &Url) -> Option<i32> {
+        self.document_versions.get(uri).copied()
+    }
+
+    pub fn cached_trace_service(
+        &self,
+        uri: &Url,
+        document_version: i32,
+        config_hash: &str,
+    ) -> Option<TraceIntrospectionService> {
+        self.trace_cache
+            .get(&TraceCacheKey {
+                uri: uri.clone(),
+                document_version,
+                config_hash: config_hash.to_string(),
+            })
+            .cloned()
+    }
+
+    pub fn cache_trace_service(
+        &mut self,
+        uri: Url,
+        document_version: i32,
+        config_hash: String,
+        service: TraceIntrospectionService,
+    ) {
+        self.trace_cache.insert(
+            TraceCacheKey {
+                uri,
+                document_version,
+                config_hash,
+            },
+            service,
+        );
+    }
+
+    pub fn clear_trace_cache_for_uri(&mut self, uri: &Url) {
+        self.trace_cache.retain(|key, _| &key.uri != uri);
+    }
+
+    pub(crate) fn create_trace_viewer_session(
+        &mut self,
+        uri: Url,
+        target: impl Into<String>,
+        opt_level: impl Into<String>,
+        view: impl Into<String>,
+        initial_selection: Option<TraceViewerSelection>,
+    ) -> TraceViewerSession {
+        self.trace_viewer_generation = self.trace_viewer_generation.saturating_add(1);
+        let id = format!("trace-session-{:x}", self.trace_viewer_generation);
+        let target = target.into();
+        let opt_level = opt_level.into();
+        let view = view.into();
+        let compiler_config_hash = self.tooling_config.stable_hash();
+        let target_config_hash = trace_viewer_target_config_hash(&target, &opt_level, &view);
+        let config_hash =
+            trace_viewer_service_config_hash(&compiler_config_hash, &target_config_hash);
+        let document_version = self.document_version(&uri);
+        let session = TraceViewerSession {
+            id: id.clone(),
+            uri: uri.to_string(),
+            target,
+            opt_level,
+            view,
+            config_hash,
+            document_version,
+            initial_selection,
+        };
+        self.trace_viewer_sessions.insert(id, session.clone());
+        self.trace_viewer_revisions
+            .insert(session.id.clone(), Vec::new());
+        self.trace_viewer_models.remove(&session.id);
+        session
+    }
+
+    pub(crate) fn trace_viewer_session(&self, session_id: &str) -> Option<TraceViewerSession> {
+        self.trace_viewer_sessions.get(session_id).cloned()
+    }
+
+    pub(crate) fn record_trace_viewer_revision(
+        &mut self,
+        session_id: &str,
+        mut record: TraceViewerRevisionRecord,
+    ) -> bool {
+        if !self.trace_viewer_sessions.contains_key(session_id) {
+            return false;
+        }
+        let revisions = self
+            .trace_viewer_revisions
+            .entry(session_id.to_string())
+            .or_default();
+        if record.previous_revision.is_none() {
+            record.previous_revision = revisions.last().map(|revision| revision.revision);
+        }
+        // Coalesce only with a prior record of the SAME status. A failed
+        // rebuild reuses the fallback ready revision's model_digest, so without
+        // the status check it would collide on (revision, model_digest) and
+        // overwrite the ready record — after which latest_ready_* finds nothing
+        // and the history claims that revision never succeeded.
+        if let Some(last) = revisions.last_mut()
+            && last.revision == record.revision
+            && last.model_digest == record.model_digest
+            && last.status == record.status
+        {
+            *last = record;
+            return true;
+        }
+        revisions.push(record);
+        const MAX_TRACE_VIEWER_REVISIONS: usize = 64;
+        if revisions.len() > MAX_TRACE_VIEWER_REVISIONS {
+            let excess = revisions.len() - MAX_TRACE_VIEWER_REVISIONS;
+            revisions.drain(0..excess);
+        }
+        true
+    }
+
+    pub(crate) fn trace_viewer_revisions(
+        &self,
+        session_id: &str,
+    ) -> Option<Vec<TraceViewerRevisionRecord>> {
+        self.trace_viewer_sessions.get(session_id)?;
+        Some(
+            self.trace_viewer_revisions
+                .get(session_id)
+                .cloned()
+                .unwrap_or_default(),
+        )
+    }
+
+    pub(crate) fn cached_trace_workbench_model(
+        &self,
+        session_id: &str,
+        document_version: Option<i32>,
+        config_hash: &str,
+    ) -> Option<serde_json::Value> {
+        self.cached_trace_workbench_entry(session_id, document_version, config_hash)
+            .map(|entry| entry.model.clone())
+    }
+
+    pub(crate) fn cached_trace_workbench_manifest(
+        &self,
+        session_id: &str,
+        document_version: Option<i32>,
+        config_hash: &str,
+    ) -> Option<serde_json::Value> {
+        self.cached_trace_workbench_entry(session_id, document_version, config_hash)
+            .map(|entry| entry.manifest.clone())
+    }
+
+    pub(crate) fn cached_trace_workbench_manifest_for_digest(
+        &self,
+        session_id: &str,
+        model_digest: &str,
+    ) -> Option<serde_json::Value> {
+        self.cached_trace_workbench_entry_for_model_digest(session_id, model_digest)
+            .map(|entry| entry.manifest.clone())
+    }
+
+    pub(crate) fn cached_trace_workbench_chunk(
+        &self,
+        session_id: &str,
+        document_version: Option<i32>,
+        config_hash: &str,
+        digest: &str,
+    ) -> Option<serde_json::Value> {
+        self.cached_trace_workbench_entry(session_id, document_version, config_hash)
+            .and_then(|entry| entry.chunks.get(digest).cloned())
+    }
+
+    pub(crate) fn cached_trace_workbench_chunk_for_digest(
+        &self,
+        session_id: &str,
+        model_digest: &str,
+        digest: &str,
+    ) -> Option<serde_json::Value> {
+        self.cached_trace_workbench_entry_for_model_digest(session_id, model_digest)
+            .and_then(|entry| entry.chunks.get(digest).cloned())
+    }
+
+    pub(crate) fn cached_trace_workbench_chunks_response(
+        &self,
+        session_id: &str,
+        document_version: Option<i32>,
+        config_hash: &str,
+        digests: Vec<String>,
+    ) -> Option<serde_json::Value> {
+        let entry = self.cached_trace_workbench_entry(session_id, document_version, config_hash)?;
+        Some(trace_workbench_chunks_response(entry, digests))
+    }
+
+    pub(crate) fn cached_trace_workbench_chunks_response_for_digest(
+        &self,
+        session_id: &str,
+        model_digest: &str,
+        digests: Vec<String>,
+    ) -> Option<serde_json::Value> {
+        let entry = self.cached_trace_workbench_entry_for_model_digest(session_id, model_digest)?;
+        Some(trace_workbench_chunks_response(entry, digests))
+    }
+
+    pub(crate) fn cache_trace_workbench_model(
+        &mut self,
+        session_id: &str,
+        document_version: Option<i32>,
+        config_hash: String,
+        model: serde_json::Value,
+        manifest: serde_json::Value,
+        chunks: BTreeMap<String, serde_json::Value>,
+    ) {
+        let Some(document_version) = document_version else {
+            return;
+        };
+        if !self.trace_viewer_sessions.contains_key(session_id) {
+            return;
+        }
+        self.trace_viewer_models.insert(
+            session_id.to_string(),
+            TraceViewerModelCacheEntry {
+                document_version,
+                config_hash,
+                model,
+                manifest,
+                chunks,
+            },
+        );
+    }
+
+    fn cached_trace_workbench_entry(
+        &self,
+        session_id: &str,
+        document_version: Option<i32>,
+        config_hash: &str,
+    ) -> Option<&TraceViewerModelCacheEntry> {
+        let document_version = document_version?;
+        let entry = self.trace_viewer_models.get(session_id)?;
+        (entry.document_version == document_version && entry.config_hash == config_hash)
+            .then_some(entry)
+    }
+
+    fn cached_trace_workbench_entry_for_model_digest(
+        &self,
+        session_id: &str,
+        model_digest: &str,
+    ) -> Option<&TraceViewerModelCacheEntry> {
+        let entry = self.trace_viewer_models.get(session_id)?;
+        (entry
+            .manifest
+            .get("rootDigest")
+            .and_then(serde_json::Value::as_str)
+            == Some(model_digest))
+        .then_some(entry)
+    }
+
+    fn clear_trace_viewer_model_cache_for_uri(&mut self, uri: &Url) {
+        let uri_text = uri.to_string();
+        let stale_sessions = self
+            .trace_viewer_sessions
+            .iter()
+            .filter_map(|(session_id, session)| {
+                (session.uri == uri_text).then(|| session_id.clone())
+            })
+            .collect::<Vec<_>>();
+        for session_id in stale_sessions {
+            self.trace_viewer_models.remove(&session_id);
         }
     }
 
@@ -197,6 +514,89 @@ impl Backend {
     }
 }
 
+pub(crate) fn trace_viewer_target_config_hash(target: &str, opt_level: &str, view: &str) -> String {
+    trace_viewer_digest_text(&format!(
+        "target={target}\nopt_level={opt_level}\nview={view}\n"
+    ))
+}
+
+pub(crate) fn trace_viewer_service_config_hash(
+    compiler_config_hash: &str,
+    target_config_hash: &str,
+) -> String {
+    trace_viewer_digest_text(&format!(
+        "compiler_config={compiler_config_hash}\ntarget_config={target_config_hash}\n"
+    ))
+}
+
+pub(crate) fn trace_viewer_digest_text(text: &str) -> String {
+    format!("blake3:{}", blake3::hash(text.as_bytes()).to_hex())
+}
+
+fn trace_workbench_chunks_response(
+    entry: &TraceViewerModelCacheEntry,
+    digests: Vec<String>,
+) -> serde_json::Value {
+    let mut chunks = Vec::new();
+    let mut missing = Vec::new();
+    for digest in digests {
+        match entry.chunks.get(&digest) {
+            Some(payload) => chunks.push(payload.clone()),
+            None => missing.push(digest),
+        }
+    }
+    serde_json::json!({
+        "chunks": chunks,
+        "missing": missing,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TraceViewerSession {
+    pub id: String,
+    pub uri: String,
+    pub target: String,
+    pub opt_level: String,
+    pub view: String,
+    pub config_hash: String,
+    pub document_version: Option<i32>,
+    pub initial_selection: Option<TraceViewerSelection>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TraceViewerSelection {
+    pub start_line: u32,
+    pub start_character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TraceViewerRevisionRecord {
+    pub revision: u64,
+    pub previous_revision: Option<u64>,
+    pub document_version: Option<i32>,
+    pub status: String,
+    pub config_hash: String,
+    pub compiler_config_hash: String,
+    pub target_config_hash: String,
+    pub target: String,
+    pub opt_level: String,
+    pub view: String,
+    pub source_hash: Option<String>,
+    pub trace_snapshot_digest: String,
+    pub model_digest: String,
+    pub summary_digest: String,
+    pub source_digest: String,
+    pub indexes_digest: String,
+    pub rail_components_digest: String,
+    pub pane_digests: BTreeMap<String, String>,
+    pub report_digests: BTreeMap<String, String>,
+}
+
 fn normalize_file_uri(uri: Url) -> Url {
     if uri.scheme() != "file" {
         return uri;
@@ -211,9 +611,10 @@ fn normalize_file_uri(uri: Url) -> Url {
 
 #[cfg(test)]
 mod tests {
-    use super::{Backend, WorkerError, normalize_file_uri};
+    use super::{Backend, TraceViewerRevisionRecord, WorkerError, normalize_file_uri};
     use async_lsp::MainLoop;
     use async_lsp::router::Router;
+    use std::collections::BTreeMap;
     use url::Url;
 
     #[test]
@@ -237,7 +638,239 @@ mod tests {
     /// these tests.
     fn test_backend() -> Backend {
         let (_main_loop, client_socket) = MainLoop::new_server(|_client| Router::<()>::new(()));
-        Backend::new(client_socket, None, None, None)
+        Backend::new(
+            client_socket,
+            None,
+            None,
+            None,
+            introspection_config::FeToolingConfig::default(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn document_version_tracking_records_and_clears_lsp_versions() {
+        let mut backend = test_backend();
+        let uri = Url::parse("file:///workspace/src/lib.fe").unwrap();
+
+        assert_eq!(backend.document_version(&uri), None);
+        backend.set_document_version(uri.clone(), 7);
+        assert_eq!(backend.document_version(&uri), Some(7));
+        backend.clear_document_version(&uri);
+        assert_eq!(backend.document_version(&uri), None);
+
+        tokio::task::spawn_blocking(move || drop(backend))
+            .await
+            .expect("backend drop task panicked");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn trace_viewer_sessions_are_revisioned_and_retrievable() {
+        let mut backend = test_backend();
+        let uri = Url::parse("file:///workspace/src/lib.fe").unwrap();
+        backend.set_document_version(uri.clone(), 12);
+
+        let session = backend.create_trace_viewer_session(
+            uri.clone(),
+            "evm",
+            "O2",
+            "source-postopt-bytecode",
+            None,
+        );
+
+        assert!(session.id.starts_with("trace-session-"));
+        assert_eq!(session.uri, uri.to_string());
+        assert_eq!(session.document_version, Some(12));
+        assert_eq!(backend.trace_viewer_session(&session.id), Some(session));
+
+        tokio::task::spawn_blocking(move || drop(backend))
+            .await
+            .expect("backend drop task panicked");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn trace_viewer_revision_history_records_deduplicates_and_caps() {
+        let mut backend = test_backend();
+        let uri = Url::parse("file:///workspace/src/lib.fe").unwrap();
+        let session =
+            backend.create_trace_viewer_session(uri, "evm", "O2", "source-postopt-bytecode", None);
+
+        assert_eq!(
+            backend.trace_viewer_revisions(&session.id),
+            Some(Vec::new())
+        );
+        assert!(!backend.record_trace_viewer_revision(
+            "missing-session",
+            trace_viewer_revision_record(1, "blake3:missing"),
+        ));
+
+        assert!(backend.record_trace_viewer_revision(
+            &session.id,
+            trace_viewer_revision_record(1, "blake3:a"),
+        ));
+        assert!(backend.record_trace_viewer_revision(
+            &session.id,
+            trace_viewer_revision_record(1, "blake3:a"),
+        ));
+        assert_eq!(
+            backend.trace_viewer_revisions(&session.id).unwrap().len(),
+            1
+        );
+
+        for revision in 2..=66 {
+            assert!(backend.record_trace_viewer_revision(
+                &session.id,
+                trace_viewer_revision_record(revision, &format!("blake3:{revision:x}")),
+            ));
+        }
+        let revisions = backend.trace_viewer_revisions(&session.id).unwrap();
+        assert_eq!(revisions.len(), 64);
+        assert_eq!(revisions.first().unwrap().revision, 3);
+        assert_eq!(revisions.first().unwrap().previous_revision, Some(2));
+        assert_eq!(revisions.last().unwrap().revision, 66);
+        assert_eq!(revisions.last().unwrap().previous_revision, Some(65));
+
+        tokio::task::spawn_blocking(move || drop(backend))
+            .await
+            .expect("backend drop task panicked");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn trace_viewer_model_cache_is_revision_scoped_and_retained_on_change() {
+        let mut backend = test_backend();
+        let uri = Url::parse("file:///workspace/src/lib.fe").unwrap();
+        backend.set_document_version(uri.clone(), 7);
+        let session = backend.create_trace_viewer_session(
+            uri.clone(),
+            "evm",
+            "O2",
+            "source-postopt-bytecode",
+            None,
+        );
+        let model = serde_json::json!({
+            "revision": { "id": 7 },
+            "metadata": { "dataSource": "lsp-live" }
+        });
+        let manifest = serde_json::json!({
+            "revision": 7,
+            "rootDigest": "blake3:model",
+            "summaryDigest": "blake3:summary"
+        });
+        let chunks = BTreeMap::from([(
+            "blake3:summary".to_string(),
+            serde_json::json!({
+                "kind": "summary",
+                "digest": "blake3:summary",
+                "value": { "revision": { "id": 7 } }
+            }),
+        )]);
+
+        backend.cache_trace_workbench_model(
+            &session.id,
+            Some(7),
+            "config-a".to_string(),
+            model.clone(),
+            manifest.clone(),
+            chunks,
+        );
+
+        assert_eq!(
+            backend.cached_trace_workbench_model(&session.id, Some(7), "config-a"),
+            Some(model)
+        );
+        assert_eq!(
+            backend.cached_trace_workbench_manifest(&session.id, Some(7), "config-a"),
+            Some(manifest)
+        );
+        assert_eq!(
+            backend
+                .cached_trace_workbench_chunk(&session.id, Some(7), "config-a", "blake3:summary")
+                .and_then(|chunk| chunk["kind"].as_str().map(str::to_string)),
+            Some("summary".to_string())
+        );
+        assert_eq!(
+            backend.cached_trace_workbench_chunks_response(
+                &session.id,
+                Some(7),
+                "config-a",
+                vec!["blake3:summary".to_string(), "blake3:missing".to_string()]
+            ),
+            Some(serde_json::json!({
+                "chunks": [{
+                    "kind": "summary",
+                    "digest": "blake3:summary",
+                    "value": { "revision": { "id": 7 } }
+                }],
+                "missing": ["blake3:missing"]
+            }))
+        );
+        assert_eq!(
+            backend.cached_trace_workbench_model(&session.id, Some(7), "config-b"),
+            None
+        );
+        assert_eq!(
+            backend.cached_trace_workbench_model(&session.id, Some(8), "config-a"),
+            None
+        );
+        assert_eq!(
+            backend
+                .cached_trace_workbench_manifest_for_digest(&session.id, "blake3:model")
+                .and_then(|manifest| manifest["revision"].as_u64()),
+            Some(7)
+        );
+        assert_eq!(
+            backend
+                .cached_trace_workbench_chunk_for_digest(
+                    &session.id,
+                    "blake3:model",
+                    "blake3:summary",
+                )
+                .and_then(|chunk| chunk["kind"].as_str().map(str::to_string)),
+            Some("summary".to_string())
+        );
+
+        backend.set_document_version(uri, 8);
+        assert_eq!(
+            backend.cached_trace_workbench_model(&session.id, Some(8), "config-a"),
+            None
+        );
+        assert_eq!(
+            backend
+                .cached_trace_workbench_manifest_for_digest(&session.id, "blake3:model")
+                .and_then(|manifest| manifest["revision"].as_u64()),
+            Some(7),
+            "previous ready workbench payload must remain available for failed-revision fallback"
+        );
+
+        tokio::task::spawn_blocking(move || drop(backend))
+            .await
+            .expect("backend drop task panicked");
+    }
+
+    fn trace_viewer_revision_record(
+        revision: u64,
+        model_digest: &str,
+    ) -> TraceViewerRevisionRecord {
+        TraceViewerRevisionRecord {
+            revision,
+            previous_revision: None,
+            document_version: Some(revision as i32),
+            status: "ready".to_string(),
+            config_hash: "config".to_string(),
+            compiler_config_hash: "config".to_string(),
+            target_config_hash: "blake3:target".to_string(),
+            target: "evm".to_string(),
+            opt_level: "O2".to_string(),
+            view: "source-postopt-bytecode".to_string(),
+            source_hash: Some("blake3:source-text".to_string()),
+            trace_snapshot_digest: "blake3:trace".to_string(),
+            model_digest: model_digest.to_string(),
+            summary_digest: "blake3:summary".to_string(),
+            source_digest: "blake3:source".to_string(),
+            indexes_digest: "blake3:indexes".to_string(),
+            rail_components_digest: "blake3:rails".to_string(),
+            pane_digests: BTreeMap::new(),
+            report_digests: BTreeMap::new(),
+        }
     }
 
     /// Regression test: `spawn_on_workers` must `catch_unwind` inside the

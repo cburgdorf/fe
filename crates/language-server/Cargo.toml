@@ -35,6 +35,7 @@ tokio = { version = "1.43.0", default-features = false, features = ["rt-multi-th
 tokio-tungstenite = "0.26"
 tower = "0.5.2"
 axum = { version = "0.8", features = ["ws"] }
+blake3.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url = "2.5.4"
@@ -46,6 +47,9 @@ fe-web.workspace = true
 mir.workspace = true
 fmt.workspace = true
 hir.workspace = true
+introspection-config.workspace = true
+trace-facts.workspace = true
+trace-query.workspace = true
 parser.workspace = true
 resolver.workspace = true
 semantic-indexing.workspace = true

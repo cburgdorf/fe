@@ -1,30 +1,41 @@
+#![allow(clippy::items_after_test_module)]
 //! Combined HTTP (doc pages) + WebSocket (LSP) server.
 //!
 //! Replaces the standalone `ws_lsp.rs` server. Serves static documentation
 //! HTML on all HTTP routes and upgrades `/lsp` to a WebSocket LSP connection
 //! backed by the shared Backend actor.
 
+use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use act_locally::actor::ActorRef;
+use act_locally::dispatcher::Dispatcher;
+use act_locally::message::{Message, MessageDowncast, MessageKey, Response};
+use act_locally::types::ActorError;
 use async_lsp::client_monitor::ClientProcessMonitorLayer;
 use async_lsp::concurrency::ConcurrencyLayer;
 use async_lsp::panic::CatchUnwindLayer;
 use async_lsp::server::LifecycleLayer;
+use axum::Json;
 use axum::Router;
-use axum::extract::WebSocketUpgrade;
 use axum::extract::ws::{Message as AxumMessage, WebSocket};
-use axum::response::Html;
-use axum::routing::get;
+use axum::extract::{Path, Query, WebSocketUpgrade};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::{Event, Sse};
+use axum::response::{Html, IntoResponse};
+use axum::routing::{get, post};
 use futures::io::{AsyncRead, AsyncWrite};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::{Mutex, broadcast, watch};
 use tower::ServiceBuilder;
+use trace_query::{TraceQueryHttpRequest, TraceQueryHttpResponse, TraceQueryRequest};
 use tracing::{info, warn};
 
 use crate::backend::Backend;
+use crate::introspection::TraceBackendQueryRequest;
 use crate::lsp_actor::service::LspActorKey;
 use crate::server::setup_ws_service;
 
@@ -37,14 +48,22 @@ pub type SharedActor = ActorRef<Backend, LspActorKey>;
 /// - `/lsp` upgrades to WebSocket and bridges to the shared Backend.
 /// - `fe/navigate` notifications are forwarded to WS clients from `doc_nav_tx`.
 /// - `fe/docReload` notifications are forwarded from `doc_reload_tx`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     listener: tokio::net::TcpListener,
     doc_html: String,
     actor_rx: watch::Receiver<Option<SharedActor>>,
     doc_nav_tx: broadcast::Sender<String>,
     doc_reload_tx: broadcast::Sender<String>,
+    tooling_config: introspection_config::FeToolingConfig,
+    config_hash: String,
+    workspace_root: Option<String>,
+    capabilities: Vec<String>,
 ) {
     let html = Arc::new(tokio::sync::RwLock::new(doc_html));
+    let bound_addr = listener.local_addr().ok();
+    let local_addr = bound_addr.map(|addr| addr.to_string());
+    let local_port = bound_addr.map(|addr| addr.port());
 
     // Spawn a task to rebuild the served HTML when doc data changes
     let html_for_reload = Arc::clone(&html);
@@ -99,21 +118,305 @@ pub async fn run(
     });
 
     let html_for_fallback = Arc::clone(&html);
+    let workspace_root_for_health = workspace_root.clone();
+    let health_payload = Arc::new(serde_json::json!({
+        "status": "ok",
+        "workspace_root": workspace_root_for_health,
+        "server_addr": local_addr,
+        "capabilities": capabilities.clone(),
+        "config_hash": config_hash.clone(),
+    }));
+    let config_payload = Arc::new(serde_json::json!({
+        "config_hash": config_hash,
+        "config": tooling_config,
+    }));
+    let (trace_selection_tx, _) = broadcast::channel::<String>(128);
     let app = Router::new()
+        .route(
+            "/health",
+            get({
+                let payload = Arc::clone(&health_payload);
+                move || {
+                    let payload = Arc::clone(&payload);
+                    async move { Json((*payload).clone()) }
+                }
+            }),
+        )
+        .route(
+            "/config/effective",
+            get({
+                let payload = Arc::clone(&config_payload);
+                move || {
+                    let payload = Arc::clone(&payload);
+                    async move { Json((*payload).clone()) }
+                }
+            }),
+        )
+        .route(
+            "/trace/workbench",
+            get(|| async {
+                Html(fe_web::assets::origin_trace_live_html_shell(
+                    "Fe Trace Workbench",
+                ))
+            }),
+        )
+        .route(
+            "/trace/session/{session_id}/bootstrap",
+            get({
+                let actor_rx = actor_rx.clone();
+                let workspace_root = workspace_root.clone();
+                move |Path(session_id): Path<String>,
+                      Query(query): Query<BTreeMap<String, String>>,
+                      headers: HeaderMap| {
+                    let actor_rx = actor_rx.clone();
+                    let workspace_root = workspace_root.clone();
+                    async move {
+                        handle_trace_workbench_bootstrap_http(
+                            session_id,
+                            query,
+                            headers,
+                            actor_rx,
+                            workspace_root,
+                        )
+                        .await
+                    }
+                }
+            }),
+        )
+        .route(
+            "/trace/session/{session_id}/model",
+            get({
+                let actor_rx = actor_rx.clone();
+                let workspace_root = workspace_root.clone();
+                move |Path(session_id): Path<String>,
+                      Query(query): Query<BTreeMap<String, String>>,
+                      headers: HeaderMap| {
+                    let actor_rx = actor_rx.clone();
+                    let workspace_root = workspace_root.clone();
+                    async move {
+                        handle_trace_workbench_model_http(
+                            session_id,
+                            query,
+                            headers,
+                            actor_rx,
+                            workspace_root,
+                        )
+                        .await
+                    }
+                }
+            }),
+        )
+        .route(
+            "/trace/session/{session_id}/manifest",
+            get({
+                let actor_rx = actor_rx.clone();
+                let workspace_root = workspace_root.clone();
+                move |Path(session_id): Path<String>,
+                      Query(query): Query<BTreeMap<String, String>>,
+                      headers: HeaderMap| {
+                    let actor_rx = actor_rx.clone();
+                    let workspace_root = workspace_root.clone();
+                    async move {
+                        handle_trace_workbench_manifest_http(
+                            session_id,
+                            query,
+                            headers,
+                            actor_rx,
+                            workspace_root,
+                        )
+                        .await
+                    }
+                }
+            }),
+        )
+        .route(
+            "/trace/session/{session_id}/revisions",
+            get({
+                let actor_rx = actor_rx.clone();
+                let workspace_root = workspace_root.clone();
+                move |Path(session_id): Path<String>,
+                      Query(query): Query<BTreeMap<String, String>>,
+                      headers: HeaderMap| {
+                    let actor_rx = actor_rx.clone();
+                    let workspace_root = workspace_root.clone();
+                    async move {
+                        handle_trace_workbench_revisions_http(
+                            session_id,
+                            query,
+                            headers,
+                            actor_rx,
+                            workspace_root,
+                        )
+                        .await
+                    }
+                }
+            }),
+        )
+        .route(
+            "/trace/session/{session_id}/chunk/{digest}",
+            get({
+                let actor_rx = actor_rx.clone();
+                let workspace_root = workspace_root.clone();
+                move |Path((session_id, digest)): Path<(String, String)>,
+                      Query(query): Query<BTreeMap<String, String>>,
+                      headers: HeaderMap| {
+                    let actor_rx = actor_rx.clone();
+                    let workspace_root = workspace_root.clone();
+                    async move {
+                        handle_trace_workbench_chunk_http(
+                            session_id,
+                            digest,
+                            query,
+                            headers,
+                            actor_rx,
+                            workspace_root,
+                        )
+                        .await
+                    }
+                }
+            }),
+        )
+        .route(
+            "/trace/session/{session_id}/chunks/missing",
+            post({
+                let actor_rx = actor_rx.clone();
+                let workspace_root = workspace_root.clone();
+                move |Path(session_id): Path<String>,
+                      Query(query): Query<BTreeMap<String, String>>,
+                      headers: HeaderMap,
+                      Json(request): Json<serde_json::Value>| {
+                    let actor_rx = actor_rx.clone();
+                    let workspace_root = workspace_root.clone();
+                    async move {
+                        handle_trace_workbench_missing_chunks_http(
+                            session_id,
+                            query,
+                            headers,
+                            request,
+                            actor_rx,
+                            workspace_root,
+                        )
+                        .await
+                    }
+                }
+            }),
+        )
+        .route(
+            "/trace/session/{session_id}/events",
+            get({
+                let actor_rx = actor_rx.clone();
+                let workspace_root = workspace_root.clone();
+                let trace_selection_tx = trace_selection_tx.clone();
+                move |Path(session_id): Path<String>,
+                      Query(query): Query<BTreeMap<String, String>>| {
+                    let actor_rx = actor_rx.clone();
+                    let workspace_root = workspace_root.clone();
+                    let selection_rx = trace_selection_tx.subscribe();
+                    async move {
+                        handle_trace_workbench_events_http(
+                            session_id,
+                            query,
+                            actor_rx,
+                            selection_rx,
+                            workspace_root,
+                        )
+                        .await
+                    }
+                }
+            }),
+        )
+        .route(
+            "/trace/session/{session_id}/select",
+            post({
+                let actor_rx = actor_rx.clone();
+                let workspace_root = workspace_root.clone();
+                let trace_selection_tx = trace_selection_tx.clone();
+                move |Path(session_id): Path<String>,
+                      Query(query): Query<BTreeMap<String, String>>,
+                      headers: HeaderMap,
+                      Json(selection): Json<serde_json::Value>| {
+                    let actor_rx = actor_rx.clone();
+                    let workspace_root = workspace_root.clone();
+                    let trace_selection_tx = trace_selection_tx.clone();
+                    async move {
+                        handle_trace_workbench_select_http(
+                            session_id,
+                            query,
+                            headers,
+                            selection,
+                            actor_rx,
+                            trace_selection_tx,
+                            workspace_root,
+                        )
+                        .await
+                    }
+                }
+            }),
+        )
+        .route(
+            "/trace/session/{session_id}/query",
+            post({
+                let actor_rx = actor_rx.clone();
+                let workspace_root = workspace_root.clone();
+                move |Path(session_id): Path<String>,
+                      Query(query): Query<BTreeMap<String, String>>,
+                      headers: HeaderMap,
+                      Json(request): Json<TraceQueryRequest>| {
+                    let actor_rx = actor_rx.clone();
+                    let workspace_root = workspace_root.clone();
+                    async move {
+                        handle_trace_workbench_query_http(
+                            session_id,
+                            query,
+                            headers,
+                            request,
+                            actor_rx,
+                            workspace_root,
+                        )
+                        .await
+                    }
+                }
+            }),
+        )
+        .route(
+            "/trace/query",
+            post({
+                let actor_rx = actor_rx.clone();
+                let workspace_root = workspace_root.clone();
+                move |Json(request): Json<TraceQueryHttpRequest>| {
+                    let actor_rx = actor_rx.clone();
+                    let workspace_root = workspace_root.clone();
+                    async move { handle_trace_query_http(request, actor_rx, workspace_root).await }
+                }
+            }),
+        )
         .route(
             "/lsp",
             get({
                 let actor_rx = actor_rx.clone();
                 let doc_nav_tx = doc_nav_tx.clone();
                 let doc_reload_tx = doc_reload_tx.clone();
-                move |ws: WebSocketUpgrade| {
+                move |ws: WebSocketUpgrade, headers: HeaderMap| {
                     let actor_rx = actor_rx.clone();
                     let doc_nav_tx = doc_nav_tx.clone();
                     let doc_reload_tx = doc_reload_tx.clone();
                     async move {
+                        // The browser threat model: any web page can open a
+                        // WebSocket to 127.0.0.1:<port>/lsp and drive the LSP
+                        // (workspace symbols, hovers) to exfiltrate source
+                        // structure — WebSocket upgrades are not subject to
+                        // CORS. Browsers always send an Origin header on the
+                        // handshake and cannot forge it, so reject any request
+                        // whose Origin is present and not same-origin loopback.
+                        // Non-browser clients omit Origin and are allowed.
+                        if !ws_origin_allowed(&headers, local_port) {
+                            return (StatusCode::FORBIDDEN, "cross-origin WebSocket rejected")
+                                .into_response();
+                        }
                         ws.on_upgrade(|socket| {
                             handle_ws_lsp(socket, actor_rx, doc_nav_tx, doc_reload_tx)
                         })
+                        .into_response()
                     }
                 }
             }),
@@ -130,6 +433,1392 @@ pub async fn run(
 
     if let Err(e) = axum::serve(listener, app).await {
         warn!("Combined server error: {e}");
+    }
+}
+
+async fn handle_trace_query_http(
+    request: TraceQueryHttpRequest,
+    actor_rx: watch::Receiver<Option<SharedActor>>,
+    workspace_root: Option<String>,
+) -> impl IntoResponse {
+    if let Err(reason) = validate_trace_auth(workspace_root.as_deref(), &request.auth_token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(TraceQueryHttpResponse::Unauthorized { reason }),
+        );
+    }
+
+    let actor_ref = match ready_actor(actor_rx).await {
+        Ok(actor_ref) => actor_ref,
+        Err(reason) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(TraceQueryHttpResponse::Error {
+                    reason,
+                    cache_hit: false,
+                    query_duration_ms: 0,
+                }),
+            );
+        }
+    };
+    actor_ref.register_handler_async_mutating(
+        MessageKey(LspActorKey::of::<TraceBackendQueryRequest>()),
+        crate::introspection::handle_trace_query,
+    );
+
+    let backend_request = TraceBackendQueryRequest {
+        uri: request.uri,
+        config_hash: request.config_hash,
+        target: None,
+        opt_level: None,
+        view: None,
+        query: request.query,
+    };
+    let dispatcher = TraceQueryDispatcher;
+    match actor_ref
+        .ask::<_, TraceQueryHttpResponse, _>(&dispatcher, backend_request)
+        .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(TraceQueryHttpResponse::Error {
+                reason: format!("live trace backend query failed: {err:?}"),
+                cache_hit: false,
+                query_duration_ms: 0,
+            }),
+        ),
+    }
+}
+
+async fn handle_trace_workbench_query_http(
+    session_id: String,
+    query: BTreeMap<String, String>,
+    headers: HeaderMap,
+    request: TraceQueryRequest,
+    actor_rx: watch::Receiver<Option<SharedActor>>,
+    workspace_root: Option<String>,
+) -> impl IntoResponse {
+    if let Err(reason) = validate_trace_auth(
+        workspace_root.as_deref(),
+        &trace_auth_token(&headers, &query).unwrap_or_default(),
+    ) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(TraceQueryHttpResponse::Unauthorized { reason }),
+        );
+    }
+
+    let actor_ref = match ready_actor(actor_rx).await {
+        Ok(actor_ref) => actor_ref,
+        Err(reason) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(TraceQueryHttpResponse::Error {
+                    reason,
+                    cache_hit: false,
+                    query_duration_ms: 0,
+                }),
+            );
+        }
+    };
+    actor_ref.register_handler_async_mutating(
+        MessageKey(LspActorKey::of::<
+            crate::introspection::TraceWorkbenchSessionRequest,
+        >()),
+        crate::introspection::handle_trace_workbench_bootstrap,
+    );
+    actor_ref.register_handler_async_mutating(
+        MessageKey(LspActorKey::of::<TraceBackendQueryRequest>()),
+        crate::introspection::handle_trace_query,
+    );
+
+    let dispatcher = TraceQueryDispatcher;
+    let bootstrap = match actor_ref
+        .ask::<_, crate::introspection::TraceWorkbenchBootstrapResponse, _>(
+            &dispatcher,
+            crate::introspection::TraceWorkbenchSessionRequest { session_id },
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(TraceQueryHttpResponse::Error {
+                    reason: format!("trace workbench session lookup failed: {err:?}"),
+                    cache_hit: false,
+                    query_duration_ms: 0,
+                }),
+            );
+        }
+    };
+    let backend_request = trace_workbench_query_backend_request(&bootstrap, request);
+    match actor_ref
+        .ask::<_, TraceQueryHttpResponse, _>(&dispatcher, backend_request)
+        .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(TraceQueryHttpResponse::Error {
+                reason: format!("live trace backend query failed: {err:?}"),
+                cache_hit: false,
+                query_duration_ms: 0,
+            }),
+        ),
+    }
+}
+
+fn trace_workbench_query_backend_request(
+    bootstrap: &crate::introspection::TraceWorkbenchBootstrapResponse,
+    query: TraceQueryRequest,
+) -> TraceBackendQueryRequest {
+    TraceBackendQueryRequest {
+        uri: bootstrap.session.uri.clone(),
+        config_hash: Some(bootstrap.revision.config_hash.clone()),
+        target: Some(bootstrap.session.target.clone()),
+        opt_level: Some(bootstrap.session.opt_level.clone()),
+        view: Some(bootstrap.session.view.clone()),
+        query,
+    }
+}
+
+async fn handle_trace_workbench_bootstrap_http(
+    session_id: String,
+    query: BTreeMap<String, String>,
+    headers: HeaderMap,
+    actor_rx: watch::Receiver<Option<SharedActor>>,
+    workspace_root: Option<String>,
+) -> impl IntoResponse {
+    if let Err(reason) = validate_trace_auth(
+        workspace_root.as_deref(),
+        &trace_auth_token(&headers, &query).unwrap_or_default(),
+    ) {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({ "reason": reason }),
+        );
+    }
+    let actor_ref = match ready_actor(actor_rx).await {
+        Ok(actor_ref) => actor_ref,
+        Err(reason) => {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({ "reason": reason }),
+            );
+        }
+    };
+    actor_ref.register_handler_async_mutating(
+        MessageKey(LspActorKey::of::<
+            crate::introspection::TraceWorkbenchSessionRequest,
+        >()),
+        crate::introspection::handle_trace_workbench_bootstrap,
+    );
+    let dispatcher = TraceQueryDispatcher;
+    let request = crate::introspection::TraceWorkbenchSessionRequest { session_id };
+    match actor_ref
+        .ask::<_, crate::introspection::TraceWorkbenchBootstrapResponse, _>(&dispatcher, request)
+        .await
+    {
+        Ok(response) => json_response(StatusCode::OK, serde_json::json!(response)),
+        Err(err) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({ "reason": format!("trace workbench bootstrap failed: {err:?}") }),
+        ),
+    }
+}
+
+async fn handle_trace_workbench_model_http(
+    session_id: String,
+    query: BTreeMap<String, String>,
+    headers: HeaderMap,
+    actor_rx: watch::Receiver<Option<SharedActor>>,
+    workspace_root: Option<String>,
+) -> impl IntoResponse {
+    if let Err(reason) = validate_trace_auth(
+        workspace_root.as_deref(),
+        &trace_auth_token(&headers, &query).unwrap_or_default(),
+    ) {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({ "reason": reason }),
+        );
+    }
+    let actor_ref = match ready_actor(actor_rx).await {
+        Ok(actor_ref) => actor_ref,
+        Err(reason) => {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({ "reason": reason }),
+            );
+        }
+    };
+    actor_ref.register_handler_async_mutating(
+        MessageKey(LspActorKey::of::<
+            crate::introspection::TraceWorkbenchSessionRequest,
+        >()),
+        crate::introspection::handle_trace_workbench_model,
+    );
+    let dispatcher = TraceQueryDispatcher;
+    let request = crate::introspection::TraceWorkbenchSessionRequest { session_id };
+    match actor_ref
+        .ask::<_, serde_json::Value, _>(&dispatcher, request)
+        .await
+    {
+        Ok(response) => json_response(StatusCode::OK, response),
+        Err(err) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({ "reason": format!("trace workbench model failed: {err:?}") }),
+        ),
+    }
+}
+
+async fn handle_trace_workbench_manifest_http(
+    session_id: String,
+    query: BTreeMap<String, String>,
+    headers: HeaderMap,
+    actor_rx: watch::Receiver<Option<SharedActor>>,
+    workspace_root: Option<String>,
+) -> impl IntoResponse {
+    if let Err(reason) = validate_trace_auth(
+        workspace_root.as_deref(),
+        &trace_auth_token(&headers, &query).unwrap_or_default(),
+    ) {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({ "reason": reason }),
+        );
+    }
+    let actor_ref = match ready_actor(actor_rx).await {
+        Ok(actor_ref) => actor_ref,
+        Err(reason) => {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({ "reason": reason }),
+            );
+        }
+    };
+    actor_ref.register_handler_async_mutating(
+        MessageKey(LspActorKey::of::<
+            crate::introspection::TraceWorkbenchSessionRequest,
+        >()),
+        crate::introspection::handle_trace_workbench_manifest,
+    );
+    let dispatcher = TraceQueryDispatcher;
+    let request = crate::introspection::TraceWorkbenchSessionRequest { session_id };
+    match actor_ref
+        .ask::<_, Option<serde_json::Value>, _>(&dispatcher, request)
+        .await
+    {
+        Ok(Some(response)) => json_response(StatusCode::OK, response),
+        Ok(None) => json_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({ "reason": "trace workbench manifest is not cached yet; fetch /model first" }),
+        ),
+        Err(err) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({ "reason": format!("trace workbench manifest failed: {err:?}") }),
+        ),
+    }
+}
+
+async fn handle_trace_workbench_revisions_http(
+    session_id: String,
+    query: BTreeMap<String, String>,
+    headers: HeaderMap,
+    actor_rx: watch::Receiver<Option<SharedActor>>,
+    workspace_root: Option<String>,
+) -> impl IntoResponse {
+    if let Err(reason) = validate_trace_auth(
+        workspace_root.as_deref(),
+        &trace_auth_token(&headers, &query).unwrap_or_default(),
+    ) {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({ "reason": reason }),
+        );
+    }
+    let actor_ref = match ready_actor(actor_rx).await {
+        Ok(actor_ref) => actor_ref,
+        Err(reason) => {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({ "reason": reason }),
+            );
+        }
+    };
+    actor_ref.register_handler_async_mutating(
+        MessageKey(LspActorKey::of::<
+            crate::introspection::TraceWorkbenchSessionRequest,
+        >()),
+        crate::introspection::handle_trace_workbench_revisions,
+    );
+    let dispatcher = TraceQueryDispatcher;
+    let request = crate::introspection::TraceWorkbenchSessionRequest { session_id };
+    match actor_ref
+        .ask::<_, crate::introspection::TraceWorkbenchRevisionHistoryResponse, _>(
+            &dispatcher,
+            request,
+        )
+        .await
+    {
+        Ok(response) => json_response(StatusCode::OK, serde_json::json!(response)),
+        Err(err) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({ "reason": format!("trace workbench revisions failed: {err:?}") }),
+        ),
+    }
+}
+
+async fn handle_trace_workbench_chunk_http(
+    session_id: String,
+    digest: String,
+    query: BTreeMap<String, String>,
+    headers: HeaderMap,
+    actor_rx: watch::Receiver<Option<SharedActor>>,
+    workspace_root: Option<String>,
+) -> impl IntoResponse {
+    if let Err(reason) = validate_trace_auth(
+        workspace_root.as_deref(),
+        &trace_auth_token(&headers, &query).unwrap_or_default(),
+    ) {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({ "reason": reason }),
+        );
+    }
+    let actor_ref = match ready_actor(actor_rx).await {
+        Ok(actor_ref) => actor_ref,
+        Err(reason) => {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({ "reason": reason }),
+            );
+        }
+    };
+    actor_ref.register_handler_async_mutating(
+        MessageKey(LspActorKey::of::<
+            crate::introspection::TraceWorkbenchChunkRequest,
+        >()),
+        crate::introspection::handle_trace_workbench_chunk,
+    );
+    let dispatcher = TraceQueryDispatcher;
+    let request = crate::introspection::TraceWorkbenchChunkRequest {
+        session_id,
+        digest: digest.clone(),
+    };
+    match actor_ref
+        .ask::<_, Option<serde_json::Value>, _>(&dispatcher, request)
+        .await
+    {
+        Ok(Some(payload)) => json_response(StatusCode::OK, payload),
+        Ok(None) => json_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({ "reason": format!("unknown trace workbench chunk digest {digest}") }),
+        ),
+        Err(err) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({ "reason": format!("trace workbench chunk failed: {err:?}") }),
+        ),
+    }
+}
+
+async fn handle_trace_workbench_missing_chunks_http(
+    session_id: String,
+    query: BTreeMap<String, String>,
+    headers: HeaderMap,
+    request: serde_json::Value,
+    actor_rx: watch::Receiver<Option<SharedActor>>,
+    workspace_root: Option<String>,
+) -> impl IntoResponse {
+    if let Err(reason) = validate_trace_auth(
+        workspace_root.as_deref(),
+        &trace_auth_token(&headers, &query).unwrap_or_default(),
+    ) {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({ "reason": reason }),
+        );
+    }
+    let actor_ref = match ready_actor(actor_rx).await {
+        Ok(actor_ref) => actor_ref,
+        Err(reason) => {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({ "reason": reason }),
+            );
+        }
+    };
+    actor_ref.register_handler_async_mutating(
+        MessageKey(LspActorKey::of::<
+            crate::introspection::TraceWorkbenchChunksRequest,
+        >()),
+        crate::introspection::handle_trace_workbench_chunks,
+    );
+    let dispatcher = TraceQueryDispatcher;
+    let request = crate::introspection::TraceWorkbenchChunksRequest {
+        session_id,
+        digests: trace_workbench_requested_chunk_digests(&request),
+    };
+    match actor_ref
+        .ask::<_, serde_json::Value, _>(&dispatcher, request)
+        .await
+    {
+        Ok(response) => json_response(StatusCode::OK, response),
+        Err(err) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({ "reason": format!("trace workbench chunks failed: {err:?}") }),
+        ),
+    }
+}
+
+fn trace_workbench_requested_chunk_digests(request: &serde_json::Value) -> Vec<String> {
+    let values = request
+        .get("digests")
+        .or_else(|| request.get("missing"))
+        .unwrap_or(request);
+    let mut digests = values
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .filter(|digest| !digest.trim().is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    digests.sort();
+    digests.dedup();
+    digests
+}
+
+async fn handle_trace_workbench_events_http(
+    session_id: String,
+    query: BTreeMap<String, String>,
+    actor_rx: watch::Receiver<Option<SharedActor>>,
+    selection_rx: broadcast::Receiver<String>,
+    workspace_root: Option<String>,
+) -> impl IntoResponse {
+    let stream: Pin<Box<dyn futures::Stream<Item = Result<Event, Infallible>> + Send>> =
+        if let Err(reason) = validate_trace_auth(
+            workspace_root.as_deref(),
+            query.get("token").map(String::as_str).unwrap_or_default(),
+        ) {
+            let event = Event::default()
+                .event("trace/error")
+                .json_data(serde_json::json!({ "reason": reason }))
+                .unwrap_or_else(|_| Event::default().event("trace/error"));
+            Box::pin(futures::stream::once(async move { Ok(event) }))
+        } else {
+            let revision_stream = futures::stream::unfold(
+                (session_id, actor_rx, None::<TraceWorkbenchRevisionCursor>),
+                |(session_id, actor_rx, mut last_revision)| async move {
+                    loop {
+                        match trace_workbench_bootstrap_for_event(
+                            session_id.clone(),
+                            actor_rx.clone(),
+                        )
+                        .await
+                        {
+                            Ok(response) => {
+                                let revision = response.revision.id;
+                                let model_digest = response.revision.model_digest.clone();
+                                let next_revision = trace_workbench_revision_cursor(&response);
+                                if last_revision != Some(next_revision.clone()) {
+                                    last_revision = Some(next_revision);
+                                    let event = Event::default()
+                                        .event("trace/revision")
+                                        .json_data(serde_json::json!({
+                                            "event": "trace/revision",
+                                            "sessionId": session_id,
+                                            "revision": revision,
+                                            "documentVersion": response.revision.document_version,
+                                            "status": response.revision.status,
+                                            "modelDigest": model_digest,
+                                            "modelDeltas": response.capabilities.model_deltas,
+                                            "chunks": response.capabilities.chunks,
+                                        }))
+                                        .unwrap_or_else(|_| {
+                                            Event::default().event("trace/revision")
+                                        });
+                                    return Some((
+                                        Ok::<_, Infallible>(event),
+                                        (session_id, actor_rx, last_revision),
+                                    ));
+                                }
+                            }
+                            Err(reason) => {
+                                let event = Event::default()
+                                    .event("trace/error")
+                                    .json_data(serde_json::json!({ "reason": reason }))
+                                    .unwrap_or_else(|_| Event::default().event("trace/error"));
+                                return Some((
+                                    Ok::<_, Infallible>(event),
+                                    (session_id, actor_rx, last_revision),
+                                ));
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    }
+                },
+            );
+            let selection_stream =
+                futures::stream::unfold(selection_rx, |mut selection_rx| async move {
+                    loop {
+                        match selection_rx.recv().await {
+                            Ok(payload) => {
+                                let event = Event::default().event("trace/selection").data(payload);
+                                return Some((Ok::<_, Infallible>(event), selection_rx));
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                        }
+                    }
+                });
+            Box::pin(futures::stream::select(revision_stream, selection_stream))
+        };
+    Sse::new(stream)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TraceWorkbenchRevisionCursor {
+    revision: u64,
+    status: String,
+    model_digest: Option<String>,
+}
+
+fn trace_workbench_revision_cursor(
+    response: &crate::introspection::TraceWorkbenchBootstrapResponse,
+) -> TraceWorkbenchRevisionCursor {
+    TraceWorkbenchRevisionCursor {
+        revision: response.revision.id,
+        status: response.revision.status.clone(),
+        model_digest: response.revision.model_digest.clone(),
+    }
+}
+
+async fn trace_workbench_bootstrap_for_event(
+    session_id: String,
+    actor_rx: watch::Receiver<Option<SharedActor>>,
+) -> Result<crate::introspection::TraceWorkbenchBootstrapResponse, String> {
+    let actor_ref = ready_actor(actor_rx).await?;
+    actor_ref.register_handler_async_mutating(
+        MessageKey(LspActorKey::of::<
+            crate::introspection::TraceWorkbenchSessionRequest,
+        >()),
+        crate::introspection::handle_trace_workbench_bootstrap,
+    );
+    let dispatcher = TraceQueryDispatcher;
+    actor_ref
+        .ask::<_, crate::introspection::TraceWorkbenchBootstrapResponse, _>(
+            &dispatcher,
+            crate::introspection::TraceWorkbenchSessionRequest { session_id },
+        )
+        .await
+        .map_err(|err| format!("trace workbench revision lookup failed: {err:?}"))
+}
+
+async fn trace_workbench_model_for_event(
+    session_id: String,
+    actor_rx: watch::Receiver<Option<SharedActor>>,
+) -> Result<serde_json::Value, String> {
+    let actor_ref = ready_actor(actor_rx).await?;
+    actor_ref.register_handler_async_mutating(
+        MessageKey(LspActorKey::of::<
+            crate::introspection::TraceWorkbenchSessionRequest,
+        >()),
+        crate::introspection::handle_trace_workbench_model,
+    );
+    let dispatcher = TraceQueryDispatcher;
+    actor_ref
+        .ask::<_, serde_json::Value, _>(
+            &dispatcher,
+            crate::introspection::TraceWorkbenchSessionRequest { session_id },
+        )
+        .await
+        .map_err(|err| format!("trace workbench model lookup failed: {err:?}"))
+}
+
+async fn handle_trace_workbench_select_http(
+    session_id: String,
+    query: BTreeMap<String, String>,
+    headers: HeaderMap,
+    selection: serde_json::Value,
+    actor_rx: watch::Receiver<Option<SharedActor>>,
+    selection_tx: broadcast::Sender<String>,
+    workspace_root: Option<String>,
+) -> impl IntoResponse {
+    if let Err(reason) = validate_trace_auth(
+        workspace_root.as_deref(),
+        &trace_auth_token(&headers, &query).unwrap_or_default(),
+    ) {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({ "reason": reason }),
+        );
+    }
+    let bootstrap =
+        match trace_workbench_bootstrap_for_event(session_id.clone(), actor_rx.clone()).await {
+            Ok(response) => response,
+            Err(reason) => {
+                return json_response(
+                    StatusCode::NOT_FOUND,
+                    serde_json::json!({ "reason": reason }),
+                );
+            }
+        };
+    let resolved_rows =
+        if let Some(rows) = trace_workbench_resolved_rows_for_selection_without_model(&selection) {
+            rows
+        } else {
+            let model = trace_workbench_model_for_event(session_id.clone(), actor_rx)
+                .await
+                .ok();
+            trace_workbench_resolved_rows_for_selection(&selection, model.as_ref())
+        };
+    let event = trace_workbench_selection_event(
+        &session_id,
+        bootstrap.revision.id,
+        selection,
+        resolved_rows,
+    );
+    let _ = selection_tx.send(event.to_string());
+    json_response(StatusCode::OK, event)
+}
+
+fn trace_workbench_selection_event(
+    session_id: &str,
+    revision: u64,
+    selection: serde_json::Value,
+    resolved_rows: Vec<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "event": "trace/selection",
+        "sessionId": session_id,
+        "revision": revision,
+        "selection": selection,
+        "resolvedRows": resolved_rows,
+    })
+}
+
+fn trace_workbench_resolved_rows_for_selection_without_model(
+    selection: &serde_json::Value,
+) -> Option<Vec<String>> {
+    if let Some(row) = selection.get("row").and_then(serde_json::Value::as_str)
+        && !row.trim().is_empty()
+    {
+        return Some(vec![row.to_string()]);
+    }
+    if let Some(source_ref) = selection
+        .get("sourceRef")
+        .or_else(|| selection.get("source_ref"))
+        .and_then(serde_json::Value::as_str)
+        && let Some((source, line)) = trace_workbench_parse_source_ref(source_ref)
+        && source == "main"
+    {
+        return Some(vec![trace_workbench_source_row_id(line)]);
+    }
+    if let Some(line) = selection
+        .get("range")
+        .and_then(|range| range.get("start"))
+        .and_then(|start| start.get("line"))
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| selection.get("line").and_then(serde_json::Value::as_u64))
+    {
+        return Some(vec![trace_workbench_source_row_id(line.saturating_add(1))]);
+    }
+    None
+}
+
+fn trace_workbench_resolved_rows_for_selection(
+    selection: &serde_json::Value,
+    model: Option<&serde_json::Value>,
+) -> Vec<String> {
+    if let Some(row) = selection.get("row").and_then(serde_json::Value::as_str)
+        && !row.trim().is_empty()
+    {
+        return vec![row.to_string()];
+    }
+    if let Some(stable) = selection
+        .get("stableIdentity")
+        .or_else(|| selection.get("stable_identity"))
+        && let Some(rows) = trace_workbench_rows_for_stable_identity(stable, model)
+    {
+        return rows;
+    }
+    if let Some(token) = selection
+        .get("stableIdentityToken")
+        .or_else(|| selection.get("stable_identity_token"))
+        .and_then(serde_json::Value::as_str)
+        && let Some(rows) = trace_workbench_rows_for_stable_identity_token(token, model)
+    {
+        return rows;
+    }
+    if let Some(origin) = selection
+        .get("origin")
+        .or_else(|| selection.get("originKey"))
+        .or_else(|| selection.get("origin_key"))
+        .or_else(|| selection.get("node"))
+        .and_then(serde_json::Value::as_str)
+        && let Some(rows) = trace_workbench_index_rows(model, "origin_to_rows", origin)
+    {
+        return rows;
+    }
+    if let Some(pc) = selection
+        .get("bytecodePc")
+        .or_else(|| selection.get("bytecode_pc"))
+        .or_else(|| selection.get("pc"))
+        .and_then(trace_workbench_json_key_string)
+    {
+        if let Some(rows) = trace_workbench_index_rows(model, "bytecode_pcs", &pc) {
+            return rows;
+        }
+        if let Ok(pc) = pc.parse::<u64>()
+            && let Some(rows) = trace_workbench_rows_for_pc_interval(model, pc)
+        {
+            return rows;
+        }
+    }
+    if let Some(source_ref) = selection
+        .get("sourceRef")
+        .or_else(|| selection.get("source_ref"))
+        .and_then(serde_json::Value::as_str)
+        && let Some((source, line)) = trace_workbench_parse_source_ref(source_ref)
+    {
+        if let Some(rows) = trace_workbench_index_rows(model, "source_lines", source_ref) {
+            return rows;
+        }
+        if let Some(rows) = trace_workbench_rows_for_source_interval(model, source, line) {
+            return rows;
+        }
+        return vec![trace_workbench_source_row_id(line)];
+    }
+    let Some(line) = selection
+        .get("range")
+        .and_then(|range| range.get("start"))
+        .and_then(|start| start.get("line"))
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| selection.get("line").and_then(serde_json::Value::as_u64))
+    else {
+        return Vec::new();
+    };
+    let source_ref = format!("main:{}", line.saturating_add(1));
+    let one_based_line = line.saturating_add(1);
+    trace_workbench_index_rows(model, "source_lines", &source_ref)
+        .or_else(|| trace_workbench_rows_for_source_interval(model, "main", one_based_line))
+        .unwrap_or_else(|| vec![trace_workbench_source_row_id(one_based_line)])
+}
+
+fn trace_workbench_parse_source_ref(source_ref: &str) -> Option<(&str, u64)> {
+    let (source, line) = source_ref.rsplit_once(':')?;
+    let line = line.parse::<u64>().ok()?;
+    Some((source, line))
+}
+
+fn trace_workbench_rows_for_stable_identity(
+    stable: &serde_json::Value,
+    model: Option<&serde_json::Value>,
+) -> Option<Vec<String>> {
+    let kind = stable.get("kind").and_then(serde_json::Value::as_str)?;
+    let value = stable
+        .get("value")
+        .and_then(trace_workbench_json_key_string)?;
+    trace_workbench_index_rows(model, "stable_identities", &format!("{kind}:{value}"))
+}
+
+fn trace_workbench_rows_for_stable_identity_token(
+    token: &str,
+    model: Option<&serde_json::Value>,
+) -> Option<Vec<String>> {
+    let (kind, value) = token.split_once('=')?;
+    let value = trace_workbench_percent_decode(value)?;
+    trace_workbench_index_rows(model, "stable_identities", &format!("{kind}:{value}"))
+}
+
+fn trace_workbench_percent_decode(value: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(value.len());
+    let mut chars = value.as_bytes().iter().copied();
+    while let Some(byte) = chars.next() {
+        if byte == b'%' {
+            let high = chars.next()?;
+            let low = chars.next()?;
+            let high = trace_workbench_hex_value(high)?;
+            let low = trace_workbench_hex_value(low)?;
+            bytes.push((high << 4) | low);
+        } else if byte == b'+' {
+            bytes.push(b' ');
+        } else {
+            bytes.push(byte);
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn trace_workbench_hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn trace_workbench_index_rows(
+    model: Option<&serde_json::Value>,
+    index: &str,
+    key: &str,
+) -> Option<Vec<String>> {
+    let value = model?.get("indexes")?.get(index)?.get(key)?;
+    let mut rows = match value {
+        serde_json::Value::String(row) => vec![row.clone()],
+        serde_json::Value::Array(rows) => rows
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    rows.sort();
+    rows.dedup();
+    (!rows.is_empty()).then_some(rows)
+}
+
+fn trace_workbench_rows_for_source_interval(
+    model: Option<&serde_json::Value>,
+    source: &str,
+    line: u64,
+) -> Option<Vec<String>> {
+    let mut rows = model?
+        .get("indexes")?
+        .get("source_intervals")?
+        .as_array()?
+        .iter()
+        .filter(|interval| {
+            interval.get("source").and_then(serde_json::Value::as_str) == Some(source)
+                && interval
+                    .get("start_line")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|start| start <= line)
+                && interval
+                    .get("end_line")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|end| line <= end)
+        })
+        .filter_map(|interval| interval.get("row_id").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    rows.sort();
+    rows.dedup();
+    (!rows.is_empty()).then_some(rows)
+}
+
+fn trace_workbench_rows_for_pc_interval(
+    model: Option<&serde_json::Value>,
+    pc: u64,
+) -> Option<Vec<String>> {
+    let mut rows = model?
+        .get("indexes")?
+        .get("pc_intervals")?
+        .as_array()?
+        .iter()
+        .filter(|interval| {
+            interval
+                .get("pc_start")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|start| start <= pc)
+                && interval
+                    .get("pc_end")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|end| pc < end)
+        })
+        .filter_map(|interval| interval.get("row_id").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    rows.sort();
+    rows.dedup();
+    (!rows.is_empty()).then_some(rows)
+}
+
+fn trace_workbench_json_key_string(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| value.as_u64().map(|value| value.to_string()))
+}
+
+fn trace_workbench_source_row_id(line_number: u64) -> String {
+    format!("source-main-line-{line_number}")
+}
+
+fn json_response(status: StatusCode, value: serde_json::Value) -> axum::response::Response {
+    (status, Json(value)).into_response()
+}
+
+/// Decide whether a WebSocket upgrade may proceed based on its `Origin` header.
+///
+/// Returns `true` when there is no `Origin` (non-browser clients, which are not
+/// subject to the cross-origin browser threat) or when the `Origin` is a
+/// loopback host on the server's own port. Any other present `Origin` — a real
+/// remote site, or a different local port attempting a DNS-rebinding / cross-app
+/// reach-in — is rejected.
+fn ws_origin_allowed(headers: &HeaderMap, server_port: Option<u16>) -> bool {
+    let Some(origin) = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
+        // No Origin header: not a browser-initiated cross-origin request.
+        return true;
+    };
+    // Strip the scheme; we only care that the authority is loopback:server_port.
+    let authority = origin
+        .split_once("://")
+        .map(|(_scheme, rest)| rest)
+        .unwrap_or(origin);
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().ok()),
+        None => (authority, None),
+    };
+    let host_is_loopback = matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1");
+    let port_matches = match (port, server_port) {
+        (Some(p), Some(sp)) => p == sp,
+        // If we never learned our own port, fall back to host-only loopback check.
+        (_, None) => true,
+        // Origin without an explicit port can't match our high server port.
+        (None, Some(_)) => false,
+    };
+    host_is_loopback && port_matches
+}
+
+fn trace_auth_token(headers: &HeaderMap, _query: &BTreeMap<String, String>) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_string)
+}
+
+async fn ready_actor(
+    mut actor_rx: watch::Receiver<Option<SharedActor>>,
+) -> Result<SharedActor, String> {
+    if actor_rx.borrow().is_none() {
+        let wait = actor_rx.wait_for(|actor| actor.is_some());
+        tokio::time::timeout(std::time::Duration::from_secs(30), wait)
+            .await
+            .map_err(|_| "backend actor was not ready within 30s".to_string())?
+            .map_err(|_| "backend actor channel closed".to_string())?;
+    }
+    actor_rx
+        .borrow()
+        .clone()
+        .ok_or_else(|| "backend actor is unavailable".to_string())
+}
+
+fn validate_trace_auth(workspace_root: Option<&str>, token: &str) -> Result<(), String> {
+    let root = workspace_root.ok_or_else(|| {
+        "live trace endpoint has no workspace root, refusing authenticated query".to_string()
+    })?;
+    let token_path = std::path::Path::new(root).join(".fe-lsp.token");
+    let expected = std::fs::read_to_string(&token_path).map_err(|err| {
+        format!(
+            "failed to read LSP auth token {}: {err}",
+            token_path.display()
+        )
+    })?;
+    let expected = expected.trim();
+    let token = token.trim();
+    if expected.is_empty() {
+        return Err("LSP auth token file is empty".to_string());
+    }
+    if token.is_empty() {
+        return Err("missing LSP auth token".to_string());
+    }
+    // Constant-time comparison: blake3::Hash's PartialEq is constant-time, so
+    // comparing digests avoids leaking the token through early-exit timing.
+    if blake3::hash(token.as_bytes()) != blake3::hash(expected.as_bytes()) {
+        return Err("invalid LSP auth token".to_string());
+    }
+    Ok(())
+}
+
+struct TraceQueryDispatcher;
+
+impl Dispatcher<LspActorKey> for TraceQueryDispatcher {
+    fn message_key(&self, message: &dyn Message) -> Result<MessageKey<LspActorKey>, ActorError> {
+        if message.is::<TraceBackendQueryRequest>() {
+            Ok(MessageKey(LspActorKey::of::<TraceBackendQueryRequest>()))
+        } else if message.is::<crate::introspection::TraceWorkbenchSessionRequest>() {
+            Ok(MessageKey(LspActorKey::of::<
+                crate::introspection::TraceWorkbenchSessionRequest,
+            >()))
+        } else if message.is::<crate::introspection::TraceWorkbenchChunkRequest>() {
+            Ok(MessageKey(LspActorKey::of::<
+                crate::introspection::TraceWorkbenchChunkRequest,
+            >()))
+        } else if message.is::<crate::introspection::TraceWorkbenchChunksRequest>() {
+            Ok(MessageKey(LspActorKey::of::<
+                crate::introspection::TraceWorkbenchChunksRequest,
+            >()))
+        } else {
+            Err(ActorError::DispatchError)
+        }
+    }
+
+    fn wrap(
+        &self,
+        message: Box<dyn Message>,
+        _key: MessageKey<LspActorKey>,
+    ) -> Result<Box<dyn Message>, ActorError> {
+        Ok(message)
+    }
+
+    fn unwrap(
+        &self,
+        message: Box<dyn Response>,
+        _key: MessageKey<LspActorKey>,
+    ) -> Result<Box<dyn Response>, ActorError> {
+        Ok(message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        trace_auth_token, trace_workbench_query_backend_request,
+        trace_workbench_requested_chunk_digests, trace_workbench_resolved_rows_for_selection,
+        trace_workbench_resolved_rows_for_selection_without_model, trace_workbench_revision_cursor,
+        trace_workbench_selection_event, validate_trace_auth,
+    };
+    use crate::introspection::trace_workbench_chunk_payload;
+    use axum::http::{HeaderMap, header};
+    use std::collections::BTreeMap;
+    use trace_query::{TraceQueryRequest, trace_workbench_manifest};
+
+    fn bootstrap_response(
+        revision: u64,
+        status: &str,
+        digest: Option<&str>,
+    ) -> crate::introspection::TraceWorkbenchBootstrapResponse {
+        crate::introspection::TraceWorkbenchBootstrapResponse {
+            session: crate::backend::TraceViewerSession {
+                id: "trace-session-1".to_string(),
+                uri: "file:///workspace/lib.fe".to_string(),
+                target: "evm".to_string(),
+                opt_level: "O2".to_string(),
+                view: "source-postopt-bytecode".to_string(),
+                config_hash: "config".to_string(),
+                document_version: Some(revision as i32),
+                initial_selection: None,
+            },
+            revision: crate::introspection::TraceWorkbenchRevision {
+                id: revision,
+                document_version: Some(revision as i32),
+                status: status.to_string(),
+                config_hash: "config".to_string(),
+                model_digest: digest.map(str::to_string),
+            },
+            capabilities: crate::introspection::TraceWorkbenchCapabilities {
+                events: "sse",
+                model_deltas: false,
+                chunks: true,
+                selection_sync: true,
+                revision_history: true,
+            },
+        }
+    }
+
+    #[test]
+    fn trace_query_auth_validates_workspace_token_file() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join(".fe-lsp.token"), "secret\n").unwrap();
+
+        assert!(validate_trace_auth(tempdir.path().to_str(), "secret").is_ok());
+        assert!(validate_trace_auth(tempdir.path().to_str(), "wrong").is_err());
+        assert!(validate_trace_auth(None, "secret").is_err());
+    }
+
+    #[test]
+    fn trace_workbench_auth_accepts_bearer_and_rejects_query_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer header-secret".parse().unwrap(),
+        );
+        let mut query = BTreeMap::new();
+        query.insert("token".to_string(), "query-secret".to_string());
+
+        assert_eq!(
+            trace_auth_token(&headers, &query).as_deref(),
+            Some("header-secret")
+        );
+
+        let headers = HeaderMap::new();
+        assert!(
+            trace_auth_token(&headers, &query).is_none(),
+            "non-SSE trace endpoints must not accept query-token auth"
+        );
+    }
+
+    #[test]
+    fn trace_workbench_selection_resolves_source_rows() {
+        let selection = serde_json::json!({
+            "source": "editor",
+            "selectionKind": "source-range",
+            "range": {
+                "start": { "line": 16, "character": 0 },
+                "end": { "line": 16, "character": 8 }
+            }
+        });
+        assert_eq!(
+            trace_workbench_resolved_rows_for_selection(&selection, None),
+            vec!["source-main-line-17".to_string()]
+        );
+
+        let selection = serde_json::json!({ "sourceRef": "main:94" });
+        assert_eq!(
+            trace_workbench_resolved_rows_for_selection(&selection, None),
+            vec!["source-main-line-94".to_string()]
+        );
+
+        let selection = serde_json::json!({ "row": "origin-abc123" });
+        assert_eq!(
+            trace_workbench_resolved_rows_for_selection(&selection, None),
+            vec!["origin-abc123".to_string()]
+        );
+    }
+
+    #[test]
+    fn trace_workbench_selection_fast_path_avoids_projection_when_safe() {
+        assert_eq!(
+            trace_workbench_resolved_rows_for_selection_without_model(
+                &serde_json::json!({ "row": "origin-bytecode-68" }),
+            ),
+            Some(vec!["origin-bytecode-68".to_string()])
+        );
+        assert_eq!(
+            trace_workbench_resolved_rows_for_selection_without_model(
+                &serde_json::json!({ "sourceRef": "main:94" }),
+            ),
+            Some(vec!["source-main-line-94".to_string()])
+        );
+        assert_eq!(
+            trace_workbench_resolved_rows_for_selection_without_model(
+                &serde_json::json!({ "range": { "start": { "line": 16 } } }),
+            ),
+            Some(vec!["source-main-line-17".to_string()])
+        );
+        assert!(
+            trace_workbench_resolved_rows_for_selection_without_model(
+                &serde_json::json!({ "sourceRef": "library:source:7" }),
+            )
+            .is_none(),
+            "related-source selections need projection indexes; do not guess a main-source row"
+        );
+        assert!(
+            trace_workbench_resolved_rows_for_selection_without_model(
+                &serde_json::json!({ "pc": 68 }),
+            )
+            .is_none(),
+            "bytecode selections need projection indexes or PC intervals"
+        );
+    }
+
+    #[test]
+    fn trace_workbench_selection_resolves_projection_indexes() {
+        let model = serde_json::json!({
+            "indexes": {
+                "source_lines": { "main:17": "source-main-line-17-model" },
+                "origin_to_rows": { "bytecode.pc\u{1f}demo\u{1f}pc:68": ["origin-bytecode-68"] },
+                "bytecode_pcs": { "68": ["origin-bytecode-68"] },
+                "source_intervals": [
+                    {
+                        "source": "library:source",
+                        "start_line": 5,
+                        "end_line": 8,
+                        "row_id": "related-library-source-line-5"
+                    }
+                ],
+                "pc_intervals": [
+                    {
+                        "pc_start": 70,
+                        "pc_end": 73,
+                        "row_id": "origin-bytecode-70-72"
+                    }
+                ],
+                "stable_identities": {
+                    "origin:bytecode.pc\u{1f}demo\u{1f}pc:68": ["origin-bytecode-68"],
+                    "source_line:main:17": ["source-main-line-17-model"]
+                }
+            }
+        });
+
+        assert_eq!(
+            trace_workbench_resolved_rows_for_selection(
+                &serde_json::json!({ "sourceRef": "main:17" }),
+                Some(&model),
+            ),
+            vec!["source-main-line-17-model".to_string()]
+        );
+        assert_eq!(
+            trace_workbench_resolved_rows_for_selection(
+                &serde_json::json!({ "pc": 68 }),
+                Some(&model),
+            ),
+            vec!["origin-bytecode-68".to_string()]
+        );
+        assert_eq!(
+            trace_workbench_resolved_rows_for_selection(
+                &serde_json::json!({ "pc": 72 }),
+                Some(&model),
+            ),
+            vec!["origin-bytecode-70-72".to_string()]
+        );
+        assert_eq!(
+            trace_workbench_resolved_rows_for_selection(
+                &serde_json::json!({ "sourceRef": "library:source:7" }),
+                Some(&model),
+            ),
+            vec!["related-library-source-line-5".to_string()]
+        );
+        assert_eq!(
+            trace_workbench_resolved_rows_for_selection(
+                &serde_json::json!({ "origin": "bytecode.pc\u{1f}demo\u{1f}pc:68" }),
+                Some(&model),
+            ),
+            vec!["origin-bytecode-68".to_string()]
+        );
+        assert_eq!(
+            trace_workbench_resolved_rows_for_selection(
+                &serde_json::json!({
+                    "stableIdentity": {
+                        "kind": "origin",
+                        "value": "bytecode.pc\u{1f}demo\u{1f}pc:68"
+                    }
+                }),
+                Some(&model),
+            ),
+            vec!["origin-bytecode-68".to_string()]
+        );
+        assert_eq!(
+            trace_workbench_resolved_rows_for_selection(
+                &serde_json::json!({
+                    "stableIdentityToken": "origin=bytecode.pc%1Fdemo%1Fpc%3A68"
+                }),
+                Some(&model),
+            ),
+            vec!["origin-bytecode-68".to_string()]
+        );
+    }
+
+    #[test]
+    fn trace_workbench_selection_event_carries_resolved_rows() {
+        let event = trace_workbench_selection_event(
+            "trace-session-1",
+            42,
+            serde_json::json!({ "source": "editor" }),
+            vec!["source-main-line-17".to_string()],
+        );
+
+        assert_eq!(event["event"], "trace/selection");
+        assert_eq!(event["sessionId"], "trace-session-1");
+        assert_eq!(event["revision"], 42);
+        assert_eq!(event["resolvedRows"][0], "source-main-line-17");
+    }
+
+    #[test]
+    fn trace_workbench_session_query_uses_session_uri_and_config() {
+        let bootstrap = bootstrap_response(12, "ready", Some("blake3:model"));
+        let request =
+            trace_workbench_query_backend_request(&bootstrap, TraceQueryRequest::loop_cost());
+
+        assert_eq!(request.uri, "file:///workspace/lib.fe");
+        assert_eq!(request.config_hash.as_deref(), Some("config"));
+        assert_eq!(request.target.as_deref(), Some("evm"));
+        assert_eq!(request.opt_level.as_deref(), Some("O2"));
+        assert_eq!(request.view.as_deref(), Some("source-postopt-bytecode"));
+        assert!(matches!(request.query, TraceQueryRequest::LoopCost { .. }));
+    }
+
+    #[test]
+    fn trace_workbench_revision_cursor_includes_status() {
+        let stale = trace_workbench_revision_cursor(&bootstrap_response(
+            12,
+            "stale_but_usable",
+            Some("blake3:same"),
+        ));
+        let ready =
+            trace_workbench_revision_cursor(&bootstrap_response(12, "ready", Some("blake3:same")));
+
+        assert_ne!(stale, ready);
+    }
+
+    #[test]
+    fn trace_workbench_chunk_payload_resolves_manifest_digests() {
+        let model = serde_json::json!({
+            "revision": { "id": 7 },
+            "metadata": { "input_path": "demo.fe" },
+            "source": { "lines": [{ "number": 1, "text": "fn main() {}" }] },
+            "indexes": { "source_lines": { "main:1": "source-main-line-1" } },
+            "provenance": { "source_to_optimized": "available" },
+            "rail_components": { "exact": ["exact-c-a"] },
+            "panels": [
+                { "id": "source", "rows": [] },
+                { "id": "bytecode", "rows": [{ "text": "STOP" }] }
+            ],
+            "attribution_audit": { "prepared_linked_pcs": 1 },
+            "static_analysis": { "checks": [] },
+            "audit": { "total_closures": 0 }
+        });
+        let manifest = trace_workbench_manifest(&model);
+
+        assert!(
+            trace_workbench_chunk_payload(&model, &manifest.root_digest).is_none(),
+            "root digest is a model identity, not a materialized full-model chunk"
+        );
+
+        let summary = trace_workbench_chunk_payload(&model, &manifest.summary_digest).unwrap();
+        assert_eq!(summary["kind"], "summary");
+        assert_eq!(summary["value"]["revision"]["id"], 7);
+        assert_eq!(
+            summary["value"]["provenance"]["source_to_optimized"],
+            "available"
+        );
+
+        let source = trace_workbench_chunk_payload(&model, &manifest.source_digest).unwrap();
+        assert_eq!(source["kind"], "source");
+        assert_eq!(source["value"]["lines"][0]["text"], "fn main() {}");
+
+        let indexes = trace_workbench_chunk_payload(&model, &manifest.indexes_digest).unwrap();
+        assert_eq!(indexes["kind"], "indexes");
+        assert_eq!(
+            indexes["value"]["source_lines"]["main:1"],
+            "source-main-line-1"
+        );
+
+        let pane_digest = manifest.panes.get("bytecode").unwrap();
+        let pane = trace_workbench_chunk_payload(&model, pane_digest).unwrap();
+        assert_eq!(pane["kind"], "pane");
+        assert_eq!(pane["id"], "bytecode");
+        assert_eq!(pane["value"]["rows"][0]["text"], "STOP");
+
+        let report_digest = manifest.reports.get("attribution").unwrap();
+        let report = trace_workbench_chunk_payload(&model, report_digest).unwrap();
+        assert_eq!(report["kind"], "report");
+        assert_eq!(report["id"], "attribution");
+        assert_eq!(report["value"]["prepared_linked_pcs"], 1);
+
+        assert!(trace_workbench_chunk_payload(&model, "blake3:missing").is_none());
+        let digests = trace_workbench_requested_chunk_digests(&serde_json::json!({
+            "digests": [
+                manifest.summary_digest,
+                manifest.summary_digest,
+                "blake3:missing"
+            ]
+        }));
+        let resolved = digests
+            .into_iter()
+            .filter_map(|digest| trace_workbench_chunk_payload(&model, &digest))
+            .collect::<Vec<_>>();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0]["kind"], "summary");
     }
 }
 
