@@ -10,13 +10,14 @@ use mir::{RuntimePackage, build_runtime_package, build_test_runtime_package};
 use rustc_hash::FxHashSet;
 use sonatina_codegen::{
     EvmCompile, OptLevel as SonatinaOptLevel,
+    machinst::vcode::{SectionCodeUnitId, VCodeInst},
     object::{
-        OBSERVABILITY_SCHEMA_VERSION, ObjectArtifact, SectionArtifact, SectionObservability,
-        SymbolId, UnmappedReason, UnmappedReasonCoverage,
+        OBSERVABILITY_SCHEMA_VERSION, ObjectArtifact, PcAttribution, PcMapEntry, PcMapUnit,
+        SectionArtifact, SectionObservability, SymbolId, UnmappedReason, UnmappedReasonCoverage,
     },
 };
 use sonatina_ir::{
-    Module,
+    BlockId, Module,
     ir_writer::{FuncWriter, ModuleWriter},
     isa::evm::Evm,
     module::{FuncRef, ModuleCtx},
@@ -409,6 +410,25 @@ fn all_unmapped_observability(
 ) -> SectionObservability {
     let mut unmapped_reason_coverage = UnmappedReasonCoverage::default();
     unmapped_reason_coverage.add_bytes(reason, code_bytes);
+    let pc_map = (code_bytes > 0)
+        .then(|| PcMapEntry {
+            pc_start: 0,
+            pc_end: code_bytes,
+            unit: PcMapUnit::Synthetic {
+                object: "fe.wrapper".into(),
+                section: section.into(),
+                unit: SectionCodeUnitId(0),
+            },
+            func_name: format!("fe.{section}.wrapper"),
+            block: BlockId(0),
+            vcode_inst: VCodeInst(0),
+            attribution: PcAttribution::Unmapped {
+                machine_inst: None,
+                reason,
+            },
+        })
+        .into_iter()
+        .collect();
     SectionObservability {
         schema_version: OBSERVABILITY_SCHEMA_VERSION,
         section: section.into(),
@@ -419,7 +439,7 @@ fn all_unmapped_observability(
         mapped_code_bytes: 0,
         unmapped_code_bytes: code_bytes,
         unmapped_reason_coverage,
-        pc_map: Vec::new(),
+        pc_map,
     }
 }
 
@@ -1138,7 +1158,16 @@ mod tests {
             observability.unmapped_reason_coverage.total_bytes() as usize,
             code_bytes
         );
-        assert!(observability.pc_map.is_empty());
+        assert_eq!(observability.pc_map.len(), 1);
+        assert_eq!(observability.pc_map[0].pc_start, 0);
+        assert_eq!(observability.pc_map[0].pc_end as usize, code_bytes);
+        assert!(matches!(
+            observability.pc_map[0].attribution,
+            PcAttribution::Unmapped {
+                reason: UnmappedReason::Synthetic,
+                ..
+            }
+        ));
     }
 
     #[test]
