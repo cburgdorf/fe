@@ -361,10 +361,11 @@ pub fn emit_ethdebug_artifact(bundle: &DebugBundle) -> Result<EthdebugArtifact, 
             if instructions.is_empty() {
                 continue;
             }
+            let contract_name = contract_name(code_object)?;
             programs.push(program_for_instructions(
                 &code_object.key.canonical_storage_key(),
                 environment_for(code_object),
-                &contract_name(code_object),
+                &contract_name,
                 code_object.code_hash.clone(),
                 instructions,
                 &spans,
@@ -790,16 +791,37 @@ fn environment_for(code_object: &DebugCodeObject) -> EthdebugEnvironment {
     }
 }
 
-fn contract_name(code_object: &DebugCodeObject) -> String {
-    code_object
+fn contract_name(code_object: &DebugCodeObject) -> Result<String, String> {
+    let contract = code_object
         .owner_function_or_contract
         .as_ref()
-        .map(|key| key.display_label())
-        .unwrap_or_else(|| code_object.key.display_label())
+        .ok_or_else(|| {
+            format!(
+                "ethdebug code object `{}` has no explicit contract owner",
+                code_object.key.canonical_storage_key()
+            )
+        })?;
+    if contract.kind() != "bytecode.contract" {
+        return Err(format!(
+            "ethdebug code object `{}` owner `{}` is not a bytecode.contract",
+            code_object.key.canonical_storage_key(),
+            contract.canonical_storage_key()
+        ));
+    }
+    let name = contract.local_key();
+    if name.trim().is_empty() {
+        return Err(format!(
+            "ethdebug code object `{}` has an empty contract name",
+            code_object.key.canonical_storage_key()
+        ));
+    }
+    Ok(name.to_string())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use common::origin::OriginExportKey;
     use serde_json::Value;
     use trace_facts::PcRange;
@@ -824,7 +846,7 @@ mod tests {
     fn bundle() -> DebugBundle {
         let source_file = key("source.file", "demo", "src/main.fe");
         let source_expr = key("hir.expr", "demo", "expr:add");
-        let contract = key("contract", "demo", "Fib");
+        let contract = key("bytecode.contract", "demo", "Fib");
         let code_object = key("code.object", "demo", "runtime");
         let function = key("function", "demo", "runtime");
         DebugBundle {
@@ -910,10 +932,11 @@ mod tests {
         let mut bundle = bundle();
         let creation = key("code.object", "demo", "creation");
         let creation_function = key("function", "demo", "creation");
+        let contract = bundle.code_objects[0].owner_function_or_contract.clone();
         bundle.code_objects.push(DebugCodeObject {
             key: creation.clone(),
             kind: "evm_creation_bytecode".to_string(),
-            owner_function_or_contract: None,
+            owner_function_or_contract: contract,
             target: "evm/sonatina".to_string(),
             code_hash: None,
         });
@@ -946,6 +969,62 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(environments.contains(&EthdebugEnvironment::Call));
         assert!(environments.contains(&EthdebugEnvironment::Create));
+        assert!(
+            artifact
+                .programs
+                .iter()
+                .all(|program| program.contract.name == "Fib")
+        );
+    }
+
+    #[test]
+    fn code_object_programs_require_explicit_bytecode_contract_owners() {
+        let mut missing = bundle();
+        missing.code_objects[0].owner_function_or_contract = None;
+        assert!(
+            emit_ethdebug_artifact(&missing)
+                .unwrap_err()
+                .contains("no explicit contract owner")
+        );
+
+        let mut wrong_kind = bundle();
+        wrong_kind.code_objects[0].owner_function_or_contract =
+            Some(key("bytecode.function", "demo", "runtime"));
+        assert!(
+            emit_ethdebug_artifact(&wrong_kind)
+                .unwrap_err()
+                .contains("is not a bytecode.contract")
+        );
+    }
+
+    #[test]
+    fn multi_contract_artifact_uses_contract_local_names() {
+        let mut bundle = bundle();
+        bundle.code_objects[0].owner_function_or_contract =
+            Some(key("bytecode.contract", "demo", "Alpha"));
+
+        let beta_object = key("code.object", "demo", "beta-runtime");
+        bundle.code_objects.push(DebugCodeObject {
+            key: beta_object.clone(),
+            kind: "evm_runtime_bytecode".to_string(),
+            owner_function_or_contract: Some(key("bytecode.contract", "demo", "Beta")),
+            target: "evm/sonatina".to_string(),
+            code_hash: None,
+        });
+        let mut beta_instruction = bundle.instructions[0].clone();
+        beta_instruction.key = key("bytecode.pc", "demo:beta", "pc:0");
+        beta_instruction.function = key("bytecode.function", "demo:beta", "runtime");
+        beta_instruction.code_object = Some(beta_object);
+        bundle.instructions.push(beta_instruction);
+
+        let artifact = emit_ethdebug_artifact(&bundle).unwrap();
+        let names = artifact
+            .programs
+            .iter()
+            .map(|program| program.contract.name.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(names, BTreeSet::from(["Alpha", "Beta"]));
     }
 
     #[test]

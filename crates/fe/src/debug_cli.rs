@@ -408,6 +408,7 @@ mod tests {
         let source_file = key("source.file", "demo", "demo.fe");
         let source_expr = key("hir.expr", "demo", "expr:add");
         let code_object = key("code.object", "demo", "runtime");
+        let contract = key("bytecode.contract", "demo", "Demo");
         let function = key("bytecode.function", "demo", "runtime");
         let instruction = key("bytecode.pc", "demo", "pc:4");
         let bundle = TraceBundle::new(
@@ -422,6 +423,7 @@ mod tests {
                 node(source_file.clone()),
                 node(source_expr.clone()),
                 node(code_object.clone()),
+                node(contract.clone()),
                 node(function.clone()),
                 node(instruction.clone()),
                 TraceFact::SourceFile(SourceFileFact::new(
@@ -444,7 +446,7 @@ mod tests {
                 TraceFact::CodeObject(CodeObjectFact::new(
                     code_object.clone(),
                     CodeObjectKind::EvmRuntimeBytecode,
-                    Some(function.clone()),
+                    Some(contract),
                     "evm/sonatina",
                     Some(
                         "blake3:000000000000000000000000000000000000000000000000000000000000beef"

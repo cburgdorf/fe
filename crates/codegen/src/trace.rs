@@ -506,11 +506,14 @@ pub fn emit_observed_bytecode_trace_facts(
     let mut facts = Vec::new();
     let mut skips = ResolveSkips::default();
     for (contract_name, artifact) in bytecode {
+        let contract = bytecode_contract_key(input_owner_key, module_key, contract_name);
+        facts.push(origin_node(contract.clone(), "bytecode.contract"));
         let runtime_owner = bytecode_runtime_owner_key(input_owner_key, module_key, contract_name);
         facts.extend(emit_evm_bytecode_instruction_facts_with_observability(
             &runtime_owner,
             function_local_key,
             EvmBytecodeSection::Runtime,
+            Some(&contract),
             &artifact.runtime,
             Some(sonatina_owner_key),
             artifact.runtime_observability.as_ref(),
@@ -523,6 +526,7 @@ pub fn emit_observed_bytecode_trace_facts(
             &creation_owner,
             "function:creation",
             EvmBytecodeSection::Creation,
+            Some(&contract),
             &artifact.deploy,
             Some(sonatina_owner_key),
             artifact.deploy_observability.as_ref(),
@@ -569,6 +573,7 @@ fn emit_bytecode_instruction_facts_with_observability_counted(
         owner_key,
         function_local_key,
         EvmBytecodeSection::Runtime,
+        None,
         bytecode,
         sonatina_owner_key,
         observability,
@@ -583,6 +588,7 @@ fn emit_evm_bytecode_instruction_facts_with_observability(
     owner_key: &str,
     function_local_key: &str,
     section: EvmBytecodeSection,
+    code_object_owner: Option<&OriginExportKey>,
     bytecode: &[u8],
     sonatina_owner_key: Option<&str>,
     observability: Option<&SectionObservability>,
@@ -609,7 +615,7 @@ fn emit_evm_bytecode_instruction_facts_with_observability(
         TraceFact::CodeObject(CodeObjectFact::new(
             code_object.clone(),
             section.code_object_kind(),
-            Some(function.clone()),
+            code_object_owner.cloned(),
             "evm/sonatina",
             Some(bytecode_content_hash(bytecode)),
         )),
@@ -988,6 +994,19 @@ pub fn bytecode_creation_owner_key(
     contract_name: &str,
 ) -> String {
     format!("package:{package_key}:module:{module_key}:contract:{contract_name}:section:creation")
+}
+
+pub fn bytecode_contract_key(
+    package_key: &str,
+    module_key: &str,
+    contract_name: &str,
+) -> OriginExportKey {
+    OriginExportKey::try_from_raw_parts(
+        "bytecode.contract",
+        format!("package:{package_key}:module:{module_key}"),
+        contract_name,
+    )
+    .expect("codegen bytecode contract key must be valid")
 }
 
 pub fn sonatina_module_owner_key(package_key: &str, module_key: &str) -> String {
@@ -1573,12 +1592,13 @@ mod tests {
         BytecodePcRange, BytecodeSourceMapEntry, SonatinaContractBytecode,
         trace::{
             EVM_VCODE_INST_KIND, SONATINA_EVM_PREPARED_INST_KIND, SONATINA_POSTOPT_INST_KIND,
-            build_pc_map, bytecode_code_object_key, bytecode_creation_owner_key,
-            bytecode_runtime_owner_key, emit_bytecode_instruction_facts,
-            emit_bytecode_instruction_facts_with_observability, emit_codegen_facts,
-            emit_observed_bytecode_trace_facts, emit_sonatina_trace_view_facts, evm_vcode_inst_key,
-            pc_map_entry_for_pc, push_standalone_source_file_facts, sonatina_postopt_inst_key,
-            standalone_source_file_facts, trace_source_file_key, whole_file_source_span,
+            build_pc_map, bytecode_code_object_key, bytecode_contract_key,
+            bytecode_creation_owner_key, bytecode_runtime_owner_key,
+            emit_bytecode_instruction_facts, emit_bytecode_instruction_facts_with_observability,
+            emit_codegen_facts, emit_observed_bytecode_trace_facts, emit_sonatina_trace_view_facts,
+            evm_vcode_inst_key, pc_map_entry_for_pc, push_standalone_source_file_facts,
+            sonatina_postopt_inst_key, standalone_source_file_facts, trace_source_file_key,
+            whole_file_source_span,
         },
     };
 
@@ -1638,6 +1658,15 @@ mod tests {
         let creation_owner = bytecode_creation_owner_key("demo", "demo", "Demo");
         assert_eq!(creation.code_object.owner_key(), creation_owner);
         assert_eq!(creation.code_object.local_key(), "creation");
+        let contract = bytecode_contract_key("demo", "demo", "Demo");
+        assert!(code_objects.iter().all(|code_object| {
+            code_object.owner_function_or_contract.as_ref() == Some(&contract)
+        }));
+        assert!(facts.iter().any(|fact| matches!(
+            fact,
+            TraceFact::OriginNode(node)
+                if node.key == contract && node.kind() == "bytecode.contract"
+        )));
         assert_ne!(
             code_objects[0].code_hash.as_deref(),
             code_objects[1].code_hash.as_deref()
@@ -2817,6 +2846,11 @@ mod tests {
         assert!(first.contains("module:mod:fib"));
         assert!(first.contains("contract:Fib"));
         assert!(first.contains("section:runtime"));
+
+        let contract = bytecode_contract_key("pkg:a", "mod:fib", "Fib");
+        assert_eq!(contract.kind(), "bytecode.contract");
+        assert_eq!(contract.owner_key(), "package:pkg:a:module:mod:fib");
+        assert_eq!(contract.local_key(), "Fib");
     }
 
     #[test]
