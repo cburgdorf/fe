@@ -217,15 +217,15 @@ fn compile_runtime_objects_with_postopt_trace(
     if emit_observability && let Some(owner) = postopt_trace_owner {
         stamp_postopt_instruction_provenance(owner, &mut compile);
     }
-    let postopt_trace_facts = postopt_trace_owner
-        .map(|owner| {
-            crate::trace::emit_sonatina_trace_view_facts(
-                owner,
-                compile.optimize(),
-                trace_facts::CompilerPhase::SonatinaPostOpt,
-            )
-        })
-        .unwrap_or_default();
+    let postopt_trace_facts = if let Some(owner) = postopt_trace_owner {
+        crate::trace::emit_sonatina_trace_view_facts(
+            owner,
+            compile.optimize(),
+            trace_facts::CompilerPhase::SonatinaPostOpt,
+        )?
+    } else {
+        Vec::new()
+    };
     let artifacts = compile
         .compile()
         .map_err(|errors| LowerError::Internal(format_object_compile_errors(&errors)))?;

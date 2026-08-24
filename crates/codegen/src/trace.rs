@@ -145,7 +145,7 @@ fn emit_observable_package_trace_facts(
         &sonatina_owner,
         &sonatina_module,
         CompilerPhase::SonatinaPreOpt,
-    ));
+    )?);
     let (bytecode, postopt_sonatina_facts) =
         crate::sonatina::emit_runtime_module_sonatina_bytecode_with_observability_and_trace(
             db,
@@ -177,7 +177,7 @@ fn emit_observable_package_trace_facts(
         &sonatina_owner,
         &bytecode,
         &postopt_sonatina_facts,
-    );
+    )?;
     facts.extend(postopt_sonatina_facts);
     facts.extend(observed_bytecode_facts);
     for contract_name in bytecode.keys() {
@@ -613,48 +613,7 @@ pub fn emit_bytecode_instruction_facts(
         None,
         None,
     )
-}
-
-/// Attribution inputs the emitter received but could not use. Process-local by
-/// design: TraceMetadata is deny_unknown_fields with an exact-match schema
-/// version (trace-facts jsonl.rs), so carrying these counts in the bundle is a
-/// TRACE_SCHEMA_VERSION bump, deferred to the CoverageFact work. Until then they
-/// are assertable in tests (via the `_counted` emitter) and logged in production.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct ResolveSkips {
-    /// post_opt_provenance was present but not decodable as an OriginExportKey.
-    provenance_undecodable: u32,
-    /// A decoded postopt endpoint was not among the known trace-view nodes
-    /// (counted only when a known-node set was supplied).
-    postopt_endpoint_unknown: u32,
-}
-
-impl ResolveSkips {
-    fn is_empty(&self) -> bool {
-        *self == Self::default()
-    }
-
-    fn warn_if_any(&self, owner_key: &str) {
-        if !self.is_empty() {
-            tracing::warn!(
-                owner = owner_key,
-                provenance_undecodable = self.provenance_undecodable,
-                postopt_endpoint_unknown = self.postopt_endpoint_unknown,
-                "trace emission skipped unresolvable attribution inputs"
-            );
-        }
-    }
-
-    /// A decode failure means producer and consumer disagree about the
-    /// provenance encoding: schema drift. Real-compile fixtures run through the
-    /// production emitters and catch it here in debug builds. An unknown
-    /// endpoint is a legitimate runtime condition, not drift, so it is excluded.
-    fn debug_assert_no_decode_failures(&self, owner_key: &str) {
-        debug_assert_eq!(
-            self.provenance_undecodable, 0,
-            "undecodable post-opt provenance for {owner_key}: {self:?}"
-        );
-    }
+    .expect("bytecode emission without observability cannot fail attribution checks")
 }
 
 pub fn emit_observed_bytecode_trace_facts(
@@ -664,7 +623,7 @@ pub fn emit_observed_bytecode_trace_facts(
     sonatina_owner_key: &str,
     bytecode: &BTreeMap<String, crate::SonatinaContractBytecode>,
     postopt_sonatina_facts: &[TraceFact],
-) -> Vec<TraceFact> {
+) -> Result<Vec<TraceFact>, crate::LowerError> {
     let postopt_sonatina_nodes = postopt_sonatina_facts
         .iter()
         .filter_map(|fact| match fact {
@@ -675,7 +634,6 @@ pub fn emit_observed_bytecode_trace_facts(
         })
         .collect::<BTreeSet<_>>();
     let mut facts = Vec::new();
-    let mut skips = ResolveSkips::default();
     for (contract_name, artifact) in bytecode {
         let contract = bytecode_contract_key(input_owner_key, module_key, contract_name);
         facts.push(origin_node(contract.clone(), "bytecode.contract"));
@@ -689,8 +647,7 @@ pub fn emit_observed_bytecode_trace_facts(
             Some(sonatina_owner_key),
             artifact.runtime_observability.as_ref(),
             Some(&postopt_sonatina_nodes),
-            &mut skips,
-        ));
+        )?);
         let creation_owner =
             bytecode_creation_owner_key(input_owner_key, module_key, contract_name);
         facts.extend(emit_evm_bytecode_instruction_facts_with_observability(
@@ -702,12 +659,9 @@ pub fn emit_observed_bytecode_trace_facts(
             Some(sonatina_owner_key),
             artifact.deploy_observability.as_ref(),
             Some(&postopt_sonatina_nodes),
-            &mut skips,
-        ));
+        )?);
     }
-    skips.debug_assert_no_decode_failures(input_owner_key);
-    skips.warn_if_any(input_owner_key);
-    facts
+    Ok(facts)
 }
 
 pub fn emit_bytecode_instruction_facts_with_observability(
@@ -717,30 +671,8 @@ pub fn emit_bytecode_instruction_facts_with_observability(
     sonatina_owner_key: Option<&str>,
     observability: Option<&SectionObservability>,
     known_sonatina_endpoint_nodes: Option<&BTreeSet<OriginExportKey>>,
-) -> Vec<TraceFact> {
-    let (facts, skips) = emit_bytecode_instruction_facts_with_observability_counted(
-        owner_key,
-        function_local_key,
-        bytecode,
-        sonatina_owner_key,
-        observability,
-        known_sonatina_endpoint_nodes,
-    );
-    skips.debug_assert_no_decode_failures(owner_key);
-    skips.warn_if_any(owner_key);
-    facts
-}
-
-fn emit_bytecode_instruction_facts_with_observability_counted(
-    owner_key: &str,
-    function_local_key: &str,
-    bytecode: &[u8],
-    sonatina_owner_key: Option<&str>,
-    observability: Option<&SectionObservability>,
-    known_sonatina_endpoint_nodes: Option<&BTreeSet<OriginExportKey>>,
-) -> (Vec<TraceFact>, ResolveSkips) {
-    let mut skips = ResolveSkips::default();
-    let facts = emit_evm_bytecode_instruction_facts_with_observability(
+) -> Result<Vec<TraceFact>, crate::LowerError> {
+    emit_evm_bytecode_instruction_facts_with_observability(
         owner_key,
         function_local_key,
         EvmBytecodeSection::Runtime,
@@ -749,9 +681,7 @@ fn emit_bytecode_instruction_facts_with_observability_counted(
         sonatina_owner_key,
         observability,
         known_sonatina_endpoint_nodes,
-        &mut skips,
-    );
-    (facts, skips)
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -764,8 +694,7 @@ fn emit_evm_bytecode_instruction_facts_with_observability(
     sonatina_owner_key: Option<&str>,
     observability: Option<&SectionObservability>,
     known_sonatina_endpoint_nodes: Option<&BTreeSet<OriginExportKey>>,
-    skips: &mut ResolveSkips,
-) -> Vec<TraceFact> {
+) -> Result<Vec<TraceFact>, crate::LowerError> {
     let function = bytecode_function_key(owner_key, function_local_key);
     let code_object = bytecode_code_object_key_for_section(owner_key, section);
     let pc_map = observability
@@ -874,44 +803,47 @@ fn emit_evm_bytecode_instruction_facts_with_observability(
                 }
             }
             if let Some(raw) = entry.attribution.post_opt_provenance() {
-                match serde_json::from_str::<OriginExportKey>(raw) {
-                    Err(_) => skips.provenance_undecodable += 1,
-                    Ok(frontend_origin) => {
-                        if frontend_origin.kind() == SONATINA_POSTOPT_INST_KIND {
-                            if let Some(prepared_inst) = prepared_inst {
-                                let endpoint_is_known = known_sonatina_endpoint_nodes
-                                    .is_some_and(|known| known.contains(&frontend_origin));
-                                if endpoint_is_known {
-                                    emit_prepared_lineage_event(
-                                        &mut facts,
-                                        owner_key,
-                                        &prepared_inst,
-                                        &frontend_origin,
-                                        &mut emitted_prepared_lineage_events,
-                                    );
-                                    if emitted_backend_edges
-                                        .insert((prepared_inst.clone(), frontend_origin.clone()))
-                                    {
-                                        facts.push(TraceFact::OriginEdge(OriginEdgeFact::new(
-                                            prepared_inst,
-                                            frontend_origin,
-                                            OriginEdgeLabel::LoweredFrom,
-                                            Some(CompilerPhase::Backend),
-                                        )));
-                                    }
-                                } else if known_sonatina_endpoint_nodes.is_some() {
-                                    skips.postopt_endpoint_unknown += 1;
-                                }
-                            }
-                        } else {
-                            facts.push(TraceFact::OriginEdge(OriginEdgeFact::new(
-                                instruction.clone(),
-                                frontend_origin,
-                                OriginEdgeLabel::BackendPrepared,
-                                Some(CompilerPhase::BytecodeEmission),
-                            )));
-                        }
-                    }
+                let frontend_origin = serde_json::from_str::<OriginExportKey>(raw).map_err(|err| {
+                    crate::LowerError::Internal(format!(
+                        "mapped bytecode attribution for `{owner_key}` has undecodable post-opt provenance: {err}"
+                    ))
+                })?;
+                if frontend_origin.kind() != SONATINA_POSTOPT_INST_KIND {
+                    return Err(crate::LowerError::Internal(format!(
+                        "mapped bytecode attribution for `{owner_key}` has unexpected provenance kind `{}`",
+                        frontend_origin.kind()
+                    )));
+                }
+                let prepared_inst = prepared_inst.ok_or_else(|| {
+                    crate::LowerError::Internal(format!(
+                        "mapped bytecode attribution for `{owner_key}` has no prepared instruction"
+                    ))
+                })?;
+                let known_sonatina_endpoint_nodes = known_sonatina_endpoint_nodes.ok_or_else(|| {
+                    crate::LowerError::Internal(format!(
+                        "mapped bytecode attribution for `{owner_key}` cannot verify its post-opt endpoint"
+                    ))
+                })?;
+                if !known_sonatina_endpoint_nodes.contains(&frontend_origin) {
+                    return Err(crate::LowerError::Internal(format!(
+                        "mapped bytecode attribution for `{owner_key}` references absent post-opt endpoint `{}`",
+                        frontend_origin.canonical_storage_key()
+                    )));
+                }
+                emit_prepared_lineage_event(
+                    &mut facts,
+                    owner_key,
+                    &prepared_inst,
+                    &frontend_origin,
+                    &mut emitted_prepared_lineage_events,
+                );
+                if emitted_backend_edges.insert((prepared_inst.clone(), frontend_origin.clone())) {
+                    facts.push(TraceFact::OriginEdge(OriginEdgeFact::new(
+                        prepared_inst,
+                        frontend_origin,
+                        OriginEdgeLabel::LoweredFrom,
+                        Some(CompilerPhase::Backend),
+                    )));
                 }
             }
         }
@@ -945,7 +877,7 @@ fn emit_evm_bytecode_instruction_facts_with_observability(
         pc += byte_len;
         index += 1;
     }
-    facts
+    Ok(facts)
 }
 
 /// Build the `pc_start`-keyed lookup used by [`pc_map_entry_for_pc`].
@@ -1001,9 +933,9 @@ pub fn emit_sonatina_trace_view_facts(
     owner_key: &str,
     module: &sonatina_ir::Module,
     phase: CompilerPhase,
-) -> Vec<TraceFact> {
+) -> Result<Vec<TraceFact>, crate::LowerError> {
     let Some((function_kind, block_kind, inst_kind)) = sonatina_phase_kinds(phase) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut facts = Vec::new();
     for function_ref in module.trace_functions() {
@@ -1082,12 +1014,9 @@ pub fn emit_sonatina_trace_view_facts(
                         )));
                     }
                     FrontendOriginLookup::Undecodable(raw) => {
-                        tracing::warn!(
-                            owner = owner_key,
-                            raw = raw.as_str(),
-                            "undecodable frontend origin in trace view"
-                        );
-                        debug_assert!(false, "undecodable frontend origin for {owner_key}: {raw}");
+                        return Err(crate::LowerError::Internal(format!(
+                            "undecodable frontend origin for `{owner_key}`: `{raw}`"
+                        )));
                     }
                     FrontendOriginLookup::Absent => {}
                 }
@@ -1149,7 +1078,7 @@ pub fn emit_sonatina_trace_view_facts(
             }
         }
     }
-    facts
+    Ok(facts)
 }
 pub fn bytecode_runtime_owner_key(
     package_key: &str,
@@ -1806,7 +1735,8 @@ mod tests {
             "package:demo:module:demo:sonatina",
             &bytecode,
             &[],
-        );
+        )
+        .unwrap();
         TraceValidator::validate(&facts).unwrap();
 
         let code_objects = facts
@@ -2004,7 +1934,8 @@ mod tests {
             Some(sonatina_owner),
             Some(&observability),
             Some(&known),
-        );
+        )
+        .unwrap();
         let mut validated_facts = vec![TraceFact::OriginNode(OriginNodeFact::new(
             postopt.clone(),
             OriginNodeKind::new(SONATINA_POSTOPT_INST_KIND),
@@ -2133,7 +2064,9 @@ mod tests {
             .unwrap();
 
         let sonatina_owner = "package:fib:module:fib:sonatina";
+        let postopt = sonatina_postopt_inst_key(sonatina_owner, func, InstId(37));
         let vcode = evm_vcode_inst_key(sonatina_owner, func, VCodeInst(0));
+        let known = std::collections::BTreeSet::from([postopt.clone()]);
         let prepared = super::sonatina_trace_inst_key(
             SONATINA_EVM_PREPARED_INST_KIND,
             sonatina_owner,
@@ -2163,12 +2096,8 @@ mod tests {
                 vcode_inst: VCodeInst(0),
                 attribution: sonatina_codegen::object::PcAttribution::Mapped {
                     machine_inst: sonatina_codegen::object::MachineInstId(InstId(37)),
-                    post_opt_provenance: serde_json::to_string(&sonatina_postopt_inst_key(
-                        sonatina_owner,
-                        func,
-                        InstId(37),
-                    ))
-                    .expect("OriginExportKey serialization cannot fail"),
+                    post_opt_provenance: serde_json::to_string(&postopt)
+                        .expect("OriginExportKey serialization cannot fail"),
                 },
             }],
         };
@@ -2179,9 +2108,15 @@ mod tests {
             &[0x5f, 0x01],
             Some(sonatina_owner),
             Some(&observability),
-            None,
-        );
-        TraceValidator::validate(&facts).unwrap();
+            Some(&known),
+        )
+        .unwrap();
+        let mut validated_facts = vec![TraceFact::OriginNode(OriginNodeFact::new(
+            postopt.clone(),
+            OriginNodeKind::new(SONATINA_POSTOPT_INST_KIND),
+        ))];
+        validated_facts.extend(facts.clone());
+        TraceValidator::validate(&validated_facts).unwrap();
 
         for pc in [&pc0, &pc1] {
             assert!(
@@ -2231,7 +2166,6 @@ mod tests {
 
         let sonatina_owner = "package:fib:module:fib:sonatina";
         let postopt = sonatina_postopt_inst_key(sonatina_owner, func, InstId(37));
-        let vcode = evm_vcode_inst_key(sonatina_owner, func, VCodeInst(0));
         let observability = SectionObservability {
             schema_version: OBSERVABILITY_SCHEMA_VERSION,
             section: "runtime".into(),
@@ -2257,45 +2191,19 @@ mod tests {
             }],
         };
 
-        let facts = emit_bytecode_instruction_facts_with_observability(
+        let err = emit_bytecode_instruction_facts_with_observability(
             "contract:Fib",
             "runtime",
             &[0x5f],
             Some(sonatina_owner),
             Some(&observability),
             None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot verify its post-opt endpoint")
         );
-        TraceValidator::validate(&facts).unwrap();
-
-        assert!(facts.iter().any(|fact| matches!(
-            fact,
-            TraceFact::OriginEdge(edge)
-                if edge.from.kind() == "bytecode.pc"
-                    && edge.to == vcode
-                    && edge.label == trace_facts::OriginEdgeLabel::EmittedFrom
-        )));
-        assert!(facts.iter().any(|fact| matches!(
-            fact,
-            TraceFact::OriginEdge(edge)
-                if edge.from == vcode
-                    && edge.to.kind() == SONATINA_EVM_PREPARED_INST_KIND
-                    && edge.label == trace_facts::OriginEdgeLabel::LoweredFrom
-        )));
-        assert!(!facts.iter().any(|fact| matches!(
-            fact,
-            TraceFact::OriginNode(node) if node.key == postopt
-        )));
-        assert!(!facts.iter().any(|fact| matches!(
-            fact,
-            TraceFact::OriginEdge(edge)
-                if edge.from.kind() == SONATINA_EVM_PREPARED_INST_KIND
-                    && edge.to == postopt
-        )));
-        assert!(!facts.iter().any(|fact| matches!(
-            fact,
-            TraceFact::CompilerEvent(event)
-                if event.kind == CompilerEventKind::PreparedLineage
-        )));
     }
 
     #[test]
@@ -2363,29 +2271,23 @@ mod tests {
             }],
         };
 
-        let facts = emit_bytecode_instruction_facts_with_observability(
+        let err = emit_bytecode_instruction_facts_with_observability(
             "contract:Fib",
             "runtime",
             &[0x5f],
             Some(sonatina_owner),
             Some(&observability),
             Some(&known),
-        );
+        )
+        .unwrap_err();
 
         // Provenance keyed by emission index instead of a real InstId does not
         // name a known postopt node; it must be refused outright, never
         // remapped onto a different instruction.
-        assert!(!facts.iter().any(|fact| matches!(
-            fact,
-            TraceFact::OriginEdge(edge)
-                if edge.from.kind() == SONATINA_EVM_PREPARED_INST_KIND
-                    && (edge.to == alias_postopt || edge.to == actual_postopt)
-        )));
-        assert!(!facts.iter().any(|fact| matches!(
-            fact,
-            TraceFact::CompilerEvent(event)
-                if event.kind == CompilerEventKind::PreparedLineage
-        )));
+        assert!(
+            err.to_string()
+                .contains("references absent post-opt endpoint")
+        );
     }
 
     #[test]
@@ -2412,7 +2314,6 @@ mod tests {
 
         let sonatina_owner = "package:fib:module:fib:sonatina";
         let unknown_postopt = sonatina_postopt_inst_key(sonatina_owner, func, InstId(37));
-        let vcode = evm_vcode_inst_key(sonatina_owner, func, VCodeInst(0));
         let known_postopt_nodes = std::collections::BTreeSet::new();
         let observability = SectionObservability {
             schema_version: OBSERVABILITY_SCHEMA_VERSION,
@@ -2439,45 +2340,19 @@ mod tests {
             }],
         };
 
-        let facts = emit_bytecode_instruction_facts_with_observability(
+        let err = emit_bytecode_instruction_facts_with_observability(
             "contract:Fib",
             "runtime",
             &[0x5f],
             Some(sonatina_owner),
             Some(&observability),
             Some(&known_postopt_nodes),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("references absent post-opt endpoint")
         );
-        TraceValidator::validate(&facts).unwrap();
-
-        assert!(facts.iter().any(|fact| matches!(
-            fact,
-            TraceFact::OriginEdge(edge)
-                if edge.from.kind() == "bytecode.pc"
-                    && edge.to == vcode
-                    && edge.label == trace_facts::OriginEdgeLabel::EmittedFrom
-        )));
-        assert!(facts.iter().any(|fact| matches!(
-            fact,
-            TraceFact::OriginEdge(edge)
-                if edge.from == vcode
-                    && edge.to.kind() == SONATINA_EVM_PREPARED_INST_KIND
-                    && edge.label == trace_facts::OriginEdgeLabel::LoweredFrom
-        )));
-        assert!(!facts.iter().any(|fact| matches!(
-            fact,
-            TraceFact::OriginNode(node) if node.key == unknown_postopt
-        )));
-        assert!(!facts.iter().any(|fact| matches!(
-            fact,
-            TraceFact::OriginEdge(edge)
-                if edge.from.kind() == SONATINA_EVM_PREPARED_INST_KIND
-                    && edge.to == unknown_postopt
-        )));
-        assert!(!facts.iter().any(|fact| matches!(
-            fact,
-            TraceFact::CompilerEvent(event)
-                if event.kind == CompilerEventKind::PreparedLineage
-        )));
     }
 
     #[test]
@@ -2538,7 +2413,8 @@ mod tests {
             Some(sonatina_owner),
             Some(&observability),
             None,
-        );
+        )
+        .unwrap();
 
         assert!(!facts.iter().any(|fact| matches!(
             fact,
@@ -2556,7 +2432,7 @@ mod tests {
     }
 
     #[test]
-    fn undecodable_post_opt_provenance_is_counted_not_emitted() {
+    fn undecodable_post_opt_provenance_is_rejected() {
         use sonatina_codegen::{
             machinst::vcode::VCodeInst,
             object::{OBSERVABILITY_SCHEMA_VERSION, PcMapEntry, SectionObservability},
@@ -2577,8 +2453,8 @@ mod tests {
             .declare_function(Signature::new_unit("runtime", Linkage::Public, &[]))
             .unwrap();
 
-        // Provenance present but not decodable as an OriginExportKey: counted as
-        // schema drift, never emitted as a contextual or lineage fact.
+        // Provenance present but not decodable as an OriginExportKey is schema
+        // drift and must prevent trace publication.
         let observability = SectionObservability {
             schema_version: OBSERVABILITY_SCHEMA_VERSION,
             section: "runtime".into(),
@@ -2603,24 +2479,20 @@ mod tests {
             }],
         };
 
-        let (facts, skips) = super::emit_bytecode_instruction_facts_with_observability_counted(
+        let err = emit_bytecode_instruction_facts_with_observability(
             "contract:Fib",
             "runtime",
             &[0x5f],
             Some("package:fib:module:fib:sonatina"),
             Some(&observability),
             None,
-        );
-        assert_eq!(skips.provenance_undecodable, 1);
-        assert!(!facts.iter().any(|fact| matches!(
-            fact,
-            TraceFact::OriginEdge(edge)
-                if edge.label == trace_facts::OriginEdgeLabel::BackendPrepared
-        )));
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("undecodable post-opt provenance"));
     }
 
     #[test]
-    fn unknown_postopt_endpoint_is_counted() {
+    fn unknown_postopt_endpoint_is_rejected() {
         use sonatina_codegen::{
             machinst::vcode::VCodeInst,
             object::{OBSERVABILITY_SCHEMA_VERSION, PcMapEntry, SectionObservability},
@@ -2643,8 +2515,8 @@ mod tests {
         let sonatina_owner = "package:fib:module:fib:sonatina";
         let postopt = sonatina_postopt_inst_key(sonatina_owner, func, InstId(37));
 
-        // A well-formed postopt endpoint absent from the known-node set is a
-        // counted skip (counted only because a set was supplied).
+        // A well-formed postopt endpoint absent from the known-node set must
+        // prevent trace publication.
         let observability = SectionObservability {
             schema_version: OBSERVABILITY_SCHEMA_VERSION,
             section: "runtime".into(),
@@ -2671,25 +2543,19 @@ mod tests {
         };
 
         let known = std::collections::BTreeSet::new();
-        let (facts, skips) = super::emit_bytecode_instruction_facts_with_observability_counted(
+        let err = emit_bytecode_instruction_facts_with_observability(
             "contract:Fib",
             "runtime",
             &[0x5f],
             Some(sonatina_owner),
             Some(&observability),
             Some(&known),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("references absent post-opt endpoint")
         );
-        assert_eq!(skips.postopt_endpoint_unknown, 1);
-        // An unknown endpoint mints no lineage event and no edge to the endpoint.
-        assert!(!facts.iter().any(|fact| matches!(
-            fact,
-            TraceFact::CompilerEvent(event)
-                if event.kind == CompilerEventKind::PreparedLineage
-        )));
-        assert!(!facts.iter().any(|fact| matches!(
-            fact,
-            TraceFact::OriginEdge(edge) if edge.to == postopt
-        )));
     }
 
     #[test]
@@ -2799,7 +2665,7 @@ mod tests {
     }
 
     #[test]
-    fn post_opt_provenance_with_foreign_kind_degrades_to_contextual() {
+    fn post_opt_provenance_with_foreign_kind_is_rejected() {
         use sonatina_codegen::{
             machinst::vcode::VCodeInst,
             object::{OBSERVABILITY_SCHEMA_VERSION, PcMapEntry, SectionObservability},
@@ -2849,53 +2715,16 @@ mod tests {
             }],
         };
 
-        let facts = emit_bytecode_instruction_facts_with_observability(
+        let err = emit_bytecode_instruction_facts_with_observability(
             "contract:Fib",
             "runtime",
             &[0x5f],
             Some(sonatina_owner),
             Some(&observability),
             None,
-        );
-        let mut validated_facts = vec![TraceFact::OriginNode(OriginNodeFact::new(
-            frontend_origin.clone(),
-            OriginNodeKind::new("hir.expr"),
-        ))];
-        validated_facts.extend(facts.clone());
-        TraceValidator::validate(&validated_facts).unwrap();
-
-        let frontend_edges = facts
-            .iter()
-            .filter_map(|fact| match fact {
-                TraceFact::OriginEdge(edge)
-                    if edge.from.kind() == "bytecode.pc" && edge.to == frontend_origin =>
-                {
-                    Some(edge)
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(frontend_edges.len(), 1);
-        assert_eq!(
-            frontend_edges[0].label,
-            trace_facts::OriginEdgeLabel::BackendPrepared
-        );
-        assert_eq!(
-            frontend_edges[0].traversal_class(),
-            trace_facts::OriginEdgeTraversalClass::Contextual
-        );
-        assert!(!facts.iter().any(|fact| matches!(
-            fact,
-            TraceFact::OriginEdge(edge)
-                if edge.from.kind() == "bytecode.pc"
-                    && edge.to == frontend_origin
-                    && edge.has_transform_claim_label()
-        )));
-        assert!(!facts.iter().any(|fact| matches!(
-            fact,
-            TraceFact::CompilerEvent(event)
-                if event.kind == CompilerEventKind::PreparedLineage
-        )));
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unexpected provenance kind"));
     }
 
     fn is_content_digest(value: &str) -> bool {
@@ -2953,11 +2782,10 @@ mod tests {
             source_origin.clone(),
             OriginNodeKind::new(source_origin.kind()),
         ))];
-        facts.extend(emit_sonatina_trace_view_facts(
-            "owner:test",
-            &module,
-            CompilerPhase::SonatinaPreOpt,
-        ));
+        facts.extend(
+            emit_sonatina_trace_view_facts("owner:test", &module, CompilerPhase::SonatinaPreOpt)
+                .unwrap(),
+        );
         TraceValidator::validate(&facts).unwrap();
 
         assert!(facts.iter().any(|fact| {
@@ -2972,6 +2800,51 @@ mod tests {
                         && edge.introduced_by == Some(CompilerPhase::SonatinaPreOpt)
             )
         }));
+    }
+
+    #[test]
+    fn sonatina_trace_view_adapter_rejects_undecodable_frontend_origin() {
+        use std::sync::Arc;
+
+        use sonatina_ir::{
+            Linkage, Signature, Type, builder::ModuleBuilder, func_cursor::InstInserter,
+            inst::arith::Add, isa::Isa, isa::evm::Evm, module::ModuleCtx,
+        };
+        use sonatina_triple::{Architecture, EvmVersion, OperatingSystem, TargetTriple, Vendor};
+
+        let evm = Evm::new(TargetTriple::new(
+            Architecture::Evm,
+            Vendor::Ethereum,
+            OperatingSystem::Evm(EvmVersion::London),
+        ));
+        let mb = ModuleBuilder::new(ModuleCtx::new(&evm));
+        let func_ref = mb
+            .declare_function(Signature::new_single(
+                "traced",
+                Linkage::Public,
+                &[],
+                Type::I32,
+            ))
+            .unwrap();
+        let mut builder = mb.func_builder::<InstInserter>(func_ref);
+        let block = builder.append_block();
+        builder.switch_to_block(block);
+        let lhs = builder.make_imm_value(1i32);
+        let rhs = builder.make_imm_value(2i32);
+        let value = builder.insert_inst(Add::new(evm.inst_set(), lhs, rhs), Type::I32);
+        let inst = builder.func.dfg.value_inst(value).unwrap();
+        builder
+            .func
+            .set_inst_frontend_origin(inst, Arc::from("not json"));
+        builder.insert_return(value);
+        builder.seal_all();
+        builder.finish();
+        let module = mb.build();
+
+        let err =
+            emit_sonatina_trace_view_facts("owner:test", &module, CompilerPhase::SonatinaPreOpt)
+                .unwrap_err();
+        assert!(err.to_string().contains("undecodable frontend origin"));
     }
 
     #[test]
@@ -3030,7 +2903,8 @@ mod tests {
         let module = mb.build();
 
         let facts =
-            emit_sonatina_trace_view_facts("owner:test", &module, CompilerPhase::SonatinaPreOpt);
+            emit_sonatina_trace_view_facts("owner:test", &module, CompilerPhase::SonatinaPreOpt)
+                .unwrap();
         TraceValidator::validate(&facts).unwrap();
 
         assert!(
