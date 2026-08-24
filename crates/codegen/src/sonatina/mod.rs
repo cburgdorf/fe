@@ -13,7 +13,8 @@ use sonatina_codegen::{
     machinst::vcode::{SectionCodeUnitId, VCodeInst},
     object::{
         OBSERVABILITY_SCHEMA_VERSION, ObjectArtifact, PcAttribution, PcMapEntry, PcMapUnit,
-        SectionArtifact, SectionObservability, SymbolId, UnmappedReason, UnmappedReasonCoverage,
+        SectionArtifact, SectionObservability, SymbolDef, SymbolId, UnmappedReason,
+        UnmappedReasonCoverage,
     },
 };
 use sonatina_ir::{
@@ -247,95 +248,260 @@ fn merged_section_observability<'db>(
     artifacts_by_name: &HashMap<&str, &ObjectArtifact>,
     section_artifact: &SectionArtifact,
     section: &mir::RuntimeSection<'db>,
-) -> Option<SectionObservability> {
-    const MAX_EMBED_DEPTH: usize = 16;
-
+    root_key: (String, mir::RuntimeSectionName),
+) -> Result<Option<SectionObservability>, LowerError> {
     fn merge_embeds<'db>(
         db: &'db dyn mir::MirDb,
         objects_by_name: &HashMap<String, mir::RuntimeObject<'db>>,
         artifacts_by_name: &HashMap<&str, &ObjectArtifact>,
         section_artifact: &SectionArtifact,
         section: &mir::RuntimeSection<'db>,
-        depth: usize,
-    ) -> Option<SectionObservability> {
-        let mut merged = section_artifact.observability.clone()?;
-        if depth >= MAX_EMBED_DEPTH {
-            return Some(merged);
+        path: &mut FxHashSet<(String, mir::RuntimeSectionName)>,
+    ) -> Result<Option<SectionObservability>, LowerError> {
+        let Some(mut merged) = section_artifact.observability.clone() else {
+            return Ok(None);
+        };
+        let mut embed_cursor = merged
+            .code_bytes
+            .checked_add(merged.data_bytes)
+            .ok_or_else(|| {
+                LowerError::Internal(format!(
+                    "observability section `{}` code/data layout overflows",
+                    merged.section.0
+                ))
+            })?;
+        let expected_section_bytes =
+            embed_cursor
+                .checked_add(merged.embed_bytes)
+                .ok_or_else(|| {
+                    LowerError::Internal(format!(
+                        "observability section `{}` embed layout overflows",
+                        merged.section.0
+                    ))
+                })?;
+        if expected_section_bytes != merged.section_bytes {
+            return Err(LowerError::Internal(format!(
+                "observability section `{}` layout describes {expected_section_bytes} bytes but reports {}",
+                merged.section.0, merged.section_bytes
+            )));
         }
 
         for embed in &section.embeds {
+            let embed_key = section_ref_key(embed.source.clone());
+            enter_observability_embed(path, embed_key.clone())?;
             let symbol_id = SymbolId::Embed(EmbedSymbol::from(embed.as_symbol.clone()));
-            let Some(symbol_def) = section_artifact.symtab.get(&symbol_id).copied() else {
-                continue;
-            };
-            let Some((embedded_section, embedded_artifact)) =
-                section_artifact_for_ref(db, objects_by_name, artifacts_by_name, &embed.source)
-            else {
-                continue;
-            };
-            let Some(embedded_observability) = merge_embeds(
+            let (embedded_section, embedded_artifact) = resolve_embedded_section_artifact(
                 db,
                 objects_by_name,
                 artifacts_by_name,
-                embedded_artifact,
-                &embedded_section,
-                depth + 1,
-            ) else {
-                continue;
+                &embed.source,
+            )?;
+            let embedded_observability = require_embedded_observability(
+                merge_embeds(
+                    db,
+                    objects_by_name,
+                    artifacts_by_name,
+                    embedded_artifact,
+                    &embedded_section,
+                    path,
+                )?,
+                &embed_key,
+            )?;
+            let expected_symbol_def = SymbolDef {
+                offset: embed_cursor,
+                size: embedded_observability.section_bytes,
             };
-
-            for mut entry in embedded_observability.pc_map {
-                if entry.pc_end > symbol_def.size {
-                    continue;
-                }
-                let Some(pc_start) = entry.pc_start.checked_add(symbol_def.offset) else {
-                    continue;
-                };
-                let Some(pc_end) = entry.pc_end.checked_add(symbol_def.offset) else {
-                    continue;
-                };
-                entry.pc_start = pc_start;
-                entry.pc_end = pc_end;
-                merged.pc_map.push(entry);
+            let symbol_def = if section_artifact.symtab.is_empty() {
+                // EvmCompile intentionally omits the optional public symtab.
+                // The linker layout is code, data, then embeds in MIR order,
+                // so reconstruct the same definition from independently
+                // checked observability sizes.
+                expected_symbol_def
+            } else {
+                required_embed_symbol(section_artifact, &symbol_id, &embed_key, &embed.as_symbol)?
+            };
+            if symbol_def != expected_symbol_def {
+                return Err(LowerError::Internal(format!(
+                    "observability embed {embed_key:?} symbol definition {symbol_def:?} disagrees with expected {expected_symbol_def:?}"
+                )));
             }
+
+            merge_embedded_pc_map(&mut merged, embedded_observability, symbol_def, &embed_key)?;
+            embed_cursor = embed_cursor.checked_add(symbol_def.size).ok_or_else(|| {
+                LowerError::Internal(format!(
+                    "observability embed {embed_key:?} advances past the section address space"
+                ))
+            })?;
+            path.remove(&embed_key);
+        }
+
+        if embed_cursor != merged.section_bytes {
+            return Err(LowerError::Internal(format!(
+                "observability section `{}` merged embeds end at {embed_cursor} but section size is {}",
+                merged.section.0, merged.section_bytes
+            )));
         }
 
         merged
             .pc_map
             .sort_by_key(|entry| (entry.pc_start, entry.pc_end));
-        Some(merged)
+        Ok(Some(merged))
     }
 
+    let mut path = FxHashSet::default();
+    path.insert(root_key);
     merge_embeds(
         db,
         objects_by_name,
         artifacts_by_name,
         section_artifact,
         section,
-        0,
+        &mut path,
     )
 }
 
-fn section_artifact_for_ref<'db, 'a>(
+fn enter_observability_embed(
+    path: &mut FxHashSet<(String, mir::RuntimeSectionName)>,
+    embed_key: (String, mir::RuntimeSectionName),
+) -> Result<(), LowerError> {
+    if !path.insert(embed_key.clone()) {
+        return Err(LowerError::Internal(format!(
+            "observability embed cycle at {embed_key:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn required_embed_symbol(
+    section_artifact: &SectionArtifact,
+    symbol_id: &SymbolId,
+    embed_key: &(String, mir::RuntimeSectionName),
+    symbol_name: &str,
+) -> Result<SymbolDef, LowerError> {
+    section_artifact
+        .symtab
+        .get(symbol_id)
+        .copied()
+        .ok_or_else(|| {
+            LowerError::Internal(format!(
+                "observability embed {embed_key:?} is missing symbol `{symbol_name}`"
+            ))
+        })
+}
+
+fn require_embedded_observability(
+    observability: Option<SectionObservability>,
+    embed_key: &(String, mir::RuntimeSectionName),
+) -> Result<SectionObservability, LowerError> {
+    observability.ok_or_else(|| {
+        LowerError::Internal(format!(
+            "observability embed {embed_key:?} has no section observability"
+        ))
+    })
+}
+
+fn merge_embedded_pc_map(
+    merged: &mut SectionObservability,
+    embedded: SectionObservability,
+    symbol_def: SymbolDef,
+    embed_key: &(String, mir::RuntimeSectionName),
+) -> Result<(), LowerError> {
+    let symbol_end = symbol_def
+        .offset
+        .checked_add(symbol_def.size)
+        .ok_or_else(|| {
+            LowerError::Internal(format!(
+                "observability embed {embed_key:?} symbol range overflows"
+            ))
+        })?;
+    if symbol_end > merged.section_bytes {
+        return Err(LowerError::Internal(format!(
+            "observability embed {embed_key:?} symbol range [{}, {symbol_end}) exceeds section size {}",
+            symbol_def.offset, merged.section_bytes
+        )));
+    }
+    if embedded.section_bytes != symbol_def.size {
+        return Err(LowerError::Internal(format!(
+            "observability embed {embed_key:?} describes {} bytes but its symbol has size {}",
+            embedded.section_bytes, symbol_def.size
+        )));
+    }
+    for mut entry in embedded.pc_map {
+        if entry.pc_end < entry.pc_start {
+            return Err(LowerError::Internal(format!(
+                "observability embed {embed_key:?} has reversed range [{}, {})",
+                entry.pc_start, entry.pc_end
+            )));
+        }
+        if entry.pc_end > symbol_def.size {
+            return Err(LowerError::Internal(format!(
+                "observability embed {embed_key:?} range [{}, {}) exceeds symbol size {}",
+                entry.pc_start, entry.pc_end, symbol_def.size
+            )));
+        }
+        entry.pc_start = entry
+            .pc_start
+            .checked_add(symbol_def.offset)
+            .ok_or_else(|| {
+                LowerError::Internal(format!(
+                    "observability embed {embed_key:?} pc start overflow"
+                ))
+            })?;
+        entry.pc_end = entry.pc_end.checked_add(symbol_def.offset).ok_or_else(|| {
+            LowerError::Internal(format!("observability embed {embed_key:?} pc end overflow"))
+        })?;
+        merged.pc_map.push(entry);
+    }
+    Ok(())
+}
+
+fn resolve_embedded_section_artifact<'db, 'a>(
     db: &'db dyn mir::MirDb,
     objects_by_name: &HashMap<String, mir::RuntimeObject<'db>>,
     artifacts_by_name: &'a HashMap<&str, &ObjectArtifact>,
     section_ref: &mir::RuntimeSectionRef,
-) -> Option<(mir::RuntimeSection<'db>, &'a SectionArtifact)> {
+) -> Result<(mir::RuntimeSection<'db>, &'a SectionArtifact), LowerError> {
     let (object, section_name) = match section_ref {
         mir::RuntimeSectionRef::Local { object, section }
         | mir::RuntimeSectionRef::External { object, section } => (object, section),
     };
-    let runtime_object = *objects_by_name.get(object.as_str())?;
+    let runtime_object = *objects_by_name.get(object.as_str()).ok_or_else(|| {
+        LowerError::Internal(format!(
+            "observability embed cannot resolve runtime object `{object}`"
+        ))
+    })?;
     let runtime_section = runtime_object
         .sections(db)
         .into_iter()
-        .find(|section| &section.name == section_name)?;
-    let artifact = artifacts_by_name.get(object.as_str()).copied()?;
-    let section_artifact = artifact
+        .find(|section| &section.name == section_name)
+        .ok_or_else(|| {
+            LowerError::Internal(format!(
+                "observability embed cannot resolve runtime section `{object}`/{section_name:?}"
+            ))
+        })?;
+    let section_artifact =
+        resolve_compiled_section_artifact(artifacts_by_name, object.as_str(), section_name)?;
+    Ok((runtime_section, section_artifact))
+}
+
+fn resolve_compiled_section_artifact<'a>(
+    artifacts_by_name: &'a HashMap<&str, &ObjectArtifact>,
+    object: &str,
+    section_name: &mir::RuntimeSectionName,
+) -> Result<&'a SectionArtifact, LowerError> {
+    let artifact = artifacts_by_name.get(object).copied().ok_or_else(|| {
+        LowerError::Internal(format!(
+            "observability embed cannot resolve compiled object `{object}`"
+        ))
+    })?;
+    artifact
         .sections
-        .get(&section_name_for_runtime(section_name))?;
-    Some((runtime_section, section_artifact))
+        .get(&section_name_for_runtime(section_name))
+        .ok_or_else(|| {
+            LowerError::Internal(format!(
+                "observability embed cannot resolve compiled section `{object}`/{section_name:?}"
+            ))
+        })
 }
 
 fn section_name_for_runtime(name: &mir::RuntimeSectionName) -> sonatina_ir::SectionName {
@@ -849,14 +1015,16 @@ fn emit_runtime_module_sonatina_bytecode_with_options(
                         &artifacts_by_name,
                         init,
                         init_section,
-                    ),
+                        (object_name.clone(), init_section.name.clone()),
+                    )?,
                     merged_section_observability(
                         db,
                         &objects_by_name,
                         &artifacts_by_name,
                         runtime,
                         runtime_section,
-                    ),
+                        (object_name.clone(), runtime_section.name.clone()),
+                    )?,
                 )
             }
             _ => {
@@ -880,7 +1048,8 @@ fn emit_runtime_module_sonatina_bytecode_with_options(
                     &artifacts_by_name,
                     runtime_section,
                     section,
-                );
+                    (object_name.clone(), section.name.clone()),
+                )?;
                 let deploy = wrap_as_init_code(&runtime);
                 let deploy_code_bytes = deploy.len().saturating_sub(runtime.len());
                 let deploy_observability = emit_observability
@@ -1168,6 +1337,170 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn test_embed_observability(section_bytes: u32, ranges: &[(u32, u32)]) -> SectionObservability {
+        SectionObservability {
+            schema_version: OBSERVABILITY_SCHEMA_VERSION,
+            section: "embedded".into(),
+            section_bytes,
+            code_bytes: 0,
+            data_bytes: 0,
+            embed_bytes: section_bytes,
+            mapped_code_bytes: 0,
+            unmapped_code_bytes: 0,
+            unmapped_reason_coverage: Default::default(),
+            pc_map: ranges
+                .iter()
+                .map(|&(pc_start, pc_end)| PcMapEntry {
+                    pc_start,
+                    pc_end,
+                    unit: PcMapUnit::Synthetic {
+                        object: "embedded".into(),
+                        section: "embedded".into(),
+                        unit: SectionCodeUnitId(0),
+                    },
+                    func_name: "embedded".to_string(),
+                    block: BlockId(0),
+                    vcode_inst: VCodeInst(0),
+                    attribution: PcAttribution::Unmapped {
+                        machine_inst: None,
+                        reason: UnmappedReason::Synthetic,
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn embedded_observability_ranges_shift_through_nested_sections() {
+        let leaf_key = ("leaf".to_string(), mir::RuntimeSectionName::Runtime);
+        let mut middle = test_embed_observability(4, &[]);
+        merge_embedded_pc_map(
+            &mut middle,
+            test_embed_observability(2, &[(0, 1)]),
+            SymbolDef { offset: 2, size: 2 },
+            &leaf_key,
+        )
+        .expect("leaf observability should merge into its parent");
+        assert_eq!(
+            middle
+                .pc_map
+                .iter()
+                .map(|entry| (entry.pc_start, entry.pc_end))
+                .collect::<Vec<_>>(),
+            vec![(2, 3)]
+        );
+
+        let middle_key = ("middle".to_string(), mir::RuntimeSectionName::Runtime);
+        let mut root = test_embed_observability(12, &[]);
+        merge_embedded_pc_map(
+            &mut root,
+            middle,
+            SymbolDef { offset: 4, size: 4 },
+            &middle_key,
+        )
+        .expect("nested observability should merge into the root");
+        assert_eq!(
+            root.pc_map
+                .iter()
+                .map(|entry| (entry.pc_start, entry.pc_end))
+                .collect::<Vec<_>>(),
+            vec![(6, 7)]
+        );
+    }
+
+    #[test]
+    fn embedded_observability_rejects_corrupt_ranges_and_overflow() {
+        let embed_key = ("embedded".to_string(), mir::RuntimeSectionName::Runtime);
+
+        let mut root = test_embed_observability(8, &[]);
+        let err = merge_embedded_pc_map(
+            &mut root,
+            test_embed_observability(4, &[(0, 5)]),
+            SymbolDef { offset: 4, size: 4 },
+            &embed_key,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("exceeds symbol size"));
+
+        let mut root = test_embed_observability(8, &[]);
+        let err = merge_embedded_pc_map(
+            &mut root,
+            test_embed_observability(4, &[(3, 2)]),
+            SymbolDef { offset: 4, size: 4 },
+            &embed_key,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("reversed range"));
+
+        let mut root = test_embed_observability(u32::MAX, &[]);
+        let err = merge_embedded_pc_map(
+            &mut root,
+            test_embed_observability(2, &[]),
+            SymbolDef {
+                offset: u32::MAX,
+                size: 2,
+            },
+            &embed_key,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("symbol range overflows"));
+
+        let mut root = test_embed_observability(8, &[]);
+        let err = merge_embedded_pc_map(
+            &mut root,
+            test_embed_observability(3, &[]),
+            SymbolDef { offset: 4, size: 4 },
+            &embed_key,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("describes 3 bytes"));
+    }
+
+    #[test]
+    fn embedded_observability_rejects_missing_inputs_and_cycles() {
+        use sonatina_ir::object::ObjectName;
+
+        let embed_key = ("embedded".to_string(), mir::RuntimeSectionName::Runtime);
+        let section_artifact = SectionArtifact {
+            bytes: Vec::new(),
+            symtab: Default::default(),
+            observability: Some(test_embed_observability(0, &[])),
+        };
+        let symbol_id = SymbolId::Embed(EmbedSymbol::from("embedded".to_string()));
+        let err = required_embed_symbol(&section_artifact, &symbol_id, &embed_key, "embedded")
+            .unwrap_err();
+        assert!(err.to_string().contains("missing symbol"));
+
+        let err = require_embedded_observability(None, &embed_key).unwrap_err();
+        assert!(err.to_string().contains("no section observability"));
+
+        let missing_objects = HashMap::new();
+        let err = resolve_compiled_section_artifact(
+            &missing_objects,
+            "embedded",
+            &mir::RuntimeSectionName::Runtime,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("compiled object"));
+
+        let artifact = ObjectArtifact {
+            object: ObjectName("embedded".into()),
+            sections: Default::default(),
+        };
+        let artifacts = HashMap::from([("embedded", &artifact)]);
+        let err = resolve_compiled_section_artifact(
+            &artifacts,
+            "embedded",
+            &mir::RuntimeSectionName::Runtime,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("compiled section"));
+
+        let mut path = FxHashSet::from_iter([embed_key.clone()]);
+        let err = enter_observability_embed(&mut path, embed_key).unwrap_err();
+        assert!(err.to_string().contains("embed cycle"));
     }
 
     #[test]
