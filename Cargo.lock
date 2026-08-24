@@ -2217,6 +2217,7 @@ dependencies = [
  "fe-trace-facts",
  "serde",
  "serde_json",
+ "url",
 ]
 
 [[package]]

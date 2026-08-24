@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use common::origin::OriginExportKey;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
+use url::Url;
 
 use crate::model::{
     AttributionConfidence, DebugBundle, DebugCodeObject, DebugInstruction, DebugSourceFile,
@@ -326,11 +327,7 @@ pub fn emit_ethdebug_artifact(bundle: &DebugBundle) -> Result<EthdebugArtifact, 
             .into_iter()
             .map(|source| EthdebugSourceMaterial {
                 id: *source_ids.get(&source.file_key).unwrap_or(&0),
-                path: source
-                    .uri
-                    .strip_prefix("file://")
-                    .unwrap_or(&source.display_name)
-                    .to_string(),
+                path: source_filesystem_path(source),
                 uri: source.uri.clone(),
                 language: "Fe".to_string(),
                 content_hash: source.content_hash.clone(),
@@ -640,6 +637,15 @@ fn is_blake3_hash_label(value: &str) -> bool {
     })
 }
 
+fn source_filesystem_path(source: &DebugSourceFile) -> String {
+    Url::parse(&source.uri)
+        .ok()
+        .filter(|url| url.scheme() == "file")
+        .and_then(|url| url.to_file_path().ok())
+        .and_then(|path| path.to_str().map(str::to_owned))
+        .unwrap_or_else(|| source.display_name.clone())
+}
+
 /// Canonical source registry: one row per distinct file, with every
 /// `source.file` key aliased onto its row's id. Two keys minted for the same
 /// underlying file (same content hash and same filesystem path, whether the
@@ -649,12 +655,8 @@ fn is_blake3_hash_label(value: &str) -> bool {
 fn source_registry(
     bundle: &DebugBundle,
 ) -> (Vec<&DebugSourceFile>, BTreeMap<OriginExportKey, u32>) {
-    fn uri_path(uri: &str) -> &str {
-        uri.strip_prefix("file://").unwrap_or(uri)
-    }
-
     let mut rows: Vec<&DebugSourceFile> = Vec::new();
-    let mut row_by_identity: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    let mut row_by_identity: BTreeMap<(String, &str), usize> = BTreeMap::new();
     let mut row_by_key: BTreeMap<&OriginExportKey, usize> = BTreeMap::new();
     for source in &bundle.sources {
         if row_by_key.contains_key(&source.file_key) {
@@ -665,7 +667,7 @@ fn source_registry(
             rows.len() - 1
         } else {
             *row_by_identity
-                .entry((uri_path(&source.uri), source.content_hash.as_str()))
+                .entry((source_filesystem_path(source), source.content_hash.as_str()))
                 .or_insert_with(|| {
                     rows.push(source);
                     rows.len() - 1
@@ -812,7 +814,7 @@ mod tests {
         ETHDEBUG_FALLBACK_PROGRAM_ID, ETHDEBUG_SCHEMA_VERSION, EVM_BYTECODE_INSTRUCTION_KIND,
         EthdebugArtifact, EthdebugEnvironment, emit_ethdebug_artifact,
         ethdebug_origin_attribution_hash, ethdebug_origin_attribution_index,
-        pinned_ethdebug_schema, validate_ethdebug_artifact,
+        pinned_ethdebug_schema, source_filesystem_path, validate_ethdebug_artifact,
     };
 
     fn key(kind: &str, owner: &str, local: &str) -> OriginExportKey {
@@ -965,6 +967,40 @@ mod tests {
         assert_eq!(code.source.id, 7);
         assert_eq!(code.range.offset, 10);
         assert_eq!(code.range.length, 4);
+    }
+
+    #[test]
+    fn source_paths_decode_file_urls_and_fall_back_for_other_uris() {
+        let mut source = bundle().sources.remove(0);
+
+        source.uri = "file:///src/My%20Contract.fe".to_string();
+        assert_eq!(source_filesystem_path(&source), "/src/My Contract.fe");
+
+        source.uri = "file:///src/Gr%C3%BC%C3%9Fe.fe".to_string();
+        assert_eq!(source_filesystem_path(&source), "/src/Grüße.fe");
+
+        source.uri = "file:///src/main.fe".to_string();
+        assert_eq!(source_filesystem_path(&source), "/src/main.fe");
+
+        source.uri = "untitled:buffer".to_string();
+        source.display_name = "buffer.fe".to_string();
+        assert_eq!(source_filesystem_path(&source), "buffer.fe");
+    }
+
+    #[test]
+    fn source_registry_dedupes_encoded_and_decoded_filesystem_paths() {
+        let mut bundle = bundle();
+        bundle.sources[0].uri = "file:///src/My%20Contract.fe".to_string();
+        bundle.sources[0].display_name = "/src/My Contract.fe".to_string();
+        let mut duplicate = bundle.sources[0].clone();
+        duplicate.file_key = key("source.file", "demo", "src/My Contract.fe");
+        duplicate.uri = "/src/My Contract.fe".to_string();
+        bundle.sources.push(duplicate);
+
+        let artifact = emit_ethdebug_artifact(&bundle).unwrap();
+
+        assert_eq!(artifact.compilation.sources.len(), 1);
+        assert_eq!(artifact.compilation.sources[0].path, "/src/My Contract.fe");
     }
 
     #[test]
