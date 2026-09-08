@@ -180,6 +180,7 @@ fn to_sonatina_opt_level(opt_level: OptLevel) -> SonatinaOptLevel {
 fn evm_compile(module: Module, opt_level: OptLevel, emit_observability: bool) -> EvmCompile {
     EvmCompile::new(module)
         .with_opt_level(to_sonatina_opt_level(opt_level))
+        .with_symbol_table(emit_observability)
         .with_observability(emit_observability)
 }
 
@@ -311,20 +312,13 @@ fn merged_section_observability<'db>(
                 offset: embed_cursor,
                 size: embedded_observability.section_bytes,
             };
-            let symbol_def = if section_artifact.symtab.is_empty() {
-                // EvmCompile intentionally omits the optional public symtab.
-                // The linker layout is code, data, then embeds in MIR order,
-                // so reconstruct the same definition from independently
-                // checked observability sizes.
-                expected_symbol_def
-            } else {
-                required_embed_symbol(section_artifact, &symbol_id, &embed_key, &embed.as_symbol)?
-            };
-            if symbol_def != expected_symbol_def {
-                return Err(LowerError::Internal(format!(
-                    "observability embed {embed_key:?} symbol definition {symbol_def:?} disagrees with expected {expected_symbol_def:?}"
-                )));
-            }
+            let symbol_def = required_embed_symbol_at(
+                section_artifact,
+                &symbol_id,
+                &embed_key,
+                &embed.as_symbol,
+                expected_symbol_def,
+            )?;
 
             merge_embedded_pc_map(&mut merged, embedded_observability, symbol_def, &embed_key)?;
             embed_cursor = embed_cursor.checked_add(symbol_def.size).ok_or_else(|| {
@@ -387,6 +381,22 @@ fn required_embed_symbol(
                 "observability embed {embed_key:?} is missing symbol `{symbol_name}`"
             ))
         })
+}
+
+fn required_embed_symbol_at(
+    section_artifact: &SectionArtifact,
+    symbol_id: &SymbolId,
+    embed_key: &(String, mir::RuntimeSectionName),
+    symbol_name: &str,
+    expected: SymbolDef,
+) -> Result<SymbolDef, LowerError> {
+    let symbol_def = required_embed_symbol(section_artifact, symbol_id, embed_key, symbol_name)?;
+    if symbol_def != expected {
+        return Err(LowerError::Internal(format!(
+            "observability embed {embed_key:?} symbol definition {symbol_def:?} disagrees with expected {expected:?}"
+        )));
+    }
+    Ok(symbol_def)
 }
 
 fn require_embedded_observability(
@@ -1501,6 +1511,28 @@ mod tests {
         let mut path = FxHashSet::from_iter([embed_key.clone()]);
         let err = enter_observability_embed(&mut path, embed_key).unwrap_err();
         assert!(err.to_string().contains("embed cycle"));
+    }
+
+    #[test]
+    fn embedded_observability_rejects_equal_size_reordered_symbol() {
+        let embed_key = ("embedded".to_string(), mir::RuntimeSectionName::Runtime);
+        let symbol_id = SymbolId::Embed(EmbedSymbol::from("embedded".to_string()));
+        let mut symtab = rustc_hash::FxHashMap::default();
+        symtab.insert(symbol_id.clone(), SymbolDef { offset: 8, size: 4 });
+        let artifact = SectionArtifact {
+            bytes: vec![0; 12],
+            symtab,
+            observability: Some(test_embed_observability(4, &[])),
+        };
+        let err = required_embed_symbol_at(
+            &artifact,
+            &symbol_id,
+            &embed_key,
+            "embedded",
+            SymbolDef { offset: 4, size: 4 },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("disagrees with expected"));
     }
 
     #[test]
