@@ -276,7 +276,10 @@ fn field_flag_attr(attrs: &[Attribute], attr_name: &str) -> syn::Result<Option<F
         return Ok(None);
     };
     let mut result = FieldFlagAttr {
-        span: attr.span(),
+        // Anchor field-level diagnostics to the attribute marker itself. Using
+        // Attribute::span() includes the whole `#[...]` token tree on newer
+        // rustc versions, which makes compile-fail snapshots toolchain-sensitive.
+        span: attr.pound_token.span(),
         name: None,
     };
     if matches!(attr.meta, syn::Meta::Path(_)) {
@@ -388,19 +391,19 @@ fn has_attr(attrs: &[Attribute], name: &str) -> bool {
 fn reject_skip_conflicts(attrs: &[Attribute]) -> syn::Result<()> {
     if let Some(attr) = attrs.iter().find(|attr| attr.path().is_ident("trace_key")) {
         return Err(syn::Error::new(
-            attr.span(),
+            attr.pound_token.span(),
             "trace_skip cannot be combined with trace_key",
         ));
     }
     if let Some(attr) = attrs.iter().find(|attr| attr.path().is_ident("trace_ref")) {
         return Err(syn::Error::new(
-            attr.span(),
+            attr.pound_token.span(),
             "trace_skip cannot be combined with trace_ref",
         ));
     }
     if let Some(attr) = attrs.iter().find(|attr| attr.path().is_ident("trace_col")) {
         return Err(syn::Error::new(
-            attr.span(),
+            attr.pound_token.span(),
             "trace_skip cannot be combined with trace_col",
         ));
     }
