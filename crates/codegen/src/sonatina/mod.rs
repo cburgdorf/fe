@@ -1551,8 +1551,8 @@ mod tests {
 
     #[test]
     fn observable_bytecode_rejects_standalone_main_sections_only() {
-        let err = ensure_observable_contract_section(&mir::RuntimeSectionName::Main, true)
-            .unwrap_err();
+        let err =
+            ensure_observable_contract_section(&mir::RuntimeSectionName::Main, true).unwrap_err();
         assert!(err.to_string().contains("standalone main sections"));
 
         ensure_observable_contract_section(&mir::RuntimeSectionName::Main, false)
