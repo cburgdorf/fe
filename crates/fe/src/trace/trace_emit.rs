@@ -666,6 +666,20 @@ pub contract Beta {
         );
     }
 
+    #[test]
+    fn emission_refuses_standalone_main_for_contract_trace() {
+        let path = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/trace/standalone_main.fe");
+
+        let err = emit_real_trace_bundle(&path, true, "dev", codegen::OptLevel::O0)
+            .expect_err("standalone main must not be presented as contract trace");
+
+        assert!(
+            err.contains("standalone main sections"),
+            "error should identify the unsupported standalone section, got {err:?}"
+        );
+    }
+
     /// `fe check` includes dependency diagnostics, so compiler-emitted trace
     /// provenance must reject an otherwise valid target with a broken
     /// dependency as well.
@@ -932,6 +946,69 @@ pub contract App {
                 );
             }
         }
+    }
+
+    #[test]
+    fn real_trace_maps_unique_literal_to_its_emitted_push() {
+        let fixture = "source_marker.fe";
+        let marker = "0x123456789abcde";
+        let path = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/trace")
+            .join(fixture);
+        let source = std::fs::read_to_string(&path).unwrap();
+        let marker_start = source
+            .find(marker)
+            .expect("source marker should be present") as u32;
+        let marker_end = marker_start + marker.len() as u32;
+        let bundle = emit_real_trace_bundle(&path, false, "dev", codegen::OptLevel::O2)
+            .expect("source marker fixture should compile");
+        let snapshot = TraceSnapshot::new(bundle).unwrap();
+        let debug = debug_export::DebugBundle::from_snapshot(&snapshot);
+        let authored_files = debug
+            .sources
+            .iter()
+            .filter(|source| source.uri.ends_with(fixture))
+            .map(|source| source.file_key.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            authored_files.len(),
+            1,
+            "fixture must have one authored source file"
+        );
+        let spans = debug
+            .source_spans
+            .iter()
+            .map(|span| (span.origin.clone(), span))
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        let matches = debug.instructions.iter().filter(|instruction| {
+            instruction.opcode_or_mnemonic == "PUSH7"
+                && instruction.pc_range.end > instruction.pc_range.start
+                && instruction.classification
+                    == debug_export::InstructionClassification::SourceMapped
+                && instruction.confidence == debug_export::AttributionConfidence::High
+                && instruction.primary_source.as_ref().is_some_and(|origin| {
+                    spans.get(origin).is_some_and(|span| {
+                        authored_files.contains(&span.file)
+                            && (span.start_byte != 0 || span.end_byte != source.len() as u32)
+                            && span.start_byte <= marker_start
+                            && marker_end <= span.end_byte
+                    })
+                })
+                && snapshot.facts().iter().any(|fact| {
+                    matches!(
+                        fact,
+                        trace_facts::TraceFact::Opcode(opcode)
+                            if opcode.pc == instruction.key
+                                && opcode.opcode == "PUSH7"
+                                && opcode.immediate.as_deref() == Some(marker)
+                    )
+                })
+        });
+        assert!(
+            matches.count() >= 1,
+            "the unique literal must own a nonzero high-confidence PUSH7 range"
+        );
     }
 
     fn is_content_digest(value: &str) -> bool {

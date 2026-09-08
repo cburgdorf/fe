@@ -533,7 +533,8 @@ pub enum DevTraceCommand {
 
 #[derive(Debug, Clone, Args)]
 pub struct DevTraceEmitArgs {
-    /// Path to an ingot/workspace directory, a workspace member name, or a .fe file.
+    /// Path to a contract ingot/workspace directory, member name, or .fe file.
+    /// Standalone main sections are not supported by the observable contract trace.
     #[arg(default_value_t = default_project_path())]
     pub path: Utf8PathBuf,
     /// Output trace JSONL bundle path.

@@ -523,6 +523,19 @@ fn section_name_for_runtime(name: &mir::RuntimeSectionName) -> sonatina_ir::Sect
     }
 }
 
+fn ensure_observable_contract_section(
+    section_name: &mir::RuntimeSectionName,
+    emit_observability: bool,
+) -> Result<(), LowerError> {
+    if emit_observability && matches!(section_name, mir::RuntimeSectionName::Main) {
+        return Err(LowerError::Unsupported(
+            "observable contract trace supports init/runtime sections only; standalone main sections are not Ethdebug contract inputs"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn wrap_as_init_code(runtime: &[u8]) -> Vec<u8> {
     fn push_u256(mut value: usize) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -1042,6 +1055,7 @@ fn emit_runtime_module_sonatina_bytecode_with_options(
                 let section = sections.first().ok_or_else(|| {
                     LowerError::Internal(format!("root object `{object_name}` has no sections"))
                 })?;
+                ensure_observable_contract_section(&section.name, emit_observability)?;
                 let runtime_section = artifact
                     .sections
                     .get(&section_name_for_runtime(&section.name))
@@ -1533,6 +1547,18 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("disagrees with expected"));
+    }
+
+    #[test]
+    fn observable_bytecode_rejects_standalone_main_sections_only() {
+        let err = ensure_observable_contract_section(&mir::RuntimeSectionName::Main, true)
+            .unwrap_err();
+        assert!(err.to_string().contains("standalone main sections"));
+
+        ensure_observable_contract_section(&mir::RuntimeSectionName::Main, false)
+            .expect("ordinary standalone compilation remains supported");
+        ensure_observable_contract_section(&mir::RuntimeSectionName::Runtime, true)
+            .expect("contract runtime observability remains supported");
     }
 
     #[test]
