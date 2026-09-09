@@ -25,6 +25,35 @@ fe dev debug emit --format ethdebug --from target/fib.trace.jsonl --out target/f
 fe dev debug validate --format ethdebug --input target/fib.ethdebug.json --sidecar target/fib.sidecar.json
 ```
 
+#### Attribution and capability contract
+
+The observable compiler path supports contract creation/runtime sections, not
+standalone `main` sections. It provides partial instruction attribution, not
+complete source coverage or exhaustive transformation history. An exact path
+in the recorded graph is not proof that every contributing source origin was
+recorded. Shared generated paths must not select one requesting statement as
+their unique source; per-site mappings remain useful where justified.
+
+The fact schema and relational projections already represent types, lexical
+scopes, variables, and location ranges. This does not mean the compiler
+populates all of them: the current source-local producer emits unknown types
+and absent scopes, and the EVM trace path does not provide physical variable
+location ranges. Backend unmapped reasons are validated in aggregate but are
+not yet preserved as explanations for each emitted instruction. Consumers
+must not interpret these missing capabilities as complete negative evidence.
+
+Source identities belong to HIR/MIR, transformation relationships to the
+transform that knows them, and emitted layout to the backend/linker. Exporters
+project those facts; they must not invent missing attribution. The shared
+panic regression exercises generated-block reuse at O0, not general optimizer
+fusion or multi-parent transformation history.
+
+The debug artifact uses a Fe-specific versioned schema; compatibility with a
+stock ethdebug consumer has not been established. Trace emission compiles
+separately from ordinary build/test execution, so it is not yet a bundle bound
+to the exact artifact executed by a failing test. These developer interfaces
+are not a stable, target-neutral instrumentation format.
+
 ### Output streams
 
 - **Stdout**: “normal” command output (e.g. artifact paths, formatted file paths, dependency trees).

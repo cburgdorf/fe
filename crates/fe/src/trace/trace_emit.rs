@@ -618,7 +618,14 @@ pub contract Beta {
         let bundle = emit_real_trace_bundle(&path, false, "dev", codegen::OptLevel::O0).unwrap();
         let snapshot = TraceSnapshot::new(bundle).unwrap();
         let debug = debug_export::DebugBundle::from_snapshot(&snapshot);
+        attributed_lines_from_debug(&debug, fixture, mnemonic)
+    }
 
+    fn attributed_lines_from_debug(
+        debug: &debug_export::DebugBundle,
+        fixture: &str,
+        mnemonic: &str,
+    ) -> std::collections::BTreeSet<u32> {
         let fixture_files = debug
             .sources
             .iter()
@@ -638,6 +645,8 @@ pub contract Beta {
         debug
             .instructions
             .iter()
+            .filter(|instruction| instruction.key.kind() == "bytecode.pc")
+            .filter(|instruction| instruction.pc_range.is_valid())
             .filter(|instruction| instruction.opcode_or_mnemonic == mnemonic)
             .filter_map(|instruction| {
                 let origin = instruction.primary_source.as_ref()?;
@@ -793,20 +802,138 @@ pub contract App {
     /// source line for every later overflow, over an exact attribution chain.
     #[test]
     fn shared_panic_blocks_are_not_attributed_to_one_statement() {
-        // The fixture contains no explicit revert, so every REVERT is
-        // compiler-generated and shared by three additions.
-        let revert_lines = attributed_lines("shared_panic.fe", "REVERT");
-        assert!(
-            revert_lines.is_empty(),
-            "a panic block shared by several statements must not claim one of them, got {revert_lines:?}"
+        // Locate the shared overflow path through the actual branch targets
+        // of the three authored checks. Other REVERTs belong to ABI helpers
+        // and may legitimately retain their own source attribution.
+        let path = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/trace/shared_panic.fe");
+        let bundle = emit_real_trace_bundle(&path, false, "dev", codegen::OptLevel::O0)
+            .expect("shared panic fixture should compile");
+        let snapshot = TraceSnapshot::new(bundle).unwrap();
+        let debug = debug_export::DebugBundle::from_snapshot(&snapshot);
+        let bytecode = debug
+            .instructions
+            .iter()
+            .filter(|instruction| instruction.key.kind() == "bytecode.pc")
+            .filter(|instruction| instruction.pc_range.is_valid())
+            .collect::<Vec<_>>();
+        let fixture_file = &debug
+            .sources
+            .iter()
+            .find(|source| source.uri.ends_with("shared_panic.fe"))
+            .expect("fixture source must be recorded")
+            .file_key;
+        let opcodes = snapshot
+            .facts()
+            .iter()
+            .filter_map(|fact| {
+                if let trace_facts::TraceFact::Opcode(opcode) = fact {
+                    Some((&opcode.pc, opcode))
+                } else {
+                    None
+                }
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let addition_lines = ["a + b", "b + c", "a + c"]
+            .into_iter()
+            .map(|needle| fixture_line("shared_panic.fe", needle))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            addition_lines.len(),
+            3,
+            "fixture needs distinct authored sites"
         );
-
-        // The per-site overflow checks stay attributed, and to more than one
-        // line: the rule must not blanket-drop attribution.
-        let checked_lines = attributed_lines("shared_panic.fe", "JUMPI");
+        let mut targets = std::collections::BTreeSet::new();
+        for line in addition_lines {
+            let checks = bytecode
+                .iter()
+                .filter(|instruction| {
+                    instruction.opcode_or_mnemonic == "JUMPI"
+                        && instruction.classification
+                            == debug_export::InstructionClassification::SourceMapped
+                        && instruction.primary_source.as_ref().is_some_and(|origin| {
+                            debug.source_spans.iter().any(|span| {
+                                &span.origin == origin
+                                    && &span.file == fixture_file
+                                    && span.start_line == line
+                            })
+                        })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                checks.len(),
+                1,
+                "addition on line {line} must own one emitted overflow check"
+            );
+            let check = checks[0];
+            let push = bytecode
+                .iter()
+                .find(|candidate| {
+                    candidate.code_object == check.code_object
+                        && candidate.pc_range.end == check.pc_range.start
+                })
+                .expect("O0 overflow check must have an adjacent target push");
+            let opcode = opcodes
+                .get(&push.key)
+                .expect("target push needs opcode evidence");
+            assert!(opcode.opcode.starts_with("PUSH"));
+            let target = u32::from_str_radix(
+                opcode
+                    .immediate
+                    .as_deref()
+                    .expect("target push needs an immediate")
+                    .strip_prefix("0x")
+                    .expect("hex target immediate"),
+                16,
+            )
+            .expect("target PC must fit u32");
+            targets.insert((
+                check.code_object.clone().expect("check needs code object"),
+                target,
+            ));
+        }
+        assert_eq!(
+            targets.len(),
+            1,
+            "all three checks must share one actual branch destination"
+        );
+        let (code_object, target) = targets.into_iter().next().unwrap();
+        let mut tail = bytecode
+            .iter()
+            .copied()
+            .filter(|instruction| {
+                instruction.code_object.as_ref() == Some(&code_object)
+                    && instruction.pc_range.start >= target
+            })
+            .collect::<Vec<_>>();
+        tail.sort_by_key(|instruction| instruction.pc_range.start);
+        assert_eq!(tail[0].pc_range.start, target);
+        assert_eq!(tail[0].opcode_or_mnemonic, "JUMPDEST");
+        let revert_index = tail
+            .iter()
+            .position(|instruction| instruction.opcode_or_mnemonic == "REVERT")
+            .expect("shared destination must end in an emitted REVERT");
+        let payload = &tail[1..revert_index];
         assert!(
-            checked_lines.len() >= 3,
-            "each checked addition should keep its own source line, got {checked_lines:?}"
+            !payload.iter().any(|instruction| matches!(
+                instruction.opcode_or_mnemonic.as_str(),
+                "JUMPDEST" | "JUMP" | "JUMPI" | "STOP" | "RETURN" | "INVALID"
+            )),
+            "overflow payload must be straight-line code"
+        );
+        for immediate in ["0x4e487b71", "0x11"] {
+            assert!(
+                payload.iter().any(|instruction| opcodes
+                    .get(&instruction.key)
+                    .is_some_and(|opcode| opcode.immediate.as_deref() == Some(immediate))),
+                "shared payload must encode Panic(0x11), missing {immediate}"
+            );
+        }
+        let revert = tail[revert_index];
+        assert!(
+            revert.classification != debug_export::InstructionClassification::SourceMapped
+                && revert.primary_source.is_none(),
+            "shared overflow REVERT must not select one authored owner: {revert:?}"
         );
     }
 
