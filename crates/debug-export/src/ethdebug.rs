@@ -1052,14 +1052,23 @@ mod tests {
     fn source_paths_decode_file_urls_and_fall_back_for_other_uris() {
         let mut source = bundle().sources.remove(0);
 
-        source.uri = "file:///src/My%20Contract.fe".to_string();
-        assert_eq!(source_filesystem_path(&source), "/src/My Contract.fe");
-
-        source.uri = "file:///src/Gr%C3%BC%C3%9Fe.fe".to_string();
-        assert_eq!(source_filesystem_path(&source), "/src/Grüße.fe");
-
-        source.uri = "file:///src/main.fe".to_string();
-        assert_eq!(source_filesystem_path(&source), "/src/main.fe");
+        // File URL conversion follows the host's filesystem rules.
+        let (uri_root, path_root) = if cfg!(windows) {
+            ("file:///C:/src/", "C:\\src\\")
+        } else {
+            ("file:///src/", "/src/")
+        };
+        for (encoded, decoded) in [
+            ("My%20Contract.fe", "My Contract.fe"),
+            ("Gr%C3%BC%C3%9Fe.fe", "Grüße.fe"),
+            ("main.fe", "main.fe"),
+        ] {
+            source.uri = format!("{uri_root}{encoded}");
+            assert_eq!(
+                source_filesystem_path(&source),
+                format!("{path_root}{decoded}")
+            );
+        }
 
         source.uri = "untitled:buffer".to_string();
         source.display_name = "buffer.fe".to_string();
@@ -1069,17 +1078,24 @@ mod tests {
     #[test]
     fn source_registry_dedupes_encoded_and_decoded_filesystem_paths() {
         let mut bundle = bundle();
-        bundle.sources[0].uri = "file:///src/My%20Contract.fe".to_string();
-        bundle.sources[0].display_name = "/src/My Contract.fe".to_string();
+        let (uri, path) = if cfg!(windows) {
+            ("file:///C:/src/My%20Contract.fe", "C:\\src\\My Contract.fe")
+        } else {
+            ("file:///src/My%20Contract.fe", "/src/My Contract.fe")
+        };
+        bundle.sources[0].uri = uri.to_string();
+        // Keep the fallback distinct so failed decoding cannot pass this test.
+        bundle.sources[0].display_name = "fallback.fe".to_string();
         let mut duplicate = bundle.sources[0].clone();
         duplicate.file_key = key("source.file", "demo", "src/My Contract.fe");
-        duplicate.uri = "/src/My Contract.fe".to_string();
+        duplicate.uri = path.to_string();
+        duplicate.display_name = path.to_string();
         bundle.sources.push(duplicate);
 
         let artifact = emit_ethdebug_artifact(&bundle).unwrap();
 
         assert_eq!(artifact.compilation.sources.len(), 1);
-        assert_eq!(artifact.compilation.sources[0].path, "/src/My Contract.fe");
+        assert_eq!(artifact.compilation.sources[0].path, path);
     }
 
     #[test]
