@@ -342,6 +342,8 @@ fn runtime_stmt_display(stmt: &RStmt<'_>) -> String {
     }
 }
 
+// Keep these projections exhaustive: a compiler IR change must force an
+// explicit instrumentation update instead of silently dropping a new case.
 fn runtime_expr_display(expr: &RExpr<'_>) -> String {
     match expr {
         RExpr::Use(value) => format!("{value:?}"),
@@ -355,18 +357,15 @@ fn runtime_expr_display(expr: &RExpr<'_>) -> String {
         RExpr::AllocObject { layout } => format!("alloc_object {layout:?}"),
         RExpr::MaterializeToObject { src } => format!("materialize {src:?}"),
         RExpr::MaterializePlaceToObject { place } => format!("materialize_place {place:?}"),
-        RExpr::ProviderFromRaw {
+        RExpr::ProviderRefFromRaw {
             raw,
             provider_ty,
             space,
-            target,
-        } => format!("provider_from_raw {raw:?}, {provider_ty:?}, {space:?}, {target:?}"),
-        RExpr::WordToRawAddr {
-            value,
-            space,
-            target,
-        } => format!("word_to_raw_addr {value:?}, {space:?}, {target:?}"),
-        RExpr::ProviderToRaw { value } => format!("provider_to_raw {value:?}"),
+        } => format!("provider_ref_from_raw {raw:?}, {provider_ty:?}, {space:?}"),
+        RExpr::WordToRawAddr { value, space } => {
+            format!("word_to_raw_addr {value:?}, {space:?}")
+        }
+        RExpr::ProviderRefToRaw { value } => format!("provider_ref_to_raw {value:?}"),
         RExpr::RetagRef { value } => format!("retag_ref {value:?}"),
         RExpr::AddrOf { place } => format!("addr_of {place:?}"),
         RExpr::Load { place } => format!("load {place:?}"),
@@ -442,6 +441,7 @@ fn runtime_terminator_display(terminator: &RTerminator<'_>) -> String {
         RTerminator::TerminalCall { callee, args } => format!("tail_call {callee:?}({args:?})"),
         RTerminator::ReturnData { offset, len } => format!("return_data {offset:?}, {len:?}"),
         RTerminator::Revert { offset, len } => format!("revert {offset:?}, {len:?}"),
+        RTerminator::RevertEmpty => "revert_empty".to_string(),
         RTerminator::SelfDestruct { beneficiary } => format!("selfdestruct {beneficiary:?}"),
         RTerminator::Trap => "trap".to_string(),
         RTerminator::Return(value) => format!("return {value:?}"),
@@ -564,10 +564,42 @@ fn terminator_edges(from: RBlockId, terminator: &RTerminator<'_>) -> Vec<Runtime
         RTerminator::TerminalCall { .. }
         | RTerminator::ReturnData { .. }
         | RTerminator::Revert { .. }
+        | RTerminator::RevertEmpty
         | RTerminator::SelfDestruct { .. }
         | RTerminator::Trap
         | RTerminator::Return(_)
         | RTerminator::Stop => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::{AddressSpaceKind, RValueId};
+
+    #[test]
+    fn raw_pointer_operations_have_explicit_trace_displays() {
+        let value = RValueId::new(0);
+        assert_eq!(
+            runtime_expr_display(&RExpr::ProviderRefToRaw { value }),
+            format!("provider_ref_to_raw {value:?}")
+        );
+        assert_eq!(
+            runtime_expr_display(&RExpr::WordToRawAddr {
+                value,
+                space: AddressSpaceKind::Memory,
+            }),
+            format!("word_to_raw_addr {value:?}, Memory")
+        );
+    }
+
+    #[test]
+    fn empty_revert_is_visible_and_has_no_cfg_successor() {
+        assert_eq!(
+            runtime_terminator_display(&RTerminator::RevertEmpty),
+            "revert_empty"
+        );
+        assert!(terminator_edges(RBlockId::new(0), &RTerminator::RevertEmpty).is_empty());
     }
 }
 
