@@ -380,6 +380,12 @@ impl<'db> TyChecker<'db> {
             Expr::Bin(lhs, rhs, op) => self.check_binary(expr, *lhs, *rhs, *op),
             Expr::Call(..) => self.check_call(expr, expr_data),
             Expr::Assert(args) => self.check_assert(expr, args),
+            Expr::UnsupportedMacroCall => {
+                self.push_diag(BodyDiag::UnsupportedMacroCall(
+                    expr.span(self.body()).into(),
+                ));
+                ExprProp::invalid(self.db)
+            }
             Expr::MethodCall(..) => self.check_method_call(expr, expr_data),
             Expr::Path(..) => self.check_path(expr, expr_data),
             Expr::RecordInit(..) => self.check_record_init(expr, expr_data, expected),

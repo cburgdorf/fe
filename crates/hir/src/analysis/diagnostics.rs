@@ -3504,6 +3504,17 @@ impl DiagnosticVoucher for BodyDiag<'_> {
                     error_code,
                 }
             }
+            Self::UnsupportedMacroCall(primary) => CompleteDiagnostic {
+                severity: Severity::Error,
+                message: "unsupported macro call".to_string(),
+                sub_diagnostics: vec![SubDiagnostic {
+                    style: LabelStyle::Primary,
+                    message: "only `assert!(...)` is supported".to_string(),
+                    span: primary.resolve(db),
+                }],
+                notes: vec![],
+                error_code,
+            },
             Self::UnsupportedUnaryPlus(primary) => CompleteDiagnostic {
                 severity: Severity::Error,
                 message: "unary `+` is not supported".to_string(),

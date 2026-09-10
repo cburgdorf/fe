@@ -628,6 +628,9 @@ impl<'a, 'db> SmirLowerCtxt<'a, 'db> {
             }
             Expr::Call(_, args) => self.lower_call(expr, None, args),
             Expr::Assert(args) => self.lower_assert(expr, args),
+            Expr::UnsupportedMacroCall => {
+                unreachable!("unsupported macro calls must be rejected before semantic lowering")
+            }
             Expr::MethodCall(receiver, _, _, args) => self.lower_call(expr, Some(*receiver), args),
             Expr::Assign(dst, src) => {
                 if self.typed_body.semantic_expr_lowering(*dst).is_some() {

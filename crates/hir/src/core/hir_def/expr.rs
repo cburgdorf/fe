@@ -18,6 +18,8 @@ pub enum Expr<'db> {
     Call(ExprId, Vec<CallArg<'db>>),
     /// Compiler-owned `assert!(cond[, "message"])` builtin.
     Assert(Vec<CallArg<'db>>),
+    /// A parsed macro call that is not a supported compiler builtin.
+    UnsupportedMacroCall,
     /// (receiver, method_name, generic args, call args)
     MethodCall(
         ExprId,

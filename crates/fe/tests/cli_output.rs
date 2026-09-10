@@ -3789,3 +3789,28 @@ fn test_cli_workspace_exclude_skips_member() {
     let (output, _) = run_fe_main_in_dir(&["check"], &root);
     snap_test!(output, snapshot_path.to_str().unwrap());
 }
+
+#[test]
+fn unsupported_macro_calls_are_cli_errors() {
+    let dir = tempdir().expect("temp dir");
+    let source = dir.path().join("unsupported_macro.fe");
+    fs::write(&source, "#[test]\nfn unsupported() { funsig!(x) }\n")
+        .expect("write unsupported macro fixture");
+    let source = source.to_str().expect("source path utf8");
+
+    for command in ["check", "build", "test"] {
+        for recovery in [false, true] {
+            let mut args = vec![command, source];
+            if command != "test" {
+                args.push("--standalone");
+            }
+            if recovery {
+                args.push("--recovery-mode");
+            }
+            let (output, exit_code) = run_fe_main_in_dir(&args, dir.path());
+            assert_eq!(exit_code, 1, "fe {args:?}:\n{output}");
+            assert!(output.contains("unsupported macro call"), "{output}");
+            assert!(!output.contains("panicked at"), "{output}");
+        }
+    }
+}

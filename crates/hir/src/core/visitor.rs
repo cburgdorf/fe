@@ -1375,6 +1375,7 @@ pub fn walk_expr<'db, V>(
             );
         }
 
+        Expr::UnsupportedMacroCall => {}
         Expr::Assert(call_args) => {
             ctxt.with_new_ctxt(
                 |span| span.into_macro_call_expr(),

@@ -3201,6 +3201,7 @@ impl<'db> TypedBody<'db> {
             }
             Expr::Call(..) | Expr::MethodCall(..) => self.semantic_expr_lowering(expr).is_none(),
             Expr::Assert(_) => expr_ty.has_invalid(db),
+            Expr::UnsupportedMacroCall => true,
             Expr::RecordInit(..) => self.record_init_lowering(expr).is_none(),
             Expr::Un(inner, crate::hir_def::expr::UnOp::Mut | crate::hir_def::expr::UnOp::Ref) => {
                 expr_ty.has_invalid(db)
@@ -4336,7 +4337,7 @@ impl<'db> TypedBody<'db> {
                     seen,
                 );
             }
-            Expr::Lit(_) | Expr::Path(_) => {}
+            Expr::Lit(_) | Expr::Path(_) | Expr::UnsupportedMacroCall => {}
         }
     }
 

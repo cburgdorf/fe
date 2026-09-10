@@ -636,6 +636,7 @@ impl<'db> Expr<'db> {
                 )
             }
 
+            Expr::UnsupportedMacroCall => "<unsupported macro call>".to_string(),
             Expr::Assert(args) => {
                 let args_str = args
                     .iter()

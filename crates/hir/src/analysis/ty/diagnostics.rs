@@ -544,6 +544,7 @@ pub enum BodyDiag<'db> {
         trait_path: PathId<'db>,
     },
     UnsupportedUnaryPlus(DynLazySpan<'db>),
+    UnsupportedMacroCall(DynLazySpan<'db>),
     IntLiteralOutOfRange {
         primary: DynLazySpan<'db>,
         literal: String,
@@ -941,6 +942,7 @@ impl<'db> BodyDiag<'db> {
             Self::AccessedFieldNotFound { .. } => 15,
             Self::OpsTraitNotImplemented { .. } => 16,
             Self::UnsupportedUnaryPlus(..) => 52,
+            Self::UnsupportedMacroCall(..) => 89,
             Self::IntLiteralOutOfRange { .. } => 74,
             Self::BorrowFromNonPlace { .. } => 65,
             Self::CannotBorrowMut { .. } => 66,

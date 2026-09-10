@@ -290,6 +290,7 @@ fn call_like_receiver_expr<'db>(expr_data: &Expr<'db>) -> Option<ExprId> {
         | Expr::AugAssign(receiver, ..) => Some(*receiver),
         Expr::Call(..)
         | Expr::Assert(..)
+        | Expr::UnsupportedMacroCall
         | Expr::Lit(..)
         | Expr::Path(..)
         | Expr::Tuple(..)
