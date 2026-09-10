@@ -59,6 +59,9 @@ use sonatina_ir::{
 use super::{LowerError, create_module_ctx};
 use crate::function_symbols::{FunctionSymbolInput, assign_function_symbols};
 
+// Sonatina's EVM calling convention can carry at most 16 arguments.
+const MAX_DIRECT_CALL_ARGS: usize = 16;
+
 const PANIC_OVERFLOW: u64 = 0x11;
 const PANIC_DIVISION_BY_ZERO: u64 = 0x12;
 
@@ -88,6 +91,7 @@ struct ModuleLowerer<'db, 'a> {
     package: &'a RuntimePackage<'db>,
     func_map: FxHashMap<mir::RuntimeInstance<'db>, FuncRef>,
     func_symbols: FxHashMap<mir::RuntimeInstance<'db>, String>,
+    argument_packs: FxHashMap<mir::RuntimeInstance<'db>, Type>,
     section_membership: FxHashMap<mir::RuntimeInstance<'db>, Vec<mir::RuntimeSectionRef>>,
     type_cache: FxHashMap<LayoutId<'db>, Type>,
     layout_names: FxHashMap<LayoutId<'db>, String>,
@@ -109,6 +113,7 @@ impl<'db, 'a> ModuleLowerer<'db, 'a> {
             isa,
             package,
             func_map: FxHashMap::default(),
+            argument_packs: FxHashMap::default(),
             func_symbols: assign_sonatina_function_symbols(db, package),
             section_membership: compute_section_membership(db, package),
             type_cache: FxHashMap::default(),
@@ -162,7 +167,7 @@ impl<'db, 'a> ModuleLowerer<'db, 'a> {
 
     fn lower_signature(&mut self, function: RuntimeFunction<'db>) -> Result<Signature, LowerError> {
         let body = function.instance(self.db).body(self.db);
-        let args = body
+        let mut args = body
             .signature
             .params
             .iter()
@@ -174,7 +179,20 @@ impl<'db, 'a> ModuleLowerer<'db, 'a> {
             .as_ref()
             .map(|class| self.ty_for_class(class))
             .transpose()?;
-        let symbol = self.function_symbol(function.instance(self.db));
+        let instance = function.instance(self.db);
+        let symbol = self.function_symbol(instance);
+        // Sonatina may add an out pointer for a compound return value. Reserve
+        // that slot before its aggregate ABI legalization runs.
+        let return_slots = usize::from(matches!(ret, Some(Type::Compound(_))));
+        if args.len() + return_slots > MAX_DIRECT_CALL_ARGS {
+            // Keep the fields typed, including object references and aggregates.
+            // A fresh object at each call also keeps recursive calls independent.
+            let pack = self
+                .builder
+                .declare_struct_type(&format!("{symbol}__args"), &args, false);
+            self.argument_packs.insert(instance, pack);
+            args = vec![self.builder.objref_type(pack)];
+        }
         Ok(match ret {
             Some(ret) => Signature::new_single(
                 &symbol,
@@ -909,13 +927,53 @@ impl<'ctx, 'db, 'a> FunctionLowerer<'ctx, 'db, 'a> {
         Ok(())
     }
 
-    fn body_signature_arg(&self, idx: usize) -> Result<ValueId, LowerError> {
+    fn body_signature_arg(&mut self, idx: usize) -> Result<ValueId, LowerError> {
+        if self.module.argument_packs.contains_key(&self.body.owner) {
+            let pack = self.fb.func.arg_values[0];
+            let class = self.body.signature.params[idx].class.clone();
+            let ty = self.module.ty_for_class(&class)?;
+            let field = self.argument_pack_field(pack, idx, ty);
+            return Ok(self
+                .fb
+                .insert_inst(ObjLoad::new(self.module.inst_set(), field), ty));
+        }
         self.fb
             .func
             .arg_values
             .get(idx)
             .copied()
             .ok_or_else(|| LowerError::Internal(format!("missing arg value {idx}")))
+    }
+
+    fn argument_pack_field(&mut self, pack: ValueId, idx: usize, ty: Type) -> ValueId {
+        let index = self.index_value(idx as u64);
+        let field_ty = self.fb.module_builder.objref_type(ty);
+        self.fb.insert_inst(
+            ObjProj::new(self.module.inst_set(), smallvec![pack, index]),
+            field_ty,
+        )
+    }
+
+    fn lower_call_args(
+        &mut self,
+        callee: RuntimeInstance<'db>,
+        args: &[RLocalId],
+    ) -> Result<SmallVec<[ValueId; 8]>, LowerError> {
+        let Some(&pack_ty) = self.module.argument_packs.get(&callee) else {
+            return args.iter().map(|arg| self.local_value(*arg)).collect();
+        };
+        let ref_ty = self.fb.module_builder.objref_type(pack_ty);
+        let pack = self
+            .fb
+            .insert_inst(ObjAlloc::new(self.module.inst_set(), pack_ty), ref_ty);
+        for (idx, arg) in args.iter().enumerate() {
+            let value = self.local_value(*arg)?;
+            let ty = self.fb.func.dfg.value_ty(value);
+            let field = self.argument_pack_field(pack, idx, ty);
+            self.fb
+                .insert_inst_no_result(ObjStore::new(self.module.inst_set(), field, value));
+        }
+        Ok(smallvec![pack])
     }
 
     fn lower_stmt(&mut self, stmt: &RStmt<'db>) -> Result<Lowered<()>, LowerError> {
@@ -1165,10 +1223,7 @@ impl<'ctx, 'db, 'a> FunctionLowerer<'ctx, 'db, 'a> {
             } => self.lower_layout_map_patch(map, *source, *index, *replacement)?,
             RExpr::Call { callee, args } => {
                 let callee_ref = self.module.func_ref(*callee)?;
-                let args = args
-                    .iter()
-                    .map(|arg| self.local_value(*arg))
-                    .collect::<Result<SmallVec<[ValueId; 8]>, _>>()?;
+                let args = self.lower_call_args(*callee, args)?;
                 let ret = callee.body(self.module.db).signature.ret.clone();
                 match ret {
                     Some(class) => {
@@ -2313,10 +2368,7 @@ impl<'ctx, 'db, 'a> FunctionLowerer<'ctx, 'db, 'a> {
                 ));
             }
             RTerminator::TerminalCall { callee, args } => {
-                let args = args
-                    .iter()
-                    .map(|arg| self.local_value(*arg))
-                    .collect::<Result<SmallVec<[ValueId; 8]>, _>>()?;
+                let args = self.lower_call_args(*callee, args)?;
                 self.fb.insert_inst_no_result(Call::new(
                     self.module.inst_set(),
                     self.module.func_ref(*callee)?,
