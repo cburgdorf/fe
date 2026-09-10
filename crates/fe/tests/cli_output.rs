@@ -3789,3 +3789,21 @@ fn test_cli_workspace_exclude_skips_member() {
     let (output, _) = run_fe_main_in_dir(&["check"], &root);
     snap_test!(output, snapshot_path.to_str().unwrap());
 }
+
+#[test]
+fn wide_function_arguments_at_all_optimization_levels() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/fe_test/wide_function_arguments.fe");
+    // The fixture test covers the default level (1).
+    for level in ["0", "2", "s"] {
+        let (output, exit_code) = run_fe_main(&[
+            "test",
+            "--jobs",
+            "1",
+            "--optimize",
+            level,
+            fixture.to_str().expect("fixture path utf8"),
+        ]);
+        assert_eq!(exit_code, 0, "wide calls failed at -O {level}:\n{output}");
+    }
+}
