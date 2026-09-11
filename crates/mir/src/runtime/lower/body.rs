@@ -1057,6 +1057,9 @@ impl<'db> RmirEmitter<'db> {
 
     fn lower_stmt(&mut self, bb: RBlockId, stmt_idx: usize, stmt: &NSStmt<'db>) {
         self.lower_stmt_index_checks(bb, &stmt.kind);
+        if self.terminated_blocks[bb.index()] {
+            return;
+        }
         match &stmt.kind {
             NSStmtKind::Assign { dst, expr } => {
                 self.lower_assign(bb, stmt_idx, stmt.id, *dst, expr)
@@ -3433,6 +3436,9 @@ impl<'db> RmirEmitter<'db> {
     }
 
     fn lower_place_index_checks(&mut self, bb: RBlockId, place: &NSPlace<'db>) {
+        if self.terminated_blocks[bb.index()] {
+            return;
+        }
         if !place
             .path
             .iter()
@@ -3489,6 +3495,12 @@ impl<'db> RmirEmitter<'db> {
                                 .expect("array length must fit the runtime index representation"),
                         },
                     );
+                    if len == 0 {
+                        // AssertIndexInBounds always panics for an empty array.
+                        // Do not try to materialize its nonexistent element.
+                        self.set_terminator(bb, RTerminator::Trap);
+                        return;
+                    }
                     ty.generic_args(self.db).first().copied()
                 }
                 Projection::Deref => ty

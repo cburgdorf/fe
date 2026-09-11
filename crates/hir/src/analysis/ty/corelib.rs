@@ -391,6 +391,13 @@ pub fn core_primitive_wrapper_call_kind<'db>(
     let Some(ItemKind::ImplTrait(impl_trait)) = func.scope().parent_item(db) else {
         return None;
     };
+    // Core also defines operators for aggregates (for example String, arrays,
+    // and tuples). Their method bodies carry the comparison semantics and must
+    // not be bypassed just because the trait and method names match.
+    let self_ty = impl_trait.ty(db);
+    if !self_ty.is_integral(db) && !self_ty.is_bool(db) && self_ty.as_ptr(db).is_none() {
+        return None;
+    }
     let method = func.name(db).to_opt()?.data(db);
     let matches_trait = |segments: &[&str]| {
         impl_trait.trait_def(db) == resolve_core_trait(db, func.scope(), segments)

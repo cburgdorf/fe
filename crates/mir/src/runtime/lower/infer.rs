@@ -698,6 +698,15 @@ fn lower_semantic_locals<'db>(
                 ),
             },
             (SemanticLocalKind::PlaceBoundValue, origin) => {
+                // An element of an empty array has no backing storage. The
+                // index check terminates execution before this alias is used.
+                if let Some(place) = local.backing_place()
+                    && matches!(place.path.iter().next(), Some(hir::projection::Projection::Index(_)))
+                    && let Some(root_ty) = body.place_root_ty(&place.root)
+                    && runtime_repr_ty_in_env(db, cx.env.type_env(), root_ty).array_len(db) == Some(0)
+                {
+                    return RuntimeLocalLowering::Erased;
+                }
                 let place_class =
                     normalized_local_place_class(db, body, SLocalId::from_u32(idx as u32), carriers)
                         .unwrap_or_else(|| {
