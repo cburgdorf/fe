@@ -1140,6 +1140,12 @@ pub enum ImplDiag<'db> {
         is_nominal: bool,
     },
 
+    TypeNotDefinedInTrait {
+        primary: DynLazySpan<'db>,
+        trait_: Trait<'db>,
+        type_name: IdentId<'db>,
+    },
+
     MissingAssociatedType {
         primary: DynLazySpan<'db>,
         type_name: IdentId<'db>,
@@ -1233,6 +1239,7 @@ impl ImplDiag<'_> {
             Self::InherentConstShadowsVariant { .. } => 20,
             Self::InherentConstShadowsFn { .. } => 21,
             Self::InvalidEffectHandleRaw { .. } => 22,
+            Self::TypeNotDefinedInTrait { .. } => 23,
         }
     }
 }

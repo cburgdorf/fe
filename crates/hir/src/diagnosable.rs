@@ -690,11 +690,8 @@ impl<'db> ImplTrait<'db> {
         self.implementor_with_errors(db)
     }
 
-    /// Diagnostics for missing associated types (required by the trait).
-    pub fn diags_missing_assoc_types(
-        self,
-        db: &'db dyn HirAnalysisDb,
-    ) -> Vec<TyDiagCollection<'db>> {
+    /// Diagnostics for missing associated types and types not declared in the trait.
+    pub fn diags_assoc_types(self, db: &'db dyn HirAnalysisDb) -> Vec<TyDiagCollection<'db>> {
         use ty::diagnostics::ImplDiag;
         use ty::trait_lower::lower_impl_trait;
 
@@ -705,6 +702,22 @@ impl<'db> ImplTrait<'db> {
         let implementor = implementor.instantiate_identity();
         let trait_hir = implementor.trait_def(db);
         let impl_types = implementor.types(db);
+
+        for (idx, assoc) in self.types(db).iter().enumerate() {
+            let Some(name) = assoc.name.to_opt() else {
+                continue;
+            };
+            if trait_hir.assoc_ty(db, name).is_none() {
+                diags.push(
+                    ImplDiag::TypeNotDefinedInTrait {
+                        primary: self.span().associated_type(idx).name().into(),
+                        trait_: trait_hir,
+                        type_name: name,
+                    }
+                    .into(),
+                );
+            }
+        }
 
         for assoc in trait_hir.assoc_types(db) {
             let Some(name) = assoc.name(db) else { continue };
@@ -1759,7 +1772,7 @@ impl<'db> Diagnosable<'db> for ImplTrait<'db> {
         out.extend(self.diags_effect_handle_raw(db, *implementor.skip_binder()));
         out.extend(self.diags_trait_ref_and_wf(db));
         out.extend(self.diags_assoc_types_wf(db));
-        out.extend(self.diags_missing_assoc_types(db));
+        out.extend(self.diags_assoc_types(db));
         out.extend(self.diags_assoc_types_bounds(db));
         out.extend(self.diags_missing_assoc_consts(db));
         out.extend(self.diags_assoc_consts(db));

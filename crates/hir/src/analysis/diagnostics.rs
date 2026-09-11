@@ -5273,6 +5273,26 @@ impl DiagnosticVoucher for ImplDiag<'_> {
                 }
             }
 
+            Self::TypeNotDefinedInTrait {
+                primary,
+                trait_,
+                type_name,
+            } => CompleteDiagnostic {
+                severity,
+                message: "associated type not defined in trait".to_string(),
+                sub_diagnostics: vec![SubDiagnostic {
+                    style: LabelStyle::Primary,
+                    message: format!(
+                        "associated type `{}` is not defined in trait `{}`",
+                        type_name.data(db),
+                        trait_.name(db).unwrap().data(db)
+                    ),
+                    span: primary.resolve(db),
+                }],
+                notes: vec![],
+                error_code,
+            },
+
             Self::MissingAssociatedType {
                 primary,
                 type_name,
