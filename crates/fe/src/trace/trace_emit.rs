@@ -352,6 +352,38 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn shared_init_runtime_function_has_unique_backend_facts() {
+        let path = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/trace/shared_init_runtime.fe");
+        let bundle = emit_real_trace_bundle(&path, true, "dev", codegen::OptLevel::O0).unwrap();
+        let snapshot = TraceSnapshot::new(bundle).unwrap();
+        // Keep the regression meaningful: both sections must retain their PC
+        // links to at least one shared backend instruction after deduplication.
+        let mut backend_users = std::collections::BTreeMap::new();
+        for fact in snapshot.facts() {
+            if let trace_facts::TraceFact::OriginEdge(edge) = fact
+                && edge.from.kind() == "bytecode.pc"
+                && edge.to.kind() == "evm.vcode.inst"
+            {
+                backend_users
+                    .entry(&edge.to)
+                    .or_insert_with(std::collections::BTreeSet::new)
+                    .insert(edge.from.owner_key());
+            }
+        }
+        assert!(backend_users.values().any(|users| users.len() == 2));
+        let debug = debug_export::DebugBundle::from_snapshot(&snapshot);
+        let artifact = debug_export::emit_ethdebug_artifact(&debug).unwrap();
+        assert_eq!(artifact.programs.len(), 2);
+        assert!(
+            artifact
+                .programs
+                .iter()
+                .all(|program| !program.instructions.is_empty())
+        );
+    }
+
+    #[test]
     fn standalone_file_input_returns_canonical_trace_identity() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)

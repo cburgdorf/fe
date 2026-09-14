@@ -578,6 +578,17 @@ mod tests {
     use crate::runtime::{AddressSpaceKind, RValueId};
 
     #[test]
+    fn self_loop_excludes_preheader() {
+        let entry = RBlockId::from_u32(0);
+        let header = RBlockId::from_u32(1);
+        let predecessors = vec![vec![], vec![entry, header]];
+        assert_eq!(
+            natural_loop_members(2, &predecessors, header, header),
+            vec![header]
+        );
+    }
+
+    #[test]
     fn raw_pointer_operations_have_explicit_trace_displays() {
         let value = RValueId::new(0);
         assert_eq!(
@@ -651,7 +662,12 @@ fn natural_loop_members(
     let header_index = header.index();
     let latch_index = latch.index();
     let mut members = BTreeSet::from([header_index, latch_index]);
-    let mut stack = vec![latch_index];
+    // Never walk predecessors of the header, including for a self-loop.
+    let mut stack = if latch_index == header_index {
+        Vec::new()
+    } else {
+        vec![latch_index]
+    };
     while let Some(block) = stack.pop() {
         for predecessor in predecessors.get(block).into_iter().flatten() {
             let predecessor = predecessor.index();

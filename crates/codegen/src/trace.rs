@@ -634,6 +634,7 @@ pub fn emit_observed_bytecode_trace_facts(
         })
         .collect::<BTreeSet<_>>();
     let mut facts = Vec::new();
+    let mut backend_facts = BackendTraceEmissionState::default();
     for (contract_name, artifact) in bytecode {
         let contract = bytecode_contract_key(input_owner_key, module_key, contract_name);
         facts.push(origin_node(contract.clone(), "bytecode.contract"));
@@ -647,6 +648,7 @@ pub fn emit_observed_bytecode_trace_facts(
             Some(sonatina_owner_key),
             artifact.runtime_observability.as_ref(),
             Some(&postopt_sonatina_nodes),
+            &mut backend_facts,
         )?);
         let creation_owner =
             bytecode_creation_owner_key(input_owner_key, module_key, contract_name);
@@ -659,6 +661,7 @@ pub fn emit_observed_bytecode_trace_facts(
             Some(sonatina_owner_key),
             artifact.deploy_observability.as_ref(),
             Some(&postopt_sonatina_nodes),
+            &mut backend_facts,
         )?);
     }
     Ok(facts)
@@ -681,7 +684,18 @@ pub fn emit_bytecode_instruction_facts_with_observability(
         sonatina_owner_key,
         observability,
         known_sonatina_endpoint_nodes,
+        &mut BackendTraceEmissionState::default(),
     )
+}
+
+/// Backend identities are scoped to the Sonatina module, not to a bytecode
+/// section. A function reused by runtime/creation or multiple contracts must
+/// emit its nodes and lineage only once across all sections of that module.
+#[derive(Default)]
+struct BackendTraceEmissionState {
+    nodes: BTreeSet<OriginExportKey>,
+    lineage_events: BTreeSet<(OriginExportKey, OriginExportKey)>,
+    edges: BTreeSet<(OriginExportKey, OriginExportKey)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -694,15 +708,13 @@ fn emit_evm_bytecode_instruction_facts_with_observability(
     sonatina_owner_key: Option<&str>,
     observability: Option<&SectionObservability>,
     known_sonatina_endpoint_nodes: Option<&BTreeSet<OriginExportKey>>,
+    backend_facts: &mut BackendTraceEmissionState,
 ) -> Result<Vec<TraceFact>, crate::LowerError> {
     let function = bytecode_function_key(owner_key, function_local_key);
     let code_object = bytecode_code_object_key_for_section(owner_key, section);
     let pc_map = observability
         .map(|observability| build_pc_map(&observability.pc_map))
         .unwrap_or_default();
-    let mut emitted_prepared_nodes = BTreeSet::new();
-    let mut emitted_prepared_lineage_events = BTreeSet::new();
-    let mut emitted_backend_edges = BTreeSet::new();
     let mut facts = vec![
         origin_node(function.clone(), "bytecode.function"),
         origin_node(code_object.clone(), "code.object"),
@@ -786,7 +798,7 @@ fn emit_evm_bytecode_instruction_facts_with_observability(
                 (sonatina_owner_key, entry.unit.function())
             {
                 let vcode_key = evm_vcode_inst_key(sonatina_owner_key, func, entry.vcode_inst);
-                if emitted_prepared_nodes.insert(vcode_key.clone()) {
+                if backend_facts.nodes.insert(vcode_key.clone()) {
                     facts.push(origin_node(vcode_key.clone(), EVM_VCODE_INST_KIND));
                 }
                 facts.push(TraceFact::OriginEdge(OriginEdgeFact::new(
@@ -802,10 +814,10 @@ fn emit_evm_bytecode_instruction_facts_with_observability(
                         func,
                         machine_inst.raw(),
                     );
-                    if emitted_prepared_nodes.insert(key.clone()) {
+                    if backend_facts.nodes.insert(key.clone()) {
                         facts.push(origin_node(key.clone(), SONATINA_EVM_PREPARED_INST_KIND));
                     }
-                    if emitted_backend_edges.insert((vcode_key.clone(), key.clone())) {
+                    if backend_facts.edges.insert((vcode_key.clone(), key.clone())) {
                         facts.push(TraceFact::OriginEdge(OriginEdgeFact::new(
                             vcode_key,
                             key.clone(),
@@ -849,9 +861,12 @@ fn emit_evm_bytecode_instruction_facts_with_observability(
                     owner_key,
                     &prepared_inst,
                     &frontend_origin,
-                    &mut emitted_prepared_lineage_events,
+                    &mut backend_facts.lineage_events,
                 );
-                if emitted_backend_edges.insert((prepared_inst.clone(), frontend_origin.clone())) {
+                if backend_facts
+                    .edges
+                    .insert((prepared_inst.clone(), frontend_origin.clone()))
+                {
                     facts.push(TraceFact::OriginEdge(OriginEdgeFact::new(
                         prepared_inst,
                         frontend_origin,
@@ -1441,7 +1456,12 @@ fn indexed_natural_loop_members(
     latch: usize,
 ) -> Vec<usize> {
     let mut members = BTreeSet::from([header, latch]);
-    let mut stack = vec![latch];
+    // A self-loop is complete already; walking the header would include its preheader.
+    let mut stack = if latch == header {
+        Vec::new()
+    } else {
+        vec![latch]
+    };
     while let Some(block) = stack.pop() {
         for predecessor in predecessors.get(block).into_iter().flatten().copied() {
             if predecessor >= block_count || !members.insert(predecessor) {
@@ -2963,6 +2983,69 @@ mod tests {
         assert!(facts.iter().any(|fact| {
             matches!(fact, TraceFact::CfgEdge(edge) if edge.kind == trace_facts::CfgEdgeKind::Backedge)
         }));
+    }
+
+    #[test]
+    fn sonatina_self_loop_excludes_preheader() {
+        use sonatina_ir::{
+            Linkage, Signature, Type,
+            builder::ModuleBuilder,
+            func_cursor::InstInserter,
+            inst::control_flow::{Br, Jump, Return},
+            isa::Isa,
+            isa::evm::Evm,
+            module::ModuleCtx,
+        };
+        use sonatina_triple::{Architecture, EvmVersion, OperatingSystem, TargetTriple, Vendor};
+
+        let evm = Evm::new(TargetTriple::new(
+            Architecture::Evm,
+            Vendor::Ethereum,
+            OperatingSystem::Evm(EvmVersion::London),
+        ));
+        let mb = ModuleBuilder::new(ModuleCtx::new(&evm));
+        let func_ref = mb
+            .declare_function(Signature::new_unit(
+                "trace_loop",
+                Linkage::Public,
+                &[Type::I1],
+            ))
+            .unwrap();
+        let is = evm.inst_set();
+        let mut builder = mb.func_builder::<InstInserter>(func_ref);
+        let entry = builder.append_block();
+        let header = builder.append_block();
+        let exit = builder.append_block();
+        let cond = builder.args()[0];
+
+        builder.switch_to_block(entry);
+        builder.insert_inst_no_result(Jump::new(is, header));
+
+        builder.switch_to_block(header);
+        builder.insert_inst_no_result(Br::new(is, cond, header, exit));
+
+        builder.switch_to_block(exit);
+        builder.insert_inst_no_result(Return::new_unit(is));
+        builder.seal_all();
+        builder.finish();
+        let module = mb.build();
+
+        let facts =
+            emit_sonatina_trace_view_facts("owner:test", &module, CompilerPhase::SonatinaPreOpt)
+                .unwrap();
+        TraceValidator::validate(&facts).unwrap();
+
+        let members = facts
+            .iter()
+            .filter_map(|fact| match fact {
+                TraceFact::LoopBlock(f) => Some(f.block.local_key().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            members,
+            vec![format!("function:{func_ref:?}:block:{header:?}")]
+        );
     }
 
     #[test]
