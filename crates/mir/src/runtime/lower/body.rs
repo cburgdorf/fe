@@ -26,7 +26,6 @@ use hir::analysis::{
             resolve_core_trait, resolve_lib_func_path, resolve_lib_type_path,
             runtime_builtin_func_kind,
         },
-        pattern_types::{PatternProjectionStep, project_pattern_child_source_ty},
         trait_def::TraitInstId,
         trait_resolution::{
             GoalSatisfiability, PredicateListId, TraitSolveCx, is_goal_satisfiable,
@@ -36,8 +35,7 @@ use hir::analysis::{
     },
 };
 use hir::hir_def::{
-    ArithBinOp, BinOp, CompBinOp, EnumVariant, Func, IdentId, UnOp, attr::ArithmeticMode,
-    scope_graph::ScopeId,
+    ArithBinOp, BinOp, CompBinOp, Func, IdentId, UnOp, attr::ArithmeticMode, scope_graph::ScopeId,
 };
 use hir::projection::{IndexSource, Projection};
 use hir::semantic::ProviderBinding;
@@ -90,7 +88,7 @@ use super::{
     returns::runtime_return_class,
     source::{
         RuntimeSourceMode, RuntimeSourceQuery, SemanticPlaceValueSource,
-        alias_source_place_for_local as source_alias_source_place_for_local,
+        alias_source_place_for_local as source_alias_source_place_for_local, place_index_bounds,
         place_path_starts_with_pointee_projection,
     },
     tuple::RuntimeTupleFieldEmitter,
@@ -3439,87 +3437,32 @@ impl<'db> RmirEmitter<'db> {
         if self.terminated_blocks[bb.index()] {
             return;
         }
-        if !place
-            .path
-            .iter()
-            .any(|projection| matches!(projection, Projection::Index(_)))
-        {
-            return;
-        }
-        let Some(mut ty) = self.semantic_place_root_ty(place) else {
-            return;
-        };
-        for projection in place.path.iter() {
-            while let Some((_, inner)) = ty.as_capability(self.db) {
-                ty = inner;
-            }
-            ty = match projection {
-                Projection::Field(index) => Some(project_pattern_child_source_ty(
-                    self.db,
-                    ty,
-                    PatternProjectionStep::Field(*index),
-                )),
-                Projection::VariantField {
-                    variant,
-                    enum_ty: _,
-                    field_idx,
-                } => ty.as_enum(self.db).map(|enum_| {
-                    project_pattern_child_source_ty(
-                        self.db,
-                        ty,
-                        PatternProjectionStep::VariantField {
-                            variant: EnumVariant::new(enum_, variant.0 as usize),
-                            field_idx: *field_idx,
-                        },
-                    )
-                }),
-                Projection::Index(index) => {
-                    let len = ty
-                        .array_len(self.db)
-                        .expect("normalized index projection must retain a concrete array length");
-                    let index = match index {
-                        IndexSource::Constant(index) => IndexSource::Constant(*index),
-                        IndexSource::Dynamic(index) => {
-                            IndexSource::Dynamic(self.read_semantic_value(bb, *index))
-                        }
-                        IndexSource::Any => {
-                            panic!("analysis wildcard index reached runtime lowering: {place:?}")
-                        }
-                    };
-                    self.push_stmt(
-                        bb,
-                        RStmt::AssertIndexInBounds {
-                            index,
-                            len: len
-                                .try_into()
-                                .expect("array length must fit the runtime index representation"),
-                        },
-                    );
-                    if len == 0 {
-                        // AssertIndexInBounds always panics for an empty array.
-                        // Do not try to materialize its nonexistent element.
-                        self.set_terminator(bb, RTerminator::Trap);
-                        return;
-                    }
-                    ty.generic_args(self.db).first().copied()
+        for (index, len) in place_index_bounds(self.db, &self.semantic_body, place) {
+            let index = match index {
+                IndexSource::Constant(index) => IndexSource::Constant(index),
+                IndexSource::Dynamic(index) => {
+                    IndexSource::Dynamic(self.read_semantic_value(bb, index))
                 }
-                Projection::Deref => ty
-                    .as_borrow(self.db)
-                    .map(|(_, inner)| inner)
-                    .or_else(|| ty.as_capability(self.db).map(|(_, inner)| inner)),
-                Projection::Discriminant => None,
+                IndexSource::Any => {
+                    panic!("analysis wildcard index reached runtime lowering: {place:?}")
+                }
+            };
+            self.push_stmt(
+                bb,
+                RStmt::AssertIndexInBounds {
+                    index,
+                    len: len
+                        .try_into()
+                        .expect("array length must fit the runtime index representation"),
+                },
+            );
+            if len == 0 {
+                // AssertIndexInBounds always panics for an empty array.
+                // Do not try to materialize its nonexistent element.
+                self.set_terminator(bb, RTerminator::Trap);
+                return;
             }
-            .unwrap_or_else(|| {
-                panic!(
-                    "invalid semantic place projection while lowering index checks: ty={}, projection={projection:?}",
-                    ty.pretty_print(self.db),
-                )
-            });
         }
-    }
-
-    fn semantic_place_root_ty(&self, place: &NSPlace<'db>) -> Option<TyId<'db>> {
-        self.semantic_body.place_root_ty(&place.root)
     }
 
     fn lower_extern_builtin_call(

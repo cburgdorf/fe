@@ -7,17 +7,79 @@ use hir::analysis::{
             NormalizedSemanticBody,
         },
     },
-    ty::ty_def::TyId,
+    ty::{
+        pattern_types::{PatternProjectionStep, project_pattern_child_source_ty},
+        ty_def::TyId,
+    },
 };
+use hir::hir_def::EnumVariant;
 use hir::projection::{IndexSource, Projection};
 
-use crate::runtime::{RuntimeCarrier, RuntimeClass, RuntimeLocalRoot};
+use crate::{
+    db::MirDb,
+    runtime::{RuntimeCarrier, RuntimeClass, RuntimeLocalRoot},
+};
 
 use super::classify::{
     BodyEnv, carrier_value_class, nonself_backing_value_place, provider_erases_runtime_root,
     runtime_class_for_direct_value_provider_in_env,
     runtime_class_for_effect_binding_provider_in_env, snapshot_source_place,
 };
+
+/// Index bounds in projection order, stopping at the first empty array.
+/// Both alias erasure and emitted bounds checks must inspect the same path.
+pub(super) fn place_index_bounds<'db>(
+    db: &'db dyn MirDb,
+    body: &NormalizedSemanticBody<'db>,
+    place: &NSPlace<'db>,
+) -> Vec<(IndexSource<SLocalId>, usize)> {
+    let mut bounds = Vec::new();
+    if !place
+        .path
+        .iter()
+        .any(|step| matches!(step, Projection::Index(_)))
+    {
+        return bounds;
+    }
+    let Some(mut ty) = body.place_root_ty(&place.root) else {
+        return bounds;
+    };
+    for projection in place.path.iter() {
+        while let Some((_, inner)) = ty.as_capability(db) {
+            ty = inner;
+        }
+        ty = match projection {
+            Projection::Field(index) => Some(project_pattern_child_source_ty(
+                db, ty, PatternProjectionStep::Field(*index),
+            )),
+            Projection::VariantField { variant, field_idx, .. } => ty.as_enum(db).map(|enum_| {
+                project_pattern_child_source_ty(db, ty, PatternProjectionStep::VariantField {
+                    variant: EnumVariant::new(enum_, variant.0 as usize),
+                    field_idx: *field_idx,
+                })
+            }),
+            Projection::Index(index) => {
+                let len = ty.array_len(db)
+                    .expect("normalized index projection must retain a concrete array length");
+                bounds.push((*index, len));
+                if len == 0 {
+                    return bounds;
+                }
+                ty.generic_args(db).first().copied()
+            }
+            Projection::Deref => ty.as_borrow(db).map(|(_, inner)| inner)
+                .or_else(|| ty.as_capability(db).map(|(_, inner)| inner)),
+            Projection::Discriminant => None,
+        }
+        .unwrap_or_else(|| {
+            panic!(
+                "invalid semantic place projection while collecting index bounds: ty={}, projection={projection:?}",
+                ty.pretty_print(db),
+            )
+        });
+    }
+    bounds
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum RuntimeSourceMode<'roots, 'db> {

@@ -36,7 +36,10 @@ use super::{
     },
     conversion::RuntimeConversionPlanner,
     returns::runtime_return_class,
-    source::{local_pointer_uses_lowerable_from_value, local_read_places_extractable_from_value},
+    source::{
+        local_pointer_uses_lowerable_from_value, local_read_places_extractable_from_value,
+        place_index_bounds,
+    },
     type_info::{
         RuntimeTypeEnv, effect_handle_transport_class_for_ty_in_env,
         provider_class_for_target_in_env, runtime_repr_ty_in_env, runtime_zero_sized_transport_ty,
@@ -701,9 +704,7 @@ fn lower_semantic_locals<'db>(
                 // An element of an empty array has no backing storage. The
                 // index check terminates execution before this alias is used.
                 if let Some(place) = local.backing_place()
-                    && matches!(place.path.iter().next(), Some(hir::projection::Projection::Index(_)))
-                    && let Some(root_ty) = body.place_root_ty(&place.root)
-                    && runtime_repr_ty_in_env(db, cx.env.type_env(), root_ty).array_len(db) == Some(0)
+                    && place_index_bounds(db, body, place).iter().any(|(_, len)| *len == 0)
                 {
                     return RuntimeLocalLowering::Erased;
                 }
