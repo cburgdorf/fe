@@ -5,6 +5,7 @@ pub mod config;
 pub mod dependencies;
 pub mod diagnostics;
 pub mod file;
+pub mod graph;
 pub mod indexmap;
 pub mod ingot;
 pub mod layout;

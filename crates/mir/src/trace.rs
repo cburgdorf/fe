@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use common::graph::ControlFlowAnalysis;
 use cranelift_entity::EntityRef;
 use trace_facts::{
     BlockFact, CfgEdgeFact, CfgEdgeKind, CompilerEventFact, CompilerEventKind, CompilerPhase,
@@ -168,7 +169,12 @@ pub fn emit_mir_facts<'db>(db: &'db dyn MirDb, package: RuntimePackage<'db>) -> 
             )));
         }
         let cfg = runtime_cfg(&body);
-        let dominators = dominators(body.blocks.len(), &cfg.predecessors);
+        let indexed_predecessors = cfg
+            .predecessors
+            .iter()
+            .map(|preds| preds.iter().map(|pred| pred.index()).collect())
+            .collect::<Vec<Vec<usize>>>();
+        let analysis = ControlFlowAnalysis::new(0, &indexed_predecessors);
         let mut instruction_index = 0u32;
         for (block_index, runtime_block) in body.blocks.iter().enumerate() {
             let block = RBlockId::from_u32(block_index as u32);
@@ -273,12 +279,12 @@ pub fn emit_mir_facts<'db>(db: &'db dyn MirDb, package: RuntimePackage<'db>) -> 
                 function_key.clone(),
                 from_key,
                 to_key,
-                cfg_edge_kind(edge, &dominators),
+                cfg_edge_kind(edge, &analysis),
                 condition_origin,
             )));
         }
-        let cfg_hash = runtime_cfg_hash(body.blocks.len(), &cfg.edges);
-        for natural_loop in natural_loops(body.blocks.len(), &cfg.predecessors, &cfg.edges) {
+        let cfg_hash = runtime_cfg_hash(body.blocks.len(), &cfg.edges, &analysis);
+        for natural_loop in natural_loops(&indexed_predecessors, &cfg.edges, &analysis) {
             let loop_key = RuntimeLoopOrigin::new(
                 instance,
                 RuntimeLoopSite::new(natural_loop.header, natural_loop.latch),
@@ -578,17 +584,6 @@ mod tests {
     use crate::runtime::{AddressSpaceKind, RValueId};
 
     #[test]
-    fn self_loop_excludes_preheader() {
-        let entry = RBlockId::from_u32(0);
-        let header = RBlockId::from_u32(1);
-        let predecessors = vec![vec![], vec![entry, header]];
-        assert_eq!(
-            natural_loop_members(2, &predecessors, header, header),
-            vec![header]
-        );
-    }
-
-    #[test]
     fn raw_pointer_operations_have_explicit_trace_displays() {
         let value = RValueId::new(0);
         assert_eq!(
@@ -612,15 +607,32 @@ mod tests {
         );
         assert!(terminator_edges(RBlockId::new(0), &RTerminator::RevertEmpty).is_empty());
     }
+
+    #[test]
+    fn cfg_hash_uses_the_emitted_backedge_kind() {
+        let edge = RuntimeCfgEdge {
+            from: RBlockId::new(1),
+            to: RBlockId::new(0),
+            kind: CfgEdgeKind::Jump,
+            condition: None,
+        };
+        let analysis = ControlFlowAnalysis::new(0, &[vec![1], vec![0]]);
+        let actual = runtime_cfg_hash(2, &[edge], &analysis);
+
+        let mut expected = blake3::Hasher::new();
+        hash_u32(&mut expected, 2);
+        hash_u32(&mut expected, 1);
+        hash_u32(&mut expected, 0);
+        hash_bytes(&mut expected, b"backedge");
+        hash_bytes(&mut expected, b"none");
+        assert_eq!(actual, format!("blake3:{}", expected.finalize().to_hex()));
+    }
 }
 
-fn cfg_edge_kind(edge: &RuntimeCfgEdge, dominators: &[BTreeSet<usize>]) -> CfgEdgeKind {
+fn cfg_edge_kind(edge: &RuntimeCfgEdge, analysis: &ControlFlowAnalysis) -> CfgEdgeKind {
     let from = edge.from.index();
     let to = edge.to.index();
-    if dominators
-        .get(from)
-        .is_some_and(|dominator_set| dominator_set.contains(&to))
-    {
+    if analysis.is_backedge(from, to) {
         CfgEdgeKind::Backedge
     } else {
         edge.kind
@@ -628,111 +640,45 @@ fn cfg_edge_kind(edge: &RuntimeCfgEdge, dominators: &[BTreeSet<usize>]) -> CfgEd
 }
 
 fn natural_loops(
-    block_count: usize,
-    predecessors: &[Vec<RBlockId>],
+    predecessors: &[Vec<usize>],
     edges: &[RuntimeCfgEdge],
+    analysis: &ControlFlowAnalysis,
 ) -> Vec<NaturalLoop> {
-    let dominators = dominators(block_count, predecessors);
     let mut seen = BTreeSet::new();
     let mut loops = Vec::new();
     for edge in edges {
         let from = edge.from.index();
         let to = edge.to.index();
-        if from >= block_count || to >= block_count {
-            continue;
-        }
-        if !dominators[from].contains(&to) || !seen.insert((to, from)) {
+        if !analysis.is_backedge(from, to) || !seen.insert((to, from)) {
             continue;
         }
         loops.push(NaturalLoop {
             header: edge.to,
             latch: edge.from,
-            members: natural_loop_members(block_count, predecessors, edge.to, edge.from),
+            members: analysis
+                .natural_loop_members(predecessors, to, from)
+                .into_iter()
+                .map(|block| RBlockId::from_u32(block as u32))
+                .collect(),
         });
     }
     loops
 }
 
-fn natural_loop_members(
+fn runtime_cfg_hash(
     block_count: usize,
-    predecessors: &[Vec<RBlockId>],
-    header: RBlockId,
-    latch: RBlockId,
-) -> Vec<RBlockId> {
-    let header_index = header.index();
-    let latch_index = latch.index();
-    let mut members = BTreeSet::from([header_index, latch_index]);
-    // Never walk predecessors of the header, including for a self-loop.
-    let mut stack = if latch_index == header_index {
-        Vec::new()
-    } else {
-        vec![latch_index]
-    };
-    while let Some(block) = stack.pop() {
-        for predecessor in predecessors.get(block).into_iter().flatten() {
-            let predecessor = predecessor.index();
-            if predecessor >= block_count || !members.insert(predecessor) {
-                continue;
-            }
-            if predecessor != header_index {
-                stack.push(predecessor);
-            }
-        }
-    }
-    members
-        .into_iter()
-        .map(|block| RBlockId::from_u32(block as u32))
-        .collect()
-}
-
-fn dominators(block_count: usize, predecessors: &[Vec<RBlockId>]) -> Vec<BTreeSet<usize>> {
-    if block_count == 0 {
-        return Vec::new();
-    }
-    let all_blocks = (0..block_count).collect::<BTreeSet<_>>();
-    let mut dominators = vec![all_blocks.clone(); block_count];
-    dominators[0] = BTreeSet::from([0]);
-
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for block in 1..block_count {
-            let preds = predecessors
-                .get(block)
-                .into_iter()
-                .flatten()
-                .map(|pred| pred.index())
-                .filter(|pred| *pred < block_count)
-                .collect::<Vec<_>>();
-            let mut next = if let Some((first, rest)) = preds.split_first() {
-                let mut intersection = dominators[*first].clone();
-                for pred in rest {
-                    intersection = intersection
-                        .intersection(&dominators[*pred])
-                        .copied()
-                        .collect();
-                }
-                intersection
-            } else {
-                BTreeSet::new()
-            };
-            next.insert(block);
-            if next != dominators[block] {
-                dominators[block] = next;
-                changed = true;
-            }
-        }
-    }
-    dominators
-}
-
-fn runtime_cfg_hash(block_count: usize, edges: &[RuntimeCfgEdge]) -> String {
+    edges: &[RuntimeCfgEdge],
+    analysis: &ControlFlowAnalysis,
+) -> String {
     let mut hasher = blake3::Hasher::new();
     hash_u32(&mut hasher, block_count as u32);
     for edge in edges {
         hash_u32(&mut hasher, edge.from.index() as u32);
         hash_u32(&mut hasher, edge.to.index() as u32);
-        hash_bytes(&mut hasher, cfg_edge_kind_name(edge.kind).as_bytes());
+        hash_bytes(
+            &mut hasher,
+            cfg_edge_kind_name(cfg_edge_kind(edge, analysis)).as_bytes(),
+        );
         match edge.condition {
             Some(condition) => hash_u32(&mut hasher, condition.index() as u32),
             None => hash_bytes(&mut hasher, b"none"),

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use common::{file::IngotFileKind, origin::OriginExportKey};
+use common::{file::IngotFileKind, graph::ControlFlowAnalysis, origin::OriginExportKey};
 use driver::DriverDataBase;
 use hir::hir_def::TopLevelMod;
 use mir::build_runtime_package;
@@ -858,7 +858,9 @@ fn emit_evm_bytecode_instruction_facts_with_observability(
                 }
                 emit_prepared_lineage_event(
                     &mut facts,
-                    owner_key,
+                    sonatina_owner_key.expect(
+                        "mapped provenance with a prepared instruction has a Sonatina owner",
+                    ),
                     &prepared_inst,
                     &frontend_origin,
                     &mut backend_facts.lineage_events,
@@ -993,7 +995,9 @@ pub fn emit_sonatina_trace_view_facts(
         let blocks = module.trace_blocks(function_ref);
         let cfg_edges = sonatina_trace_cfg_edges(module, function_ref, &blocks);
         let predecessors = indexed_predecessors(blocks.len(), &cfg_edges);
-        let dominators = indexed_dominators(blocks.len(), &predecessors);
+        // Trace blocks preserve function layout order, whose first block is
+        // the function entry.
+        let analysis = ControlFlowAnalysis::new(0, &predecessors);
         for (block_ordinal, block) in blocks.iter().copied().enumerate() {
             let block_key = sonatina_trace_block_key(block_kind, owner_key, function_ref, block);
             push_node(&mut facts, block_key.clone());
@@ -1017,7 +1021,7 @@ pub fn emit_sonatina_trace_view_facts(
                     function_key.clone(),
                     block_key.clone(),
                     to_block,
-                    indexed_cfg_edge_kind(edge, &dominators),
+                    indexed_cfg_edge_kind(edge, &analysis),
                     None,
                 )));
             }
@@ -1065,8 +1069,8 @@ pub fn emit_sonatina_trace_view_facts(
         let Some(loop_kind) = sonatina_loop_kind_for_phase(phase) else {
             continue;
         };
-        let cfg_hash = indexed_cfg_hash(blocks.len(), &cfg_edges, &dominators);
-        for natural_loop in indexed_natural_loops(blocks.len(), &predecessors, &cfg_edges) {
+        let cfg_hash = indexed_cfg_hash(blocks.len(), &cfg_edges, &analysis);
+        for natural_loop in indexed_natural_loops(&predecessors, &cfg_edges, &analysis) {
             let loop_key = sonatina_trace_loop_key(
                 loop_kind,
                 owner_key,
@@ -1414,11 +1418,8 @@ fn indexed_predecessors(block_count: usize, edges: &[IndexedCfgEdge]) -> Vec<Vec
     predecessors
 }
 
-fn indexed_cfg_edge_kind(edge: &IndexedCfgEdge, dominators: &[BTreeSet<usize>]) -> CfgEdgeKind {
-    if dominators
-        .get(edge.from)
-        .is_some_and(|dominator_set| dominator_set.contains(&edge.to))
-    {
+fn indexed_cfg_edge_kind(edge: &IndexedCfgEdge, analysis: &ControlFlowAnalysis) -> CfgEdgeKind {
+    if analysis.is_backedge(edge.from, edge.to) {
         CfgEdgeKind::Backedge
     } else {
         edge.kind
@@ -1426,100 +1427,29 @@ fn indexed_cfg_edge_kind(edge: &IndexedCfgEdge, dominators: &[BTreeSet<usize>]) 
 }
 
 fn indexed_natural_loops(
-    block_count: usize,
     predecessors: &[Vec<usize>],
     edges: &[IndexedCfgEdge],
+    analysis: &ControlFlowAnalysis,
 ) -> Vec<IndexedNaturalLoop> {
-    let dominators = indexed_dominators(block_count, predecessors);
     let mut seen = BTreeSet::new();
     let mut loops = Vec::new();
     for edge in edges {
-        if edge.from >= block_count || edge.to >= block_count {
-            continue;
-        }
-        if !dominators[edge.from].contains(&edge.to) || !seen.insert((edge.to, edge.from)) {
+        if !analysis.is_backedge(edge.from, edge.to) || !seen.insert((edge.to, edge.from)) {
             continue;
         }
         loops.push(IndexedNaturalLoop {
             header: edge.to,
             latch: edge.from,
-            members: indexed_natural_loop_members(block_count, predecessors, edge.to, edge.from),
+            members: analysis.natural_loop_members(predecessors, edge.to, edge.from),
         });
     }
     loops
 }
 
-fn indexed_natural_loop_members(
-    block_count: usize,
-    predecessors: &[Vec<usize>],
-    header: usize,
-    latch: usize,
-) -> Vec<usize> {
-    let mut members = BTreeSet::from([header, latch]);
-    // A self-loop is complete already; walking the header would include its preheader.
-    let mut stack = if latch == header {
-        Vec::new()
-    } else {
-        vec![latch]
-    };
-    while let Some(block) = stack.pop() {
-        for predecessor in predecessors.get(block).into_iter().flatten().copied() {
-            if predecessor >= block_count || !members.insert(predecessor) {
-                continue;
-            }
-            if predecessor != header {
-                stack.push(predecessor);
-            }
-        }
-    }
-    members.into_iter().collect()
-}
-
-fn indexed_dominators(block_count: usize, predecessors: &[Vec<usize>]) -> Vec<BTreeSet<usize>> {
-    if block_count == 0 {
-        return Vec::new();
-    }
-    let all_blocks = (0..block_count).collect::<BTreeSet<_>>();
-    let mut dominators = vec![all_blocks.clone(); block_count];
-    dominators[0] = BTreeSet::from([0]);
-
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for block in 1..block_count {
-            let preds = predecessors
-                .get(block)
-                .into_iter()
-                .flatten()
-                .copied()
-                .filter(|pred| *pred < block_count)
-                .collect::<Vec<_>>();
-            let mut next = if let Some((first, rest)) = preds.split_first() {
-                let mut intersection = dominators[*first].clone();
-                for pred in rest {
-                    intersection = intersection
-                        .intersection(&dominators[*pred])
-                        .copied()
-                        .collect();
-                }
-                intersection
-            } else {
-                BTreeSet::new()
-            };
-            next.insert(block);
-            if next != dominators[block] {
-                dominators[block] = next;
-                changed = true;
-            }
-        }
-    }
-    dominators
-}
-
 fn indexed_cfg_hash(
     block_count: usize,
     edges: &[IndexedCfgEdge],
-    dominators: &[BTreeSet<usize>],
+    analysis: &ControlFlowAnalysis,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
     hash_u32(&mut hasher, block_count as u32);
@@ -1528,7 +1458,7 @@ fn indexed_cfg_hash(
         hash_u32(&mut hasher, edge.to as u32);
         hash_bytes(
             &mut hasher,
-            cfg_edge_kind_name(indexed_cfg_edge_kind(edge, dominators)).as_bytes(),
+            cfg_edge_kind_name(indexed_cfg_edge_kind(edge, analysis)).as_bytes(),
         );
     }
     format!("blake3:{}", hasher.finalize().to_hex())
@@ -1735,14 +1665,15 @@ mod tests {
     use crate::{
         BytecodePcRange, BytecodeSourceMapEntry, SonatinaContractBytecode,
         trace::{
-            EVM_VCODE_INST_KIND, SONATINA_EVM_PREPARED_INST_KIND, SONATINA_POSTOPT_INST_KIND,
-            build_pc_map, bytecode_code_object_key, bytecode_contract_key,
-            bytecode_creation_owner_key, bytecode_runtime_owner_key,
-            emit_bytecode_instruction_facts, emit_bytecode_instruction_facts_with_observability,
-            emit_codegen_facts, emit_observed_bytecode_trace_facts, emit_sonatina_trace_view_facts,
-            evm_vcode_inst_key, pc_map_entry_for_pc, push_standalone_source_file_facts,
-            sonatina_postopt_inst_key, standalone_source_file_facts, trace_source_file_key,
-            whole_file_source_span,
+            BackendTraceEmissionState, EVM_VCODE_INST_KIND, EvmBytecodeSection,
+            SONATINA_EVM_PREPARED_INST_KIND, SONATINA_POSTOPT_INST_KIND, build_pc_map,
+            bytecode_code_object_key, bytecode_contract_key, bytecode_creation_owner_key,
+            bytecode_runtime_owner_key, emit_bytecode_instruction_facts,
+            emit_bytecode_instruction_facts_with_observability, emit_codegen_facts,
+            emit_evm_bytecode_instruction_facts_with_observability,
+            emit_observed_bytecode_trace_facts, emit_sonatina_trace_view_facts, evm_vcode_inst_key,
+            pc_map_entry_for_pc, push_standalone_source_file_facts, sonatina_postopt_inst_key,
+            standalone_source_file_facts, trace_source_file_key, whole_file_source_span,
         },
     };
 
@@ -1930,7 +1861,7 @@ mod tests {
     }
 
     #[test]
-    fn bytecode_observability_links_prepared_instruction_to_postopt_lineage() {
+    fn bytecode_observability_uses_module_owned_order_independent_prepared_lineage() {
         use sonatina_codegen::{
             machinst::vcode::VCodeInst,
             object::{OBSERVABILITY_SCHEMA_VERSION, PcMapEntry, SectionObservability},
@@ -2041,6 +1972,49 @@ mod tests {
                         && edge.to.kind() == SONATINA_POSTOPT_INST_KIND
             )
         }));
+
+        let emit_sections = |sections: Vec<(&str, EvmBytecodeSection)>| {
+            let mut state = BackendTraceEmissionState::default();
+            let mut emitted = Vec::new();
+            for (section_owner, section) in sections {
+                emitted.extend(
+                    emit_evm_bytecode_instruction_facts_with_observability(
+                        section_owner,
+                        "function:test",
+                        section,
+                        None,
+                        &[0x5f],
+                        Some(sonatina_owner),
+                        Some(&observability),
+                        Some(&known),
+                        &mut state,
+                    )
+                    .unwrap(),
+                );
+            }
+            emitted
+                .iter()
+                .filter_map(|fact| match fact {
+                    TraceFact::CompilerEvent(event)
+                        if event.kind == CompilerEventKind::PreparedLineage =>
+                    {
+                        Some(event.event.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let runtime_first = emit_sections(vec![
+            ("contract:A:section:runtime", EvmBytecodeSection::Runtime),
+            ("contract:B:section:creation", EvmBytecodeSection::Creation),
+        ]);
+        let creation_first = emit_sections(vec![
+            ("contract:B:section:creation", EvmBytecodeSection::Creation),
+            ("contract:A:section:runtime", EvmBytecodeSection::Runtime),
+        ]);
+        assert_eq!(runtime_first.len(), 1);
+        assert_eq!(creation_first, runtime_first);
+        assert_eq!(runtime_first[0].owner_key(), sonatina_owner);
     }
 
     #[test]

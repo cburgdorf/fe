@@ -43,6 +43,57 @@ fn sonatina_function_names(ir: &str) -> Vec<String> {
         .collect()
 }
 
+#[test]
+fn observability_preserves_creation_and_runtime_bytecode() {
+    let source = r#"
+msg SharedMsg {
+    #[selector = 0x01]
+    Get { n: u256 } -> u256,
+}
+fn helper(n: u256) -> u256 { n + 1 }
+struct SharedStore { value: u256 }
+pub contract Shared {
+    mut store: SharedStore
+    init(n: u256) uses (mut store) { store.value = helper(n) }
+    recv SharedMsg {
+        Get { n } -> u256 { helper(n) }
+    }
+}
+"#;
+    with_top_mod_for_source("observability_equivalence.fe", source, |db, top_mod| {
+        for level in [OptLevel::O0, OptLevel::O2] {
+            let plain = fe_codegen::emit_module_sonatina_bytecode(db, top_mod, level, None)
+                .expect("ordinary bytecode compilation");
+            let observed = fe_codegen::emit_module_sonatina_bytecode_with_observability(
+                db, top_mod, level, None,
+            )
+            .expect("observable bytecode compilation");
+            assert!(!plain.is_empty());
+            assert_eq!(
+                plain.keys().collect::<Vec<_>>(),
+                observed.keys().collect::<Vec<_>>()
+            );
+            for (name, ordinary) in &plain {
+                let instrumented = &observed[name];
+                assert!(!ordinary.deploy.is_empty());
+                assert!(!ordinary.runtime.is_empty());
+                assert_eq!(
+                    ordinary.deploy, instrumented.deploy,
+                    "creation: {name}, {level:?}"
+                );
+                assert_eq!(
+                    ordinary.runtime, instrumented.runtime,
+                    "runtime: {name}, {level:?}"
+                );
+                assert!(instrumented.deploy_observability.is_some());
+                assert!(instrumented.runtime_observability.is_some());
+                assert!(ordinary.deploy_observability.is_none());
+                assert!(ordinary.runtime_observability.is_none());
+            }
+        }
+    });
+}
+
 fn sonatina_function_body<'a>(ir: &'a str, symbol_segment: &str) -> Option<&'a str> {
     let header = ir
         .lines()
