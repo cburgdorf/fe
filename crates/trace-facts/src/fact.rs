@@ -12,6 +12,7 @@ pub enum TraceFact {
     CompilerEvent(CompilerEventFact),
     Storage(StorageFact),
     Instruction(InstructionFact),
+    AttributionGap(AttributionGapFact),
     InstructionCategory(InstructionCategoryFact),
     Block(BlockFact),
     CfgEdge(CfgEdgeFact),
@@ -57,6 +58,7 @@ impl TraceFact {
             Self::CompilerEvent(_) => "compiler_event",
             Self::Storage(_) => "storage",
             Self::Instruction(_) => "instruction",
+            Self::AttributionGap(_) => "attribution_gap",
             Self::InstructionCategory(_) => "instruction_category",
             Self::Block(_) => "block",
             Self::CfgEdge(_) => "cfg_edge",
@@ -542,6 +544,50 @@ impl InstructionFact {
             function,
             index,
             mnemonic: mnemonic.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TraceFactSpec)]
+#[trace_fact(type = "attribution_gap", relation = "base_attribution_gap")]
+#[serde(deny_unknown_fields)]
+pub struct AttributionGapFact {
+    #[trace_key]
+    #[trace_ref]
+    pub instruction: OriginExportKey,
+    #[trace_col]
+    pub reason: AttributionGapReason,
+}
+
+impl AttributionGapFact {
+    pub fn new(instruction: OriginExportKey, reason: AttributionGapReason) -> Self {
+        Self {
+            instruction,
+            reason,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttributionGapReason {
+    MissingProvenance,
+    NoMachineInst,
+    LabelOrFixupOnly,
+    Synthetic,
+    Unknown,
+    MissingPcMapEntry,
+}
+
+impl AttributionGapReason {
+    pub const fn wire_enum_label(self) -> &'static str {
+        match self {
+            Self::MissingProvenance => "missing_provenance",
+            Self::NoMachineInst => "no_machine_inst",
+            Self::LabelOrFixupOnly => "label_or_fixup_only",
+            Self::Synthetic => "synthetic",
+            Self::Unknown => "unknown",
+            Self::MissingPcMapEntry => "missing_pc_map_entry",
         }
     }
 }
@@ -1828,6 +1874,25 @@ mod tests {
                 .unwrap()
                 .contains("\"origin_edge\"")
         );
+    }
+
+    #[test]
+    fn attribution_gap_wire_labels_match_serde() {
+        let reasons = [
+            AttributionGapReason::MissingProvenance,
+            AttributionGapReason::NoMachineInst,
+            AttributionGapReason::LabelOrFixupOnly,
+            AttributionGapReason::Synthetic,
+            AttributionGapReason::Unknown,
+            AttributionGapReason::MissingPcMapEntry,
+        ];
+
+        for reason in reasons {
+            assert_eq!(
+                serde_json::to_string(&reason).unwrap(),
+                format!("\"{}\"", reason.wire_enum_label())
+            );
+        }
     }
 
     #[test]

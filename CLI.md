@@ -38,8 +38,13 @@ The fact schema and relational projections already represent types, lexical
 scopes, variables, and location ranges. This does not mean the compiler
 populates all of them: the current source-local producer emits unknown types
 and absent scopes, and the EVM trace path does not provide physical variable
-location ranges. Backend unmapped reasons are validated in aggregate but are
-not yet preserved as explanations for each emitted instruction. Consumers
+location ranges. Backend unmapped reasons are validated in aggregate and
+preserved per emitted instruction as typed `attribution_gap` facts. The debug
+bundle and optional sidecar expose them as `classification_reason`, including
+missing provenance, missing machine instructions, label/fixup-only emission,
+synthetic emission, unknown backend reasons, and missing PC-map entries.
+`NoSourceAttributionEvidence` identifies an unmapped instruction without a
+more specific explanation; it does not establish why the evidence is missing. Consumers
 must not interpret these missing capabilities as complete negative evidence.
 
 Source identities belong to HIR/MIR, transformation relationships to the
@@ -53,6 +58,9 @@ stock ethdebug consumer has not been established. Trace emission compiles
 separately from ordinary build/test execution, so it is not yet a bundle bound
 to the exact artifact executed by a failing test. These developer interfaces
 are not a stable, target-neutral instrumentation format.
+
+Trace bundles currently use schema v2 and origin sidecars use v3. Version
+matching is exact; regenerate older experimental bundles and sidecars.
 
 ### Output streams
 

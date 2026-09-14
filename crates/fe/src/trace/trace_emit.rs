@@ -1045,6 +1045,37 @@ pub contract App {
             "bytecode PCs must not upgrade contextual MIR runtime origins to exact LoweredFrom edges"
         );
 
+        let snapshot = trace_facts::TraceSnapshot::new(bundle.clone()).unwrap();
+        let debug = debug_export::DebugBundle::from_snapshot(&snapshot);
+        let index = debug_export::ethdebug_origin_attribution_index(&debug).unwrap();
+        let gaps = bundle
+            .facts
+            .iter()
+            .filter_map(|fact| match fact {
+                trace_facts::TraceFact::AttributionGap(gap) => Some(gap),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !gaps.is_empty(),
+            "fixture must exercise backend attribution gaps"
+        );
+        for gap in gaps {
+            let exported = index
+                .iter()
+                .find(|entry| entry.instruction_key == gap.instruction.canonical_storage_key())
+                .expect("every emitted gap must survive into the sidecar");
+            assert_eq!(
+                exported.classification_reason.as_deref(),
+                Some(gap.reason.wire_enum_label())
+            );
+            assert_eq!(
+                exported.classification,
+                debug_export::InstructionClassification::Unmapped
+            );
+            assert!(exported.primary_source.is_none());
+        }
+
         // HIR identity is shared per body: no per-instantiation copies. Every
         // HIR source site appears exactly once bundle-wide, and no HIR owner
         // embeds a runtime instance.

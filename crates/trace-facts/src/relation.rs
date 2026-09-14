@@ -4,14 +4,15 @@ use common::origin::OriginExportKey;
 use serde::{Deserialize, Serialize};
 
 use crate::fact::{
-    BlockFact, CallFact, CfgEdgeFact, CodeObjectFact, CompilerEventFact, DisplayNameFact,
-    DynamicGasStepFact, ExecutionStepFact, ExecutionTraceSessionFact, FunctionFact, GasCostFact,
-    InlineContextFact, InstructionBlockFact, InstructionCategoryFact, InstructionExtentFact,
-    InstructionFact, LexicalScopeFact, LocationRangeFact, LogFact, LoopBlockFact, LoopFact,
-    LoopMembershipFact, MemoryAccessFact, OpcodeFact, OriginEdgeFact, OriginNodeFact,
-    PrecompileInvocationFact, ReturnDataFact, RevertFact, RuntimeCodeObjectBindingFact,
-    SelfdestructFact, SourceFileFact, SourceSpanFact, StackSampleFact, StaticGasFact,
-    StorageAccessFact, StorageFact, TraceFact, TypeFact, ValuePropertyFact, VariableFact,
+    AttributionGapFact, BlockFact, CallFact, CfgEdgeFact, CodeObjectFact, CompilerEventFact,
+    DisplayNameFact, DynamicGasStepFact, ExecutionStepFact, ExecutionTraceSessionFact,
+    FunctionFact, GasCostFact, InlineContextFact, InstructionBlockFact, InstructionCategoryFact,
+    InstructionExtentFact, InstructionFact, LexicalScopeFact, LocationRangeFact, LogFact,
+    LoopBlockFact, LoopFact, LoopMembershipFact, MemoryAccessFact, OpcodeFact, OriginEdgeFact,
+    OriginNodeFact, PrecompileInvocationFact, ReturnDataFact, RevertFact,
+    RuntimeCodeObjectBindingFact, SelfdestructFact, SourceFileFact, SourceSpanFact,
+    StackSampleFact, StaticGasFact, StorageAccessFact, StorageFact, TraceFact, TypeFact,
+    ValuePropertyFact, VariableFact,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +217,7 @@ trace_fact_registry! {
     CompilerEvent(CompilerEventFact),
     Storage(StorageFact),
     Instruction(InstructionFact),
+    AttributionGap(AttributionGapFact),
     InstructionCategory(InstructionCategoryFact),
     Block(BlockFact),
     CfgEdge(CfgEdgeFact),

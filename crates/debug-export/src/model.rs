@@ -225,6 +225,7 @@ struct DebugFactIndex<'a> {
     function_facts: BTreeMap<OriginExportKey, &'a FunctionFact>,
     function_code_objects: BTreeMap<OriginExportKey, OriginExportKey>,
     categories: BTreeMap<OriginExportKey, InstructionCategory>,
+    attribution_gaps: BTreeMap<OriginExportKey, trace_facts::AttributionGapReason>,
     source_candidate_cache: RefCell<BTreeMap<OriginExportKey, SourceCandidateResult>>,
     source_candidate_walks: Cell<usize>,
 }
@@ -238,6 +239,7 @@ impl<'a> DebugFactIndex<'a> {
         let mut function_facts = BTreeMap::new();
         let mut function_code_objects = BTreeMap::new();
         let mut categories = BTreeMap::new();
+        let mut attribution_gaps = BTreeMap::new();
 
         for fact in snapshot.facts() {
             match fact {
@@ -266,6 +268,9 @@ impl<'a> DebugFactIndex<'a> {
                 TraceFact::InstructionCategory(category) => {
                     categories.insert(category.instruction.clone(), category.category);
                 }
+                TraceFact::AttributionGap(gap) => {
+                    attribution_gaps.insert(gap.instruction.clone(), gap.reason);
+                }
                 _ => {}
             }
         }
@@ -280,6 +285,7 @@ impl<'a> DebugFactIndex<'a> {
             function_facts,
             function_code_objects,
             categories,
+            attribution_gaps,
             source_candidate_cache: RefCell::new(BTreeMap::new()),
             source_candidate_walks: Cell::new(0),
         }
@@ -450,7 +456,16 @@ impl<'a> DebugFactIndex<'a> {
 
     fn debug_instruction(&self, instruction: &InstructionFact) -> DebugInstruction {
         let source_candidates = self.source_candidates(&instruction.instruction);
-        let (classification, classification_reason) = self.classification(&source_candidates);
+        // Explicit backend gaps prohibit exact attribution even if another
+        // producer supplied a source edge for this instruction.
+        let (classification, classification_reason) =
+            match self.attribution_gaps.get(&instruction.instruction) {
+                Some(reason) => (
+                    InstructionClassification::Unmapped,
+                    Some(reason.wire_enum_label().to_string()),
+                ),
+                None => self.classification(&source_candidates),
+            };
         let primary_source = (classification == InstructionClassification::SourceMapped
             && source_candidates.exact_origins.len() == 1)
             .then(|| source_candidates.exact_origins.iter().next().cloned())
@@ -590,7 +605,10 @@ impl<'a> DebugFactIndex<'a> {
                 InstructionClassification::Unmapped,
                 Some("Unmapped".to_string()),
             ),
-            _ => (InstructionClassification::Unmapped, None),
+            _ => (
+                InstructionClassification::Unmapped,
+                Some("NoSourceAttributionEvidence".to_string()),
+            ),
         }
     }
 
@@ -970,6 +988,75 @@ mod tests {
     }
 
     #[test]
+    fn attribution_gap_reasons_survive_facts_bundle_and_sidecar() {
+        use trace_facts::{AttributionGapFact, AttributionGapReason};
+
+        for reason in [
+            AttributionGapReason::MissingProvenance,
+            AttributionGapReason::NoMachineInst,
+            AttributionGapReason::LabelOrFixupOnly,
+            AttributionGapReason::Synthetic,
+            AttributionGapReason::Unknown,
+            AttributionGapReason::MissingPcMapEntry,
+        ] {
+            let contract = key("bytecode.contract", "demo", "Demo");
+            let object = key("code.object", "demo", "runtime");
+            let function = key("bytecode.function", "demo", "runtime");
+            let instruction = key("bytecode.pc", "demo", "pc:0");
+            let facts = vec![
+                node(contract.clone()),
+                node(object.clone()),
+                node(function.clone()),
+                node(instruction.clone()),
+                TraceFact::CodeObject(trace_facts::CodeObjectFact::new(
+                    object.clone(),
+                    CodeObjectKind::EvmRuntimeBytecode,
+                    Some(contract),
+                    "evm/sonatina",
+                    None,
+                )),
+                TraceFact::Instruction(InstructionFact::new(
+                    instruction.clone(),
+                    function,
+                    0,
+                    "STOP",
+                )),
+                TraceFact::InstructionExtent(trace_facts::InstructionExtentFact::new(
+                    instruction.clone(),
+                    object,
+                    PcRange::new(0, 1),
+                    1,
+                )),
+                TraceFact::AttributionGap(AttributionGapFact::new(instruction, reason)),
+            ];
+            // Exercise the fact wire representation before projecting it.
+            let facts = serde_json::from_slice(&serde_json::to_vec(&facts).unwrap()).unwrap();
+            let bundle = DebugBundle::from_snapshot(&snapshot(facts));
+            let expected = super::wire_enum_label(&reason);
+            let debug = &bundle.instructions[0];
+            assert_eq!(debug.classification, InstructionClassification::Unmapped);
+            assert_eq!(
+                debug.classification_reason.as_deref(),
+                Some(expected.as_str())
+            );
+            assert!(debug.primary_source.is_none());
+            let artifact = crate::ethdebug::emit_ethdebug_artifact(&bundle).unwrap();
+            assert!(artifact.programs[0].instructions[0].context.is_none());
+            let index = crate::ethdebug::ethdebug_origin_attribution_index(&bundle).unwrap();
+            assert_eq!(index[0].classification_reason, debug.classification_reason);
+            let encoded = serde_json::to_value(&index).unwrap();
+            assert_eq!(encoded[0]["classification_reason"], expected);
+            let original_hash = crate::ethdebug::ethdebug_origin_attribution_hash(&index);
+            let mut tampered = index;
+            tampered[0].classification_reason = None;
+            assert_ne!(
+                original_hash,
+                crate::ethdebug::ethdebug_origin_attribution_hash(&tampered)
+            );
+        }
+    }
+
+    #[test]
     fn debug_bundle_marks_missing_source_as_unmapped() {
         let function = key("function", "demo", "main");
         let instruction = key("asm.inst", "demo", "inst:0");
@@ -997,6 +1084,10 @@ mod tests {
             InstructionClassification::Unmapped
         );
         assert_eq!(bundle.instructions[0].primary_source, None);
+        assert_eq!(
+            bundle.instructions[0].classification_reason.as_deref(),
+            Some("NoSourceAttributionEvidence")
+        );
     }
 
     #[test]
@@ -1183,6 +1274,48 @@ mod tests {
             bundle.instructions[0]
                 .all_origins
                 .contains(&generated_source)
+        );
+    }
+
+    #[test]
+    fn explicit_backend_gap_prevents_exact_source_promotion() {
+        let source = key("hir.expr", "demo", "expr:add");
+        let function = key("bytecode.function", "demo", "runtime");
+        let instruction = key("bytecode.pc", "demo", "pc:0");
+        let mut facts = source_file_and_span(key("source.file", "demo", "main.fe"), source.clone());
+        facts.extend([
+            node(function.clone()),
+            node(instruction.clone()),
+            TraceFact::Instruction(InstructionFact::new(
+                instruction.clone(),
+                function,
+                0,
+                "ADD",
+            )),
+            TraceFact::OriginEdge(OriginEdgeFact::new(
+                instruction.clone(),
+                source,
+                OriginEdgeLabel::LoweredFrom,
+                None,
+            )),
+            TraceFact::AttributionGap(trace_facts::AttributionGapFact::new(
+                instruction,
+                trace_facts::AttributionGapReason::MissingProvenance,
+            )),
+        ]);
+        let bundle = DebugBundle::from_snapshot(&snapshot(facts));
+        assert_eq!(
+            bundle.instructions[0].classification,
+            InstructionClassification::Unmapped
+        );
+        assert_eq!(
+            bundle.instructions[0].confidence,
+            AttributionConfidence::Unmapped
+        );
+        assert_eq!(bundle.instructions[0].primary_source, None);
+        assert_eq!(
+            bundle.instructions[0].classification_reason.as_deref(),
+            Some("missing_provenance")
         );
     }
 

@@ -13,7 +13,7 @@ use crate::model::{
 pub const ETHDEBUG_SCHEMA_VERSION: &str = "ethdebug/format/draft-2020-12+fe-instruction-source-v2";
 pub const ETHDEBUG_FALLBACK_PROGRAM_ID: &str = "program:runtime";
 
-const ORIGIN_ATTRIBUTION_HASH_DOMAIN: &[u8] = b"fe-ethdebug-origin-attribution-v1\0";
+const ORIGIN_ATTRIBUTION_HASH_DOMAIN: &[u8] = b"fe-ethdebug-origin-attribution-v2\0";
 const EVM_BYTECODE_INSTRUCTION_KIND: &str = "bytecode.pc";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,7 +43,33 @@ pub struct EthdebugOriginAttribution {
     pub primary_source: Option<String>,
     pub all_origins: Vec<String>,
     pub classification: InstructionClassification,
+    pub classification_reason: Option<String>,
     pub confidence: AttributionConfidence,
+}
+
+impl EthdebugOriginAttribution {
+    pub fn has_consistent_reason(&self) -> bool {
+        match (self.classification, self.classification_reason.as_deref()) {
+            (
+                InstructionClassification::SourceMapped | InstructionClassification::Ambiguous,
+                None,
+            ) => true,
+            (InstructionClassification::Synthetic, Some("SyntheticFor" | "BackendPrepared")) => {
+                true
+            }
+            (
+                InstructionClassification::Unmapped,
+                Some("Unmapped" | "NoSourceAttributionEvidence"),
+            ) => true,
+            (InstructionClassification::Unmapped, Some(reason)) => {
+                serde_json::from_value::<trace_facts::AttributionGapReason>(Value::String(
+                    reason.to_string(),
+                ))
+                .is_ok()
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -611,6 +637,7 @@ fn origin_attribution_index(
                     .map(OriginExportKey::canonical_storage_key)
                     .collect(),
                 classification: instruction.classification,
+                classification_reason: instruction.classification_reason.clone(),
                 confidence: instruction.confidence,
             }
         })
@@ -1046,6 +1073,27 @@ mod tests {
         assert_eq!(code.source.id, 7);
         assert_eq!(code.range.offset, 10);
         assert_eq!(code.range.length, 4);
+    }
+
+    #[test]
+    fn sidecar_reason_must_match_classification() {
+        let mut entry = ethdebug_origin_attribution_index(&bundle())
+            .unwrap()
+            .remove(0);
+        entry.classification = InstructionClassification::SourceMapped;
+        entry.classification_reason = None;
+        assert!(entry.has_consistent_reason());
+        entry.classification_reason = Some("missing_provenance".to_string());
+        assert!(!entry.has_consistent_reason());
+        entry.classification = InstructionClassification::Unmapped;
+        assert!(entry.has_consistent_reason());
+        for reason in [None, Some("".to_string()), Some("invented".to_string())] {
+            entry.classification_reason = reason;
+            assert!(!entry.has_consistent_reason());
+        }
+        entry.classification = InstructionClassification::Synthetic;
+        entry.classification_reason = Some("SyntheticFor".to_string());
+        assert!(entry.has_consistent_reason());
     }
 
     #[test]

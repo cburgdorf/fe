@@ -14,7 +14,7 @@ use serde_json::json;
 
 use crate::{DebugExportFormat, DevDebugCommand, DevDebugEmitArgs, DevDebugValidateArgs};
 
-const ETHDEBUG_SIDECAR_SCHEMA_VERSION: &str = "fe-ethdebug-origin-sidecar-v2";
+const ETHDEBUG_SIDECAR_SCHEMA_VERSION: &str = "fe-ethdebug-origin-sidecar-v3";
 
 pub(crate) fn run_debug_command(command: &DevDebugCommand) -> Result<String, String> {
     match command {
@@ -308,6 +308,12 @@ fn validate_sidecar(
                 debug_export::AttributionConfidence::Unmapped
             )
         );
+        if !instruction.has_consistent_reason() {
+            return Err(format!(
+                "ethdebug sidecar instruction {} has inconsistent classification/reason",
+                instruction.instruction_key
+            ));
+        }
         if !valid_attribution {
             return Err(format!(
                 "ethdebug sidecar instruction {} has inconsistent classification/confidence",

@@ -4,17 +4,18 @@ use std::fmt;
 use common::origin::OriginExportKey;
 
 use crate::fact::{
-    BlockFact, CallFact, CategorySource, CfgEdgeFact, CodeObjectFact, CompilerEventFact,
-    CompilerEventKind, CompilerPhase, DisplayNameFact, DisplayNameKind, DynamicGasStepFact,
-    ExecutionStepFact, ExecutionTraceSessionFact, FunctionFact, InlineContextFact,
-    InstructionBlockFact, InstructionCategoryFact, InstructionExtentFact, InstructionFact,
-    LexicalScopeFact, LocationExpr, LocationRangeFact, LogFact, LoopBlockFact, LoopBlockRole,
-    LoopDerivation, LoopFact, LoopMembershipFact, MemoryAccessFact, OpcodeFact, OriginEdgeFact,
-    OriginEdgeLabel, OriginEdgeTraversalClass, OriginNodeFact, PrecompileInvocationFact,
-    ReturnDataFact, RevertFact, RuntimeCodeObjectBindingFact, RuntimePcJoinConfidence,
-    RuntimeValue, RuntimeValuePolicy, SelfdestructFact, SourceFileFact, SourceSpanFact,
-    StackSampleFact, StaticGasFact, StorageAccessFact, StorageFact, StorageLocation, TraceFact,
-    TypeFact, ValueLocation, ValueProperty, ValuePropertyFact, VariableFact,
+    AttributionGapFact, BlockFact, CallFact, CategorySource, CfgEdgeFact, CodeObjectFact,
+    CompilerEventFact, CompilerEventKind, CompilerPhase, DisplayNameFact, DisplayNameKind,
+    DynamicGasStepFact, ExecutionStepFact, ExecutionTraceSessionFact, FunctionFact,
+    InlineContextFact, InstructionBlockFact, InstructionCategoryFact, InstructionExtentFact,
+    InstructionFact, LexicalScopeFact, LocationExpr, LocationRangeFact, LogFact, LoopBlockFact,
+    LoopBlockRole, LoopDerivation, LoopFact, LoopMembershipFact, MemoryAccessFact, OpcodeFact,
+    OriginEdgeFact, OriginEdgeLabel, OriginEdgeTraversalClass, OriginNodeFact,
+    PrecompileInvocationFact, ReturnDataFact, RevertFact, RuntimeCodeObjectBindingFact,
+    RuntimePcJoinConfidence, RuntimeValue, RuntimeValuePolicy, SelfdestructFact, SourceFileFact,
+    SourceSpanFact, StackSampleFact, StaticGasFact, StorageAccessFact, StorageFact,
+    StorageLocation, TraceFact, TypeFact, ValueLocation, ValueProperty, ValuePropertyFact,
+    VariableFact,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -164,6 +165,7 @@ impl TraceValidator {
         let mut edges = Vec::new();
         let mut storage = Vec::new();
         let mut instructions = Vec::new();
+        let mut attribution_gaps = Vec::new();
         let mut instruction_categories = Vec::new();
         let mut blocks = Vec::new();
         let mut cfg_edges = Vec::new();
@@ -218,6 +220,7 @@ impl TraceValidator {
                 TraceFact::CompilerEvent(event) => compiler_events.push(event),
                 TraceFact::Storage(storage_fact) => storage.push(storage_fact),
                 TraceFact::Instruction(instruction) => instructions.push(instruction),
+                TraceFact::AttributionGap(gap) => attribution_gaps.push(gap),
                 TraceFact::InstructionCategory(category) => instruction_categories.push(category),
                 TraceFact::Block(block) => blocks.push(block),
                 TraceFact::CfgEdge(edge) => cfg_edges.push(edge),
@@ -315,6 +318,17 @@ impl TraceValidator {
                     },
                 );
             }
+        }
+
+        let mut seen_attribution_gaps = BTreeSet::new();
+        for gap in attribution_gaps {
+            validate_attribution_gap(gap, &nodes, &instruction_keys, &mut diagnostics);
+            check_unique_fact_key(
+                &mut seen_attribution_gaps,
+                "attribution_gap",
+                &gap.instruction,
+                &mut diagnostics,
+            );
         }
 
         let mut block_functions = BTreeMap::new();
@@ -829,6 +843,28 @@ fn validate_instruction(
             diagnostics,
             TraceValidationError::EmptyInstructionMnemonic {
                 instruction: instruction.instruction.clone(),
+            },
+        );
+    }
+}
+
+fn validate_attribution_gap(
+    gap: &AttributionGapFact,
+    nodes: &BTreeSet<OriginExportKey>,
+    instruction_keys: &BTreeSet<OriginExportKey>,
+    diagnostics: &mut Vec<TraceValidationDiagnostic>,
+) {
+    require_node(
+        nodes,
+        &gap.instruction,
+        "attribution_gap.instruction",
+        diagnostics,
+    );
+    if !instruction_keys.contains(&gap.instruction) {
+        push_error(
+            diagnostics,
+            TraceValidationError::AttributionGapWithoutInstruction {
+                instruction: gap.instruction.clone(),
             },
         );
     }
@@ -2649,6 +2685,9 @@ pub enum TraceValidationError {
     InstructionCategoryWithoutInstruction {
         instruction: OriginExportKey,
     },
+    AttributionGapWithoutInstruction {
+        instruction: OriginExportKey,
+    },
     EmptyBlockName {
         block: OriginExportKey,
     },
@@ -2950,6 +2989,11 @@ impl fmt::Display for TraceValidationError {
             Self::InstructionCategoryWithoutInstruction { instruction } => write!(
                 f,
                 "instruction category references {} but no instruction fact defines it",
+                instruction.display_label()
+            ),
+            Self::AttributionGapWithoutInstruction { instruction } => write!(
+                f,
+                "attribution gap references {} but no instruction fact defines it",
                 instruction.display_label()
             ),
             Self::EmptyBlockName { block } => {
@@ -3328,20 +3372,20 @@ mod tests {
     use common::origin::OriginExportKey;
 
     use crate::{
-        BlockFact, CallFact, CategorySource, CfgEdgeFact, CfgEdgeKind, CodeObjectFact,
-        CodeObjectKind, CompilerEventFact, CompilerEventKind, CompilerPhase, DisplayNameFact,
-        DisplayNameKind, DynamicGasStepFact, EvmSchedule, ExecutionStepFact,
-        ExecutionTraceSessionFact, FunctionFact, GasConfidence, GasCostFact, GasKind, GasSource,
-        InlineContextFact, InstructionBlockFact, InstructionCategory, InstructionCategoryFact,
-        InstructionExtentFact, InstructionFact, LoopBlockFact, LoopBlockRole, LoopConfidence,
-        LoopDerivation, LoopFact, LoopMembershipFact, MemoryAccessFact, MemoryAccessKind,
-        OpcodeCategory, OpcodeFact, OriginEdgeFact, OriginEdgeLabel, OriginNodeFact,
-        OriginNodeKind, PcRange, RuntimeCallKind, RuntimeCaptureMode, RuntimeCodeObjectBindingFact,
-        RuntimePcJoinConfidence, RuntimeTraceDataSource, RuntimeValue, RuntimeValuePolicy,
-        SourceFileFact, SourceSpanFact, StackSampleFact, StaticGasFact, StorageAccessFact,
-        StorageAccessKind, StorageFact, StorageLocation, StorageReason, TraceFact,
-        TraceValidationDiagnostic, TraceValidationError, TraceValidationLevel,
-        TraceValidationWarning, TraceValidator,
+        AttributionGapFact, AttributionGapReason, BlockFact, CallFact, CategorySource, CfgEdgeFact,
+        CfgEdgeKind, CodeObjectFact, CodeObjectKind, CompilerEventFact, CompilerEventKind,
+        CompilerPhase, DisplayNameFact, DisplayNameKind, DynamicGasStepFact, EvmSchedule,
+        ExecutionStepFact, ExecutionTraceSessionFact, FunctionFact, GasConfidence, GasCostFact,
+        GasKind, GasSource, InlineContextFact, InstructionBlockFact, InstructionCategory,
+        InstructionCategoryFact, InstructionExtentFact, InstructionFact, LoopBlockFact,
+        LoopBlockRole, LoopConfidence, LoopDerivation, LoopFact, LoopMembershipFact,
+        MemoryAccessFact, MemoryAccessKind, OpcodeCategory, OpcodeFact, OriginEdgeFact,
+        OriginEdgeLabel, OriginNodeFact, OriginNodeKind, PcRange, RuntimeCallKind,
+        RuntimeCaptureMode, RuntimeCodeObjectBindingFact, RuntimePcJoinConfidence,
+        RuntimeTraceDataSource, RuntimeValue, RuntimeValuePolicy, SourceFileFact, SourceSpanFact,
+        StackSampleFact, StaticGasFact, StorageAccessFact, StorageAccessKind, StorageFact,
+        StorageLocation, StorageReason, TraceFact, TraceValidationDiagnostic, TraceValidationError,
+        TraceValidationLevel, TraceValidationWarning, TraceValidator,
     };
 
     fn key(kind: &str, owner: &str, local: &str) -> OriginExportKey {
@@ -3392,6 +3436,77 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn validator_accepts_one_attribution_gap_per_instruction() {
+        let function = key("bytecode.function", "fib", "runtime");
+        let instruction = key("bytecode.pc", "fib", "pc:0");
+        let facts = vec![
+            node("bytecode.function", "fib", "runtime"),
+            node("bytecode.pc", "fib", "pc:0"),
+            TraceFact::Instruction(InstructionFact::new(
+                instruction.clone(),
+                function,
+                0,
+                "STOP",
+            )),
+            TraceFact::AttributionGap(AttributionGapFact::new(
+                instruction,
+                AttributionGapReason::MissingPcMapEntry,
+            )),
+        ];
+
+        assert!(TraceValidator::validate(&facts).is_ok());
+    }
+
+    #[test]
+    fn validator_rejects_attribution_gap_without_instruction_fact() {
+        let instruction = key("bytecode.pc", "fib", "pc:0");
+        let facts = vec![
+            node("bytecode.pc", "fib", "pc:0"),
+            TraceFact::AttributionGap(AttributionGapFact::new(
+                instruction.clone(),
+                AttributionGapReason::Synthetic,
+            )),
+        ];
+
+        assert_eq!(
+            TraceValidator::validate(&facts),
+            Err(TraceValidationError::AttributionGapWithoutInstruction { instruction })
+        );
+    }
+
+    #[test]
+    fn validator_rejects_duplicate_attribution_gap_for_instruction() {
+        let function = key("bytecode.function", "fib", "runtime");
+        let instruction = key("bytecode.pc", "fib", "pc:0");
+        let facts = vec![
+            node("bytecode.function", "fib", "runtime"),
+            node("bytecode.pc", "fib", "pc:0"),
+            TraceFact::Instruction(InstructionFact::new(
+                instruction.clone(),
+                function,
+                0,
+                "STOP",
+            )),
+            TraceFact::AttributionGap(AttributionGapFact::new(
+                instruction.clone(),
+                AttributionGapReason::Synthetic,
+            )),
+            TraceFact::AttributionGap(AttributionGapFact::new(
+                instruction.clone(),
+                AttributionGapReason::Unknown,
+            )),
+        ];
+
+        assert_eq!(
+            TraceValidator::validate(&facts),
+            Err(TraceValidationError::DuplicateFactKey {
+                fact: "attribution_gap",
+                key: instruction,
+            })
+        );
     }
 
     #[test]

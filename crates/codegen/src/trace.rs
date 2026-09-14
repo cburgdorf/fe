@@ -10,13 +10,13 @@ use sonatina_codegen::object::{
 };
 use sonatina_ir::{CfgEdgeKind as SonatinaCfgEdgeKind, SonatinaTraceView};
 use trace_facts::{
-    BlockFact, CategorySource, CfgEdgeFact, CfgEdgeKind, CodeObjectFact, CodeObjectKind,
-    CompilerEventFact, CompilerEventKind, CompilerPhase, CompilerReason, DynamicGasKind,
-    EvmSchedule, FunctionFact, GasConfidence, InstructionBlockFact, InstructionCategory,
-    InstructionCategoryFact, InstructionExtentFact, InstructionFact, LoopBlockFact, LoopBlockRole,
-    LoopConfidence, LoopDerivation, LoopFact, LoopMembershipFact, OpcodeCategory, OpcodeFact,
-    OriginEdgeFact, OriginEdgeLabel, OriginNodeFact, OriginNodeKind, PcRange, SourceFileFact,
-    SourceSpanFact, StaticGasFact, TraceFact,
+    AttributionGapFact, AttributionGapReason, BlockFact, CategorySource, CfgEdgeFact, CfgEdgeKind,
+    CodeObjectFact, CodeObjectKind, CompilerEventFact, CompilerEventKind, CompilerPhase,
+    CompilerReason, DynamicGasKind, EvmSchedule, FunctionFact, GasConfidence, InstructionBlockFact,
+    InstructionCategory, InstructionCategoryFact, InstructionExtentFact, InstructionFact,
+    LoopBlockFact, LoopBlockRole, LoopConfidence, LoopDerivation, LoopFact, LoopMembershipFact,
+    OpcodeCategory, OpcodeFact, OriginEdgeFact, OriginEdgeLabel, OriginNodeFact, OriginNodeKind,
+    PcRange, SourceFileFact, SourceSpanFact, StaticGasFact, TraceFact,
 };
 
 use crate::debug::BytecodeSourceMapEntry;
@@ -759,13 +759,27 @@ fn emit_evm_bytecode_instruction_facts_with_observability(
             OriginEdgeLabel::EmittedFrom,
             Some(CompilerPhase::BytecodeEmission),
         )));
+        let pc_map_entry = pc_map_entry_for_pc(&pc_map, pc as u32);
+        let attribution_gap = match pc_map_entry {
+            Some(entry) => entry
+                .attribution
+                .unmapped_reason()
+                .map(attribution_gap_reason),
+            None => Some(AttributionGapReason::MissingPcMapEntry),
+        };
+        if let Some(reason) = attribution_gap {
+            facts.push(TraceFact::AttributionGap(AttributionGapFact::new(
+                instruction.clone(),
+                reason,
+            )));
+        }
         // Entries the backend itself marks unmapped (synthetic section units,
         // unlowered code) must not mint Sonatina joins: synthetic FuncRefs are
         // numbered per section and can collide with real functions of another
         // contract in the same module, handing this pc an exact chain into the
         // wrong contract's source.
-        if let Some(entry) = pc_map_entry_for_pc(&pc_map, pc as u32)
-            .filter(|entry| entry.attribution.unmapped_reason().is_none())
+        if let Some(entry) =
+            pc_map_entry.filter(|entry| entry.attribution.unmapped_reason().is_none())
         {
             let mut prepared_inst = None;
             if let (Some(sonatina_owner_key), Some(func)) =
@@ -878,6 +892,16 @@ fn emit_evm_bytecode_instruction_facts_with_observability(
         index += 1;
     }
     Ok(facts)
+}
+
+fn attribution_gap_reason(reason: UnmappedReason) -> AttributionGapReason {
+    match reason {
+        UnmappedReason::MissingProvenance => AttributionGapReason::MissingProvenance,
+        UnmappedReason::NoMachineInst => AttributionGapReason::NoMachineInst,
+        UnmappedReason::LabelOrFixupOnly => AttributionGapReason::LabelOrFixupOnly,
+        UnmappedReason::Synthetic => AttributionGapReason::Synthetic,
+        UnmappedReason::Unknown => AttributionGapReason::Unknown,
+    }
 }
 
 /// Build the `pc_start`-keyed lookup used by [`pc_map_entry_for_pc`].
@@ -1684,8 +1708,8 @@ fn evm_static_gas(opcode: u8) -> Option<(u64, Option<DynamicGasKind>)> {
 mod tests {
     use common::origin::OriginExportKey;
     use trace_facts::{
-        CodeObjectKind, CompilerEventKind, CompilerPhase, OriginNodeFact, OriginNodeKind,
-        TraceFact, TraceValidator,
+        AttributionGapReason, CodeObjectKind, CompilerEventKind, CompilerPhase, OriginNodeFact,
+        OriginNodeKind, TraceFact, TraceValidator,
     };
 
     use crate::{
@@ -1793,6 +1817,18 @@ mod tests {
             Some(2),
             "runtime payload appended after init code must not be decoded as creation instructions"
         );
+    }
+
+    #[test]
+    fn bytecode_trace_emits_missing_pc_map_gap_without_observability() {
+        let facts = emit_bytecode_instruction_facts("contract:Fib", "runtime", &[0x00]);
+
+        assert!(facts.iter().any(|fact| matches!(
+            fact,
+            TraceFact::AttributionGap(gap)
+                if gap.reason == AttributionGapReason::MissingPcMapEntry
+                    && gap.instruction.local_key() == "pc:0"
+        )));
     }
 
     #[test]
@@ -2415,6 +2451,13 @@ mod tests {
             None,
         )
         .unwrap();
+
+        assert!(facts.iter().any(|fact| matches!(
+            fact,
+            TraceFact::AttributionGap(gap)
+                if gap.reason == AttributionGapReason::MissingProvenance
+                    && gap.instruction.local_key() == "pc:0"
+        )));
 
         assert!(!facts.iter().any(|fact| matches!(
             fact,
