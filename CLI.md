@@ -59,8 +59,11 @@ project those facts; they must not invent missing attribution. The shared
 panic regression exercises generated-block reuse at O0, not general optimizer
 fusion or multi-parent transformation history.
 
-The debug artifact uses a Fe-specific versioned schema; compatibility with a
-stock ethdebug consumer has not been established. Trace emission compiles
+The debug artifact uses a Fe-specific versioned schema, not an upstream
+ethdebug program document. Its wrapper, absent contract definitions, and absent
+source contents require adaptation before stock-consumer use. The local
+validator checks the Fe schema, not upstream conformance or debugger behavior.
+Trace emission compiles
 separately from ordinary build/test execution, so it is not yet a bundle bound
 to the exact artifact executed by a failing test. These developer interfaces
 are not a stable, target-neutral instrumentation format.

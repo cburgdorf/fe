@@ -61,7 +61,7 @@ fn run_debug_emit(args: &DevDebugEmitArgs) -> Result<String, String> {
                  Schema: {}\n\
                  Phase: {}\n\
                  Programs: {}\n\
-                 Note: artifact is a derived view over DebugBundle. Optional Fe attribution details are experimental and have no compatibility guarantee.\n{}",
+                 Note: artifact is a Fe-specific experimental view over DebugBundle, not a stock ethdebug program document. Optional Fe attribution details have no compatibility guarantee.\n{}",
                 args.out,
                 crate::trace::format_data_source(snapshot.metadata()),
                 bundle.trace_hash,
@@ -573,7 +573,10 @@ mod tests {
         })
         .unwrap();
 
-        assert!(output.contains("derived view over DebugBundle"));
+        assert!(output.contains("view over DebugBundle"));
+        assert!(output.contains("Fe-specific experimental"));
+        assert!(output.contains("not a stock ethdebug program document"));
+        assert!(output.contains("attribution details have no compatibility guarantee"));
         assert!(output.contains("Phase: instruction-source"));
         assert!(out.exists());
         assert!(attribution_details.exists());
