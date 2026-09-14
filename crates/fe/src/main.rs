@@ -499,9 +499,9 @@ pub struct DevDebugEmitArgs {
     /// ethdebug phase; only `instruction-source` is emitted.
     #[arg(long)]
     pub phase: Option<String>,
-    /// Optional Fe origin/confidence sidecar output path for ethdebug.
+    /// Write experimental Fe attribution details (no compatibility guarantee).
     #[arg(long)]
-    pub sidecar: Option<Utf8PathBuf>,
+    pub attribution_details: Option<Utf8PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -515,9 +515,9 @@ pub struct DevDebugValidateArgs {
     /// ethdebug schema version; use `pinned` for the vendored schema.
     #[arg(long, default_value = "pinned")]
     pub schema_version: String,
-    /// Optional Fe origin/confidence sidecar to validate alongside ethdebug.
+    /// Validate experimental Fe attribution details alongside ethdebug.
     #[arg(long)]
-    pub sidecar: Option<Utf8PathBuf>,
+    pub attribution_details: Option<Utf8PathBuf>,
     /// Optional validation JSON output path.
     #[arg(long)]
     pub verify_json: Option<Utf8PathBuf>,

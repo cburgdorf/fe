@@ -1096,7 +1096,7 @@ pub contract App {
             let exported = index
                 .iter()
                 .find(|entry| entry.instruction_key == gap.instruction.canonical_storage_key())
-                .expect("every emitted gap must survive into the sidecar");
+                .expect("every emitted gap must survive into the attribution details");
             assert_eq!(
                 exported.classification_reason.as_deref(),
                 Some(gap.reason.wire_enum_label())

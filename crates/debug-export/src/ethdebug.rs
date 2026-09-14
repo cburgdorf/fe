@@ -1076,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_reason_must_match_classification() {
+    fn attribution_details_reason_must_match_classification() {
         let mut entry = ethdebug_origin_attribution_index(&bundle())
             .unwrap()
             .remove(0);
@@ -1442,7 +1442,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_validator_rejects_duplicate_instruction_keys_without_sidecar() {
+    fn artifact_validator_rejects_duplicate_instruction_keys_without_attribution_details() {
         let mut artifact = emit_ethdebug_artifact(&bundle()).unwrap();
         artifact.programs[0].instructions[1].fe_origin_key =
             artifact.programs[0].instructions[0].fe_origin_key.clone();

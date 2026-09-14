@@ -206,7 +206,7 @@ pub enum InstructionClassification {
 }
 
 /// Serde-facing label for wire-visible enum values so the bundle, artifact,
-/// and sidecar all speak the same snake_case vocabulary instead of Rust
+/// and attribution details all speak the same snake_case vocabulary instead of Rust
 /// Debug formatting.
 pub(crate) fn wire_enum_label<T: serde::Serialize + std::fmt::Debug>(value: &T) -> String {
     serde_json::to_value(value)
@@ -988,7 +988,7 @@ mod tests {
     }
 
     #[test]
-    fn attribution_gap_reasons_survive_facts_bundle_and_sidecar() {
+    fn attribution_gap_reasons_survive_facts_bundle_and_attribution_details() {
         use trace_facts::{AttributionGapFact, AttributionGapReason};
 
         for reason in [
