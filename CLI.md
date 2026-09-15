@@ -56,13 +56,18 @@ evidence.
 Source identities belong to HIR/MIR, transformation relationships to the
 transform that knows them, and emitted layout to the backend/linker. Exporters
 project those facts; they must not invent missing attribution. The shared
-panic regression exercises generated-block reuse at O0, not general optimizer
-fusion or multi-parent transformation history.
+panic regression exercises generated-block reuse at O0/O2 in both statement
+orders. A separate optimized mask canary checks a surviving constant's source
+against genuine contributors and a live neighboring expression. These are
+bounded semantic checks, not general optimizer fusion or multi-parent history.
 
 The debug artifact uses a Fe-specific versioned schema, not an upstream
 ethdebug program document. Its wrapper, absent contract definitions, and absent
 source contents require adaptation before stock-consumer use. The local
 validator checks the Fe schema, not upstream conformance or debugger behavior.
+Code-object export accepts the typed EVM creation and runtime kinds only;
+native, unknown, and mixed EVM/unsupported bundles are rejected rather than
+partially exported. The attribution index uses the same admission rule.
 Trace emission compiles
 separately from ordinary build/test execution, so it is not yet a bundle bound
 to the exact artifact executed by a failing test. These developer interfaces
