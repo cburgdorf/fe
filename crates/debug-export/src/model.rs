@@ -7,9 +7,10 @@ use common::origin::OriginExportKey;
 use serde::{Deserialize, Serialize};
 use trace_facts::trace_index::{TraceIndex as SemanticTraceIndex, TraceReachabilityPolicy};
 use trace_facts::{
-    CodeObjectFact, FunctionFact, GasCostFact, GasKind, InstructionCategory, InstructionExtentFact,
-    InstructionFact, LocationRangeFact, OpcodeFact, OriginEdgeFact, OriginEdgeTraversalClass,
-    PcRange, SourceSpanFact, StaticGasFact, TraceDataSource, TraceFact, TraceSnapshot,
+    CodeObjectFact, CodeObjectKind, FunctionFact, GasCostFact, GasKind, InstructionCategory,
+    InstructionExtentFact, InstructionFact, LocationRangeFact, OpcodeFact, OriginEdgeFact,
+    OriginEdgeTraversalClass, PcRange, SourceSpanFact, StaticGasFact, TraceDataSource, TraceFact,
+    TraceSnapshot,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,7 +100,7 @@ pub struct DebugSourceSpan {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DebugCodeObject {
     pub key: OriginExportKey,
-    pub kind: String,
+    pub kind: CodeObjectKind,
     pub owner_function_or_contract: Option<OriginExportKey>,
     pub target: String,
     pub code_hash: Option<String>,
@@ -674,7 +675,7 @@ fn is_precise_source_candidate(origin: &OriginExportKey) -> bool {
 fn debug_code_object(code_object: &CodeObjectFact) -> DebugCodeObject {
     DebugCodeObject {
         key: code_object.code_object.clone(),
-        kind: wire_enum_label(&code_object.kind),
+        kind: code_object.kind,
         owner_function_or_contract: code_object.owner_function_or_contract.clone(),
         target: code_object.target.clone(),
         code_hash: code_object.code_hash.clone(),

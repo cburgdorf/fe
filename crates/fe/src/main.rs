@@ -493,10 +493,10 @@ pub struct DevDebugEmitArgs {
     /// Output artifact path.
     #[arg(long)]
     pub out: Utf8PathBuf,
-    /// ethdebug schema version; use `pinned` for the vendored schema.
+    /// Fe-specific ethdebug view schema; use `pinned` for the vendored schema.
     #[arg(long, default_value = "pinned")]
     pub schema_version: String,
-    /// ethdebug phase; only `instruction-source` is emitted.
+    /// Fe-specific view phase; only `instruction-source` is emitted.
     #[arg(long)]
     pub phase: Option<String>,
     /// Write experimental Fe attribution details (no compatibility guarantee).
@@ -512,10 +512,10 @@ pub struct DevDebugValidateArgs {
     /// Input artifact path.
     #[arg(long)]
     pub input: Utf8PathBuf,
-    /// ethdebug schema version; use `pinned` for the vendored schema.
+    /// Fe-specific ethdebug view schema; use `pinned` for the vendored schema.
     #[arg(long, default_value = "pinned")]
     pub schema_version: String,
-    /// Validate experimental Fe attribution details alongside ethdebug.
+    /// Validate experimental Fe attribution details alongside the Fe-specific view.
     #[arg(long)]
     pub attribution_details: Option<Utf8PathBuf>,
     /// Optional validation JSON output path.

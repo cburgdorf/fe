@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use common::origin::OriginExportKey;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
+use trace_facts::CodeObjectKind;
 use url::Url;
 
 use crate::model::{
@@ -555,6 +556,7 @@ struct ProjectedEthdebugInstruction<'a> {
 fn projected_ethdebug_instructions(
     bundle: &DebugBundle,
 ) -> Result<Vec<ProjectedEthdebugInstruction<'_>>, String> {
+    reject_unsupported_code_objects(bundle)?;
     let instructions = bundle
         .instructions
         .iter()
@@ -734,16 +736,32 @@ fn source_registry(
 /// environment, creation bytecode as a create environment. Creation objects
 /// must not be silently dropped just because runtime objects exist.
 fn evm_code_objects(bundle: &DebugBundle) -> Vec<&DebugCodeObject> {
-    let evm = bundle
+    bundle
         .code_objects
         .iter()
-        .filter(|code_object| code_object.kind.to_ascii_lowercase().contains("bytecode"))
-        .collect::<Vec<_>>();
-    if evm.is_empty() {
-        bundle.code_objects.iter().collect()
-    } else {
-        evm
+        .filter(|code_object| {
+            matches!(
+                code_object.kind,
+                CodeObjectKind::EvmRuntimeBytecode | CodeObjectKind::EvmCreationBytecode
+            )
+        })
+        .collect()
+}
+
+fn reject_unsupported_code_objects(bundle: &DebugBundle) -> Result<(), String> {
+    if let Some(code_object) = bundle.code_objects.iter().find(|code_object| {
+        !matches!(
+            code_object.kind,
+            CodeObjectKind::EvmRuntimeBytecode | CodeObjectKind::EvmCreationBytecode
+        )
+    }) {
+        return Err(format!(
+            "ethdebug export does not support code object {} of kind {:?}",
+            code_object.key.canonical_storage_key(),
+            code_object.kind
+        ));
     }
+    Ok(())
 }
 
 fn program_for_instructions(
@@ -811,10 +829,12 @@ fn source_context(
 }
 
 fn environment_for(code_object: &DebugCodeObject) -> EthdebugEnvironment {
-    if code_object.kind.to_ascii_lowercase().contains("creation") {
-        EthdebugEnvironment::Create
-    } else {
-        EthdebugEnvironment::Call
+    match code_object.kind {
+        CodeObjectKind::EvmCreationBytecode => EthdebugEnvironment::Create,
+        CodeObjectKind::EvmRuntimeBytecode => EthdebugEnvironment::Call,
+        CodeObjectKind::NativeObject | CodeObjectKind::Unknown => {
+            unreachable!("unsupported code objects are rejected before program projection")
+        }
     }
 }
 
@@ -851,7 +871,7 @@ mod tests {
 
     use common::origin::OriginExportKey;
     use serde_json::Value;
-    use trace_facts::PcRange;
+    use trace_facts::{CodeObjectKind, PcRange};
 
     use crate::model::{
         AttributionConfidence, AttributionPolicyVersion, CompilerInfo, DebugBundle,
@@ -908,7 +928,7 @@ mod tests {
             }],
             code_objects: vec![DebugCodeObject {
                 key: code_object.clone(),
-                kind: "EvmRuntimeBytecode".to_string(),
+                kind: CodeObjectKind::EvmRuntimeBytecode,
                 owner_function_or_contract: Some(contract),
                 target: "evm/sonatina".to_string(),
                 code_hash: Some(
@@ -962,7 +982,7 @@ mod tests {
         let contract = bundle.code_objects[0].owner_function_or_contract.clone();
         bundle.code_objects.push(DebugCodeObject {
             key: creation.clone(),
-            kind: "evm_creation_bytecode".to_string(),
+            kind: CodeObjectKind::EvmCreationBytecode,
             owner_function_or_contract: contract,
             target: "evm/sonatina".to_string(),
             code_hash: None,
@@ -1005,6 +1025,41 @@ mod tests {
     }
 
     #[test]
+    fn ethdebug_rejects_native_and_unknown_code_objects() {
+        for unsupported_kind in [CodeObjectKind::NativeObject, CodeObjectKind::Unknown] {
+            let mut candidate = bundle();
+            candidate.code_objects[0].kind = unsupported_kind;
+
+            let err = emit_ethdebug_artifact(&candidate).unwrap_err();
+            assert!(err.contains("does not support code object"));
+            assert!(err.contains(&format!("{unsupported_kind:?}")));
+            assert_eq!(
+                ethdebug_origin_attribution_index(&candidate).unwrap_err(),
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn ethdebug_rejects_mixed_evm_and_unsupported_code_objects() {
+        let mut candidate = bundle();
+        candidate.code_objects.push(DebugCodeObject {
+            key: key("code.object", "demo", "native"),
+            kind: CodeObjectKind::NativeObject,
+            owner_function_or_contract: None,
+            target: "native".to_string(),
+            code_hash: None,
+        });
+
+        let err = emit_ethdebug_artifact(&candidate).unwrap_err();
+        assert!(err.contains("NativeObject"));
+        assert_eq!(
+            ethdebug_origin_attribution_index(&candidate).unwrap_err(),
+            err
+        );
+    }
+
+    #[test]
     fn code_object_programs_require_explicit_bytecode_contract_owners() {
         let mut missing = bundle();
         missing.code_objects[0].owner_function_or_contract = None;
@@ -1033,7 +1088,7 @@ mod tests {
         let beta_object = key("code.object", "demo", "beta-runtime");
         bundle.code_objects.push(DebugCodeObject {
             key: beta_object.clone(),
-            kind: "evm_runtime_bytecode".to_string(),
+            kind: CodeObjectKind::EvmRuntimeBytecode,
             owner_function_or_contract: Some(key("bytecode.contract", "demo", "Beta")),
             target: "evm/sonatina".to_string(),
             code_hash: None,

@@ -1,4 +1,5 @@
 mod lower_runtime;
+pub(crate) mod observability;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -1105,7 +1106,8 @@ fn emit_runtime_module_sonatina_bytecode_with_options(
                 runtime,
                 deploy_observability,
                 runtime_observability,
-            },
+            }
+            .checked(&object_name, emit_observability)?,
         );
     }
     Ok((out, postopt_trace_facts))

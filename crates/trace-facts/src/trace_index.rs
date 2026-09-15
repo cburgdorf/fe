@@ -336,7 +336,7 @@ fn is_backend_phase_origin_kind(kind: &str) -> bool {
 }
 
 pub(crate) fn is_sonatina_postopt_origin_kind(kind: &str) -> bool {
-    kind.starts_with("sonatina.post")
+    kind.starts_with("sonatina.postopt.")
 }
 
 pub(crate) fn is_prepared_codegen_origin_kind(kind: &str) -> bool {
@@ -398,7 +398,7 @@ mod tests {
         TraceBundle, TraceFact, TraceMetadata, TraceSnapshot, TraceValidationError,
     };
 
-    use super::{TraceIndex, TracePhase, TraceReachabilityPolicy};
+    use super::{TraceIndex, TracePhase, TraceReachabilityPolicy, is_sonatina_postopt_origin_kind};
 
     fn key(kind: &str, owner: &str, local: &str) -> OriginExportKey {
         OriginExportKey::try_from_raw_parts(kind, owner, local).unwrap()
@@ -488,6 +488,26 @@ mod tests {
             &backend,
             TraceReachabilityPolicy::ExactPlusContextual
         ));
+    }
+
+    #[test]
+    fn postopt_kind_predicate_accepts_emitted_namespace_only() {
+        for kind in [
+            "sonatina.postopt.inst",
+            "sonatina.postopt.block",
+            "sonatina.postopt.function",
+            "sonatina.postopt.loop",
+        ] {
+            assert!(is_sonatina_postopt_origin_kind(kind), "{kind}");
+        }
+        for kind in [
+            "sonatina.post.inst",
+            "sonatina.postoptimization.inst",
+            "sonatina.postopt",
+            "sonatina.postoptical.inst",
+        ] {
+            assert!(!is_sonatina_postopt_origin_kind(kind), "{kind}");
+        }
     }
 
     #[test]

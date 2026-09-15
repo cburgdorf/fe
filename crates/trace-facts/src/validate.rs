@@ -17,6 +17,7 @@ use crate::fact::{
     StorageLocation, TraceFact, TypeFact, ValueLocation, ValueProperty, ValuePropertyFact,
     VariableFact,
 };
+use crate::trace_index::is_sonatina_postopt_origin_kind;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TraceValidationSummary {
@@ -959,10 +960,6 @@ fn validate_edge_semantics(
 
 fn is_bytecode_origin_kind(kind: &str) -> bool {
     kind == "bytecode.pc" || kind.starts_with("bytecode.")
-}
-
-fn is_sonatina_postopt_origin_kind(kind: &str) -> bool {
-    kind.starts_with("sonatina.postopt.")
 }
 
 fn is_prepared_codegen_origin_kind(kind: &str) -> bool {

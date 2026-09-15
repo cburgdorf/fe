@@ -95,7 +95,7 @@ fn run_debug_validate(args: &DevDebugValidateArgs) -> Result<String, String> {
             write_validation_json(args.verify_json.as_ref(), verification)?;
             let report = outcome?;
             Ok(format!(
-                "ethdebug validation passed: {}\nPrograms: {}\nAttribution details consistency checked: {}\n",
+                "Fe-specific ethdebug view validation passed: {}\nPrograms: {}\nAttribution details consistency checked: {}\nNote: this validates the pinned Fe view schema, not upstream ethdebug conformance.\n",
                 args.input, report.program_count, report.attribution_details_consistency_checked,
             ))
         }
@@ -138,7 +138,7 @@ fn ensure_ethdebug_schema(value: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "unsupported ethdebug schema version {value}; expected `pinned` or {ETHDEBUG_SCHEMA_VERSION}"
+            "unsupported Fe-specific ethdebug view schema version {value}; expected `pinned` or {ETHDEBUG_SCHEMA_VERSION}"
         ))
     }
 }
@@ -978,7 +978,7 @@ mod tests {
     fn ethdebug_schema_is_pinned() {
         let err = ensure_ethdebug_schema("future").unwrap_err();
 
-        assert!(err.contains("unsupported ethdebug schema version"));
+        assert!(err.contains("unsupported Fe-specific ethdebug view schema version"));
     }
 
     #[test]
