@@ -705,9 +705,7 @@ struct FunctionLowerer<'ctx, 'db, 'a> {
     slot_roots: FxHashMap<RLocalId, SlotRoot>,
     checked_indices: FxHashMap<(RLocalId, u64), ValueId>,
     pending_enum_proof: Option<PendingEnumProof<'db>>,
-    empty_revert_block: Option<BlockId>,
-    overflow_panic_block: Option<BlockId>,
-    division_by_zero_panic_block: Option<BlockId>,
+    shared_helper_blocks: FxHashMap<SharedHelperKind, BlockId>,
     /// Instructions of shared helper blocks (see [`build_shared_helper`]).
     shared_helper_insts: FxHashSet<InstId>,
     shared_helpers: Vec<SharedHelperBlock>,
@@ -722,6 +720,12 @@ struct FunctionLowerer<'ctx, 'db, 'a> {
 struct SharedHelperBlock {
     insts: Vec<InstId>,
     origins: Vec<OriginExportKey>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum SharedHelperKind {
+    EmptyRevert,
+    Panic(u64),
 }
 
 #[derive(Clone, Copy)]
@@ -781,9 +785,7 @@ impl<'ctx, 'db, 'a> FunctionLowerer<'ctx, 'db, 'a> {
             slot_roots: FxHashMap::default(),
             checked_indices: FxHashMap::default(),
             pending_enum_proof: None,
-            empty_revert_block: None,
-            overflow_panic_block: None,
-            division_by_zero_panic_block: None,
+            shared_helper_blocks: FxHashMap::default(),
             shared_helper_insts: FxHashSet::default(),
             shared_helpers: Vec::new(),
             shared_helper_index_by_block: FxHashMap::default(),
@@ -901,9 +903,11 @@ impl<'ctx, 'db, 'a> FunctionLowerer<'ctx, 'db, 'a> {
 
     /// Record that the statement currently being lowered jumps to `block`.
     fn request_shared_helper(&mut self, block: BlockId) {
-        if let Some(&index) = self.shared_helper_index_by_block.get(&block)
-            && !self.pending_shared_helpers.contains(&index)
-        {
+        let &index = self
+            .shared_helper_index_by_block
+            .get(&block)
+            .expect("shared helper requests require registered ownership");
+        if !self.pending_shared_helpers.contains(&index) {
             self.pending_shared_helpers.push(index);
         }
     }
@@ -4831,58 +4835,35 @@ impl<'ctx, 'db, 'a> FunctionLowerer<'ctx, 'db, 'a> {
         })
     }
 
-    fn ensure_empty_revert_block(&mut self) -> BlockId {
-        if let Some(block) = self.empty_revert_block {
+    fn get_or_build_shared_helper(&mut self, kind: SharedHelperKind) -> BlockId {
+        if let Some(&block) = self.shared_helper_blocks.get(&kind) {
             self.request_shared_helper(block);
             return block;
         }
-        let revert_block = self.build_shared_helper(|this| {
-            let revert_block = this.fb.append_block();
+        let block = self.build_shared_helper(|this| {
+            let block = this.fb.append_block();
             let current = this
                 .fb
                 .current_block()
-                .expect("overflow block requires current block");
-            this.fb.switch_to_block(revert_block);
-            let zero = zero_for_type(&mut this.fb, Type::I256);
-            this.fb
-                .insert_inst_no_result(EvmRevert::new(this.module.inst_set(), zero, zero));
+                .expect("shared helper requires current block");
+            this.fb.switch_to_block(block);
+            match kind {
+                SharedHelperKind::EmptyRevert => {
+                    let zero = zero_for_type(&mut this.fb, Type::I256);
+                    this.fb.insert_inst_no_result(EvmRevert::new(
+                        this.module.inst_set(),
+                        zero,
+                        zero,
+                    ));
+                }
+                SharedHelperKind::Panic(code) => this.emit_panic_revert_payload(code),
+            }
             this.fb.switch_to_block(current);
-            revert_block
+            block
         });
-        self.empty_revert_block = Some(revert_block);
-        revert_block
-    }
-
-    fn ensure_panic_revert_block(&mut self, code: u64) -> BlockId {
-        if code == PANIC_OVERFLOW
-            && let Some(block) = self.overflow_panic_block
-        {
-            self.request_shared_helper(block);
-            return block;
-        }
-        if code == PANIC_DIVISION_BY_ZERO
-            && let Some(block) = self.division_by_zero_panic_block
-        {
-            self.request_shared_helper(block);
-            return block;
-        }
-        let revert_block = self.build_shared_helper(|this| {
-            let revert_block = this.fb.append_block();
-            let current = this
-                .fb
-                .current_block()
-                .expect("panic block requires current block");
-            this.fb.switch_to_block(revert_block);
-            this.emit_panic_revert_payload(code);
-            this.fb.switch_to_block(current);
-            revert_block
-        });
-        match code {
-            PANIC_OVERFLOW => self.overflow_panic_block = Some(revert_block),
-            PANIC_DIVISION_BY_ZERO => self.division_by_zero_panic_block = Some(revert_block),
-            _ => {}
-        }
-        revert_block
+        let replaced = self.shared_helper_blocks.insert(kind, block);
+        debug_assert!(replaced.is_none(), "shared helper was registered twice");
+        block
     }
 
     fn emit_panic_revert_payload(&mut self, code: u64) {
@@ -4908,7 +4889,7 @@ impl<'ctx, 'db, 'a> FunctionLowerer<'ctx, 'db, 'a> {
     }
 
     fn emit_empty_revert(&mut self, overflow_flag: ValueId) -> Result<(), LowerError> {
-        let revert_block = self.ensure_empty_revert_block();
+        let revert_block = self.get_or_build_shared_helper(SharedHelperKind::EmptyRevert);
         let continue_block = self.fb.append_block();
         self.fb.insert_inst_no_result(Br::new(
             self.module.inst_set(),
@@ -4921,7 +4902,7 @@ impl<'ctx, 'db, 'a> FunctionLowerer<'ctx, 'db, 'a> {
     }
 
     fn emit_panic_revert(&mut self, overflow_flag: ValueId, code: u64) -> Result<(), LowerError> {
-        let revert_block = self.ensure_panic_revert_block(code);
+        let revert_block = self.get_or_build_shared_helper(SharedHelperKind::Panic(code));
         let continue_block = self.fb.append_block();
         self.fb.insert_inst_no_result(Br::new(
             self.module.inst_set(),
@@ -4942,7 +4923,7 @@ impl<'ctx, 'db, 'a> FunctionLowerer<'ctx, 'db, 'a> {
     }
 
     fn emit_unconditional_empty_revert<T>(&mut self) -> Lowered<T> {
-        let revert_block = self.ensure_empty_revert_block();
+        let revert_block = self.get_or_build_shared_helper(SharedHelperKind::EmptyRevert);
         self.fb
             .insert_inst_no_result(Jump::new(self.module.inst_set(), revert_block));
         Lowered::Terminated

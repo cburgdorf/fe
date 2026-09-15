@@ -834,12 +834,40 @@ pub contract App {
     /// source line for every later overflow, over an exact attribution chain.
     #[test]
     fn shared_panic_blocks_are_not_attributed_to_one_statement() {
+        let path = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/trace/shared_panic.fe");
+        assert_shared_panic_attribution(&path, codegen::OptLevel::O0);
+    }
+
+    #[test]
+    fn shared_panic_attribution_survives_optimization_and_request_order() {
+        let original = include_str!("../../tests/fixtures/trace/shared_panic.fe");
+        let reordered = original.replace(
+            "let x: u32 = a + b\n            let y: u32 = b + c\n            let z: u32 = a + c",
+            "let z: u32 = a + c\n            let y: u32 = b + c\n            let x: u32 = a + b",
+        );
+        assert_ne!(
+            original, reordered,
+            "fixture reorder must change request order"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        for (order, source) in [original, reordered.as_str()].into_iter().enumerate() {
+            let path =
+                Utf8PathBuf::from_path_buf(temp.path().join(format!("panic_order_{order}.fe")))
+                    .unwrap();
+            std::fs::write(&path, source).unwrap();
+            for level in [codegen::OptLevel::O0, codegen::OptLevel::O2] {
+                assert_shared_panic_attribution(&path, level);
+            }
+        }
+    }
+
+    fn assert_shared_panic_attribution(path: &Utf8PathBuf, level: codegen::OptLevel) {
         // Locate the shared overflow path through the actual branch targets
         // of the three authored checks. Other REVERTs belong to ABI helpers
         // and may legitimately retain their own source attribution.
-        let path = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/trace/shared_panic.fe");
-        let bundle = emit_real_trace_bundle(&path, false, "dev", codegen::OptLevel::O0)
+        let source_text = std::fs::read_to_string(path).unwrap();
+        let bundle = emit_real_trace_bundle(path, false, "dev", level)
             .expect("shared panic fixture should compile");
         let snapshot = TraceSnapshot::new(bundle).unwrap();
         let debug = debug_export::DebugBundle::from_snapshot(&snapshot);
@@ -852,7 +880,7 @@ pub contract App {
         let fixture_file = &debug
             .sources
             .iter()
-            .find(|source| source.uri.ends_with("shared_panic.fe"))
+            .find(|source| source.uri.ends_with(path.file_name().unwrap()))
             .expect("fixture source must be recorded")
             .file_key;
         let opcodes = snapshot
@@ -868,7 +896,13 @@ pub contract App {
             .collect::<std::collections::BTreeMap<_, _>>();
         let addition_lines = ["a + b", "b + c", "a + c"]
             .into_iter()
-            .map(|needle| fixture_line("shared_panic.fe", needle))
+            .map(|needle| {
+                source_text
+                    .lines()
+                    .position(|line| line.contains(needle))
+                    .expect("authored addition must occur in fixture") as u32
+                    + 1
+            })
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
             addition_lines.len(),
@@ -904,7 +938,7 @@ pub contract App {
                     candidate.code_object == check.code_object
                         && candidate.pc_range.end == check.pc_range.start
                 })
-                .expect("O0 overflow check must have an adjacent target push");
+                .expect("overflow check must have an adjacent target push");
             let opcode = opcodes
                 .get(&push.key)
                 .expect("target push needs opcode evidence");
