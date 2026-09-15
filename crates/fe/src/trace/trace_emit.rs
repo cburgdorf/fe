@@ -349,12 +349,11 @@ fn render_json<T: Serialize>(value: &T) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use dir_test::{Fixture, dir_test};
 
-    #[test]
-    fn shared_init_runtime_function_has_unique_backend_facts() {
-        let path = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/trace/shared_init_runtime.fe");
+    #[dir_test(dir: "$CARGO_MANIFEST_DIR/tests/fixtures/trace", glob: "shared_init_runtime.fe")]
+    fn shared_init_runtime_function_has_unique_backend_facts(fixture: Fixture<&str>) {
+        let path = Utf8PathBuf::from(fixture.path());
         let bundle = emit_real_trace_bundle(&path, true, "dev", codegen::OptLevel::O0).unwrap();
         let snapshot = TraceSnapshot::new(bundle).unwrap();
         // Keep the regression meaningful: both sections must retain their PC
@@ -385,92 +384,32 @@ mod tests {
 
     #[test]
     fn standalone_file_input_returns_canonical_trace_identity() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "fe-trace-standalone-canonical-{}-{unique}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("input.fe");
+        // This test exercises actual filesystem canonicalization and URL
+        // encoding, so it intentionally uses a temporary file, not dir_test.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Grüße Contract.fe");
         std::fs::write(&path, "pub contract Demo {}\n").unwrap();
-        let relative = Utf8PathBuf::from_path_buf(path).unwrap();
+        let input = Utf8PathBuf::from_path_buf(path).unwrap();
 
-        let (canonical, file_url, content) = standalone_file_input(&relative).unwrap();
+        let (canonical, file_url, content) = standalone_file_input(&input).unwrap();
 
         assert!(canonical.is_absolute());
         assert_eq!(file_url.scheme(), "file");
+        // Windows canonicalization may use an extended-length prefix that
+        // file URLs do not retain. Compare canonical paths, not spellings.
+        assert_eq!(
+            file_url.to_file_path().unwrap().canonicalize().unwrap(),
+            canonical.as_std_path()
+        );
         assert_eq!(content, "pub contract Demo {}\n");
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn ingot_trace_bundle_covers_all_runtime_modules() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+    #[dir_test(dir: "$CARGO_MANIFEST_DIR/tests/fixtures/trace/packages/multi_module", glob: "fe.toml")]
+    fn ingot_trace_bundle_covers_all_runtime_modules(fixture: Fixture<&str>) {
+        let root = Utf8PathBuf::from(fixture.path())
+            .parent()
             .unwrap()
-            .as_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("fe-trace-ingot-{}-{unique}", std::process::id()));
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(
-            dir.join("fe.toml"),
-            "[ingot]\nname = \"trace_ingot_demo\"\nversion = \"0.1.0\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("src/lib.fe"),
-            r#"
-msg AlphaMsg {
-    #[selector = 0x01]
-    Get {} -> u32,
-}
-
-struct AlphaStore {
-    value: u32,
-}
-
-pub contract Alpha {
-    mut store: AlphaStore
-
-    init() uses (mut store) {
-        store.value = 1
-    }
-
-    recv AlphaMsg {
-        Get {} -> u32 uses (store) {
-            return store.value
-        }
-    }
-}
-"#,
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("src/beta.fe"),
-            r#"
-msg BetaMsg {
-    #[selector = 0x02]
-    Sum { a: u32, b: u32 } -> u32,
-}
-
-struct BetaStore {}
-
-pub contract Beta {
-    store: BetaStore
-
-    recv BetaMsg {
-        Sum { a, b } -> u32 {
-            return a + b
-        }
-    }
-}
-"#,
-        )
-        .unwrap();
-        let root = Utf8PathBuf::from_path_buf(dir.clone()).unwrap();
+            .to_path_buf();
 
         let bundle = emit_real_trace_bundle(&root, false, "dev", codegen::OptLevel::O1).unwrap();
         // The validator is the dedup gate: shared std bodies emitted from both
@@ -586,8 +525,6 @@ pub contract Beta {
                 .any(|instruction| instruction.context.is_some()),
             "the explicit init section should retain source attribution"
         );
-
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -644,24 +581,27 @@ pub contract Beta {
     }
 
     /// Source lines that bytecode of the given mnemonic claims in `fixture`.
-    fn attributed_lines(fixture: &str, mnemonic: &str) -> std::collections::BTreeSet<u32> {
-        let path = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join(format!("tests/fixtures/trace/{fixture}"));
+    fn attributed_lines(
+        fixture: &Fixture<&str>,
+        mnemonic: &str,
+    ) -> std::collections::BTreeSet<u32> {
+        let path = Utf8PathBuf::from(fixture.path());
+        let (_, source_uri, _) = standalone_file_input(&path).unwrap();
         let bundle = emit_real_trace_bundle(&path, false, "dev", codegen::OptLevel::O0).unwrap();
         let snapshot = TraceSnapshot::new(bundle).unwrap();
         let debug = debug_export::DebugBundle::from_snapshot(&snapshot);
-        attributed_lines_from_debug(&debug, fixture, mnemonic)
+        attributed_lines_from_debug(&debug, &source_uri, mnemonic)
     }
 
     fn attributed_lines_from_debug(
         debug: &debug_export::DebugBundle,
-        fixture: &str,
+        source_uri: &Url,
         mnemonic: &str,
     ) -> std::collections::BTreeSet<u32> {
         let fixture_files = debug
             .sources
             .iter()
-            .filter(|source| source.uri.ends_with(fixture))
+            .filter(|source| source.uri == source_uri.as_str())
             .map(|source| source.file_key.clone())
             .collect::<std::collections::BTreeSet<_>>();
         assert!(
@@ -693,10 +633,9 @@ pub contract Beta {
     /// A bundle asserts compiler-emitted provenance, so emission must refuse a
     /// target the compiler rejects instead of describing bytecode that cannot
     /// be built.
-    #[test]
-    fn emission_refuses_targets_that_do_not_compile() {
-        let path = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/trace/does_not_compile.fe");
+    #[dir_test(dir: "$CARGO_MANIFEST_DIR/tests/fixtures/trace", glob: "does_not_compile.fe")]
+    fn emission_refuses_targets_that_do_not_compile(fixture: Fixture<&str>) {
+        let path = Utf8PathBuf::from(fixture.path());
 
         let err = emit_real_trace_bundle(&path, false, "dev", codegen::OptLevel::O0)
             .expect_err("emission must refuse a target that does not compile");
@@ -707,10 +646,9 @@ pub contract Beta {
         );
     }
 
-    #[test]
-    fn emission_refuses_standalone_main_for_contract_trace() {
-        let path = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/trace/standalone_main.fe");
+    #[dir_test(dir: "$CARGO_MANIFEST_DIR/tests/fixtures/trace", glob: "standalone_main.fe")]
+    fn emission_refuses_standalone_main_for_contract_trace(fixture: Fixture<&str>) {
+        let path = Utf8PathBuf::from(fixture.path());
 
         let err = emit_real_trace_bundle(&path, true, "dev", codegen::OptLevel::O0)
             .expect_err("standalone main must not be presented as contract trace");
@@ -724,75 +662,12 @@ pub contract Beta {
     /// `fe check` includes dependency diagnostics, so compiler-emitted trace
     /// provenance must reject an otherwise valid target with a broken
     /// dependency as well.
-    #[test]
-    fn emission_refuses_targets_with_dependencies_that_do_not_compile() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+    #[dir_test(dir: "$CARGO_MANIFEST_DIR/tests/fixtures/trace/packages/broken_dependency", glob: "fe.toml")]
+    fn emission_refuses_targets_with_dependencies_that_do_not_compile(fixture: Fixture<&str>) {
+        let app = Utf8PathBuf::from(fixture.path())
+            .parent()
             .unwrap()
-            .as_nanos();
-        let workspace = std::env::temp_dir().join(format!(
-            "fe-trace-broken-dependency-{}-{unique}",
-            std::process::id()
-        ));
-        let app = workspace.join("ingots/app");
-        let dependency = workspace.join("ingots/dep");
-        std::fs::create_dir_all(app.join("src")).unwrap();
-        std::fs::create_dir_all(dependency.join("src")).unwrap();
-        std::fs::write(
-            workspace.join("fe.toml"),
-            r#"[workspace]
-name = "trace_broken_dependency"
-version = "0.1.0"
-members = [
-  { path = "ingots/app", name = "app" },
-  { path = "ingots/dep", name = "dep" },
-]
-"#,
-        )
-        .unwrap();
-        std::fs::write(
-            app.join("fe.toml"),
-            r#"[ingot]
-name = "app"
-version = "0.1.0"
-
-[dependencies]
-dep = true
-"#,
-        )
-        .unwrap();
-        std::fs::write(
-            app.join("src/lib.fe"),
-            r#"msg AppMsg {
-    #[selector = 0x01]
-    Get {} -> u32,
-}
-
-struct AppStore {}
-
-pub contract App {
-    store: AppStore
-
-    recv AppMsg {
-        Get {} -> u32 {
-            return 1
-        }
-    }
-}
-"#,
-        )
-        .unwrap();
-        std::fs::write(
-            dependency.join("fe.toml"),
-            "[ingot]\nname = \"dep\"\nversion = \"0.1.0\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dependency.join("src/lib.fe"),
-            "fn broken() -> NoSuchType {}\n",
-        )
-        .unwrap();
-        let app = Utf8PathBuf::from_path_buf(app).unwrap();
+            .join("ingots/app");
 
         let err = emit_real_trace_bundle(&app, false, "dev", codegen::OptLevel::O0)
             .expect_err("emission must refuse a target with a broken dependency");
@@ -801,26 +676,24 @@ pub contract App {
             err.contains("dependencies do not compile"),
             "error should identify the broken dependency, got {err:?}"
         );
-        std::fs::remove_dir_all(workspace).unwrap();
     }
 
     /// 1-based line of the first occurrence of `needle` in a trace fixture.
-    fn fixture_line(fixture: &str, needle: &str) -> u32 {
-        let path = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join(format!("tests/fixtures/trace/{fixture}"));
-        let text = std::fs::read_to_string(&path).unwrap();
-        text.lines()
+    fn fixture_line(fixture: &Fixture<&str>, needle: &str) -> u32 {
+        fixture
+            .content()
+            .lines()
             .position(|line| line.contains(needle))
             .map(|index| index as u32 + 1)
-            .unwrap_or_else(|| panic!("{fixture} should contain {needle:?}"))
+            .unwrap_or_else(|| panic!("{} should contain {needle:?}", fixture.path()))
     }
 
     /// A compiler-generated panic block with exactly one requesting statement
     /// is genuinely that statement's, so it keeps its attribution.
-    #[test]
-    fn single_user_panic_blocks_stay_attributed() {
-        let addition = fixture_line("single_panic.fe", "a + b");
-        let revert_lines = attributed_lines("single_panic.fe", "REVERT");
+    #[dir_test(dir: "$CARGO_MANIFEST_DIR/tests/fixtures/trace", glob: "single_panic.fe")]
+    fn single_user_panic_blocks_stay_attributed(fixture: Fixture<&str>) {
+        let addition = fixture_line(&fixture, "a + b");
+        let revert_lines = attributed_lines(&fixture, "REVERT");
 
         assert!(
             revert_lines.contains(&addition),
@@ -832,33 +705,21 @@ pub contract App {
     /// checked-arithmetic site in the function. It must not be attributed to
     /// whichever statement happened to create it first: that reports the wrong
     /// source line for every later overflow, over an exact attribution chain.
-    #[test]
-    fn shared_panic_blocks_are_not_attributed_to_one_statement() {
-        let path = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/trace/shared_panic.fe");
-        assert_shared_panic_attribution(&path, codegen::OptLevel::O0);
-    }
-
-    #[test]
-    fn shared_panic_attribution_survives_optimization_and_request_order() {
-        let original = include_str!("../../tests/fixtures/trace/shared_panic.fe");
-        let reordered = original.replace(
-            "let x: u32 = a + b\n            let y: u32 = b + c\n            let z: u32 = a + c",
-            "let z: u32 = a + c\n            let y: u32 = b + c\n            let x: u32 = a + b",
+    #[dir_test(dir: "$CARGO_MANIFEST_DIR/tests/fixtures/trace", glob: "shared_panic*.fe")]
+    fn shared_panic_attribution_survives_optimization_and_request_order(fixture: Fixture<&str>) {
+        let path = Utf8PathBuf::from(fixture.path());
+        let expected_order = match path.file_name().unwrap() {
+            "shared_panic.fe" => ["a + b", "b + c", "a + c"],
+            "shared_panic_reordered.fe" => ["a + c", "b + c", "a + b"],
+            name => panic!("declare the expected request order for {name}"),
+        };
+        let lines = expected_order.map(|needle| fixture_line(&fixture, needle));
+        assert!(
+            lines[0] < lines[1] && lines[1] < lines[2],
+            "fixture must exercise its declared request order"
         );
-        assert_ne!(
-            original, reordered,
-            "fixture reorder must change request order"
-        );
-        let temp = tempfile::tempdir().unwrap();
-        for (order, source) in [original, reordered.as_str()].into_iter().enumerate() {
-            let path =
-                Utf8PathBuf::from_path_buf(temp.path().join(format!("panic_order_{order}.fe")))
-                    .unwrap();
-            std::fs::write(&path, source).unwrap();
-            for level in [codegen::OptLevel::O0, codegen::OptLevel::O2] {
-                assert_shared_panic_attribution(&path, level);
-            }
+        for level in [codegen::OptLevel::O0, codegen::OptLevel::O2] {
+            assert_shared_panic_attribution(&path, level);
         }
     }
 
@@ -866,7 +727,7 @@ pub contract App {
         // Locate the shared overflow path through the actual branch targets
         // of the three authored checks. Other REVERTs belong to ABI helpers
         // and may legitimately retain their own source attribution.
-        let source_text = std::fs::read_to_string(path).unwrap();
+        let (_, source_uri, source_text) = standalone_file_input(path).unwrap();
         let bundle = emit_real_trace_bundle(path, false, "dev", level)
             .expect("shared panic fixture should compile");
         let snapshot = TraceSnapshot::new(bundle).unwrap();
@@ -880,7 +741,7 @@ pub contract App {
         let fixture_file = &debug
             .sources
             .iter()
-            .find(|source| source.uri.ends_with(path.file_name().unwrap()))
+            .find(|source| source.uri == source_uri.as_str())
             .expect("fixture source must be recorded")
             .file_key;
         let opcodes = snapshot
@@ -1003,10 +864,9 @@ pub contract App {
         );
     }
 
-    #[test]
-    fn real_trace_bundle_compiles_fib_demo_without_fixture_claims() {
-        let path =
-            Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/trace/fib_demo.fe");
+    #[dir_test(dir: "$CARGO_MANIFEST_DIR/tests/fixtures/trace", glob: "fib_demo.fe")]
+    fn real_trace_bundle_compiles_fib_demo_without_fixture_claims(fixture: Fixture<&str>) {
+        let path = Utf8PathBuf::from(fixture.path());
         let bundle = emit_real_trace_bundle(&path, false, "dev", codegen::OptLevel::O2).unwrap();
         let summary = TraceValidator::validate(&bundle.facts).unwrap();
 
@@ -1172,14 +1032,11 @@ pub contract App {
         }
     }
 
-    #[test]
-    fn real_trace_maps_unique_literal_to_its_emitted_push() {
-        let fixture = "source_marker.fe";
+    #[dir_test(dir: "$CARGO_MANIFEST_DIR/tests/fixtures/trace", glob: "source_marker.fe")]
+    fn real_trace_maps_unique_literal_to_its_emitted_push(fixture: Fixture<&str>) {
         let marker = "0x123456789abcde";
-        let path = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/trace")
-            .join(fixture);
-        let source = std::fs::read_to_string(&path).unwrap();
+        let path = Utf8PathBuf::from(fixture.path());
+        let (_, source_uri, source) = standalone_file_input(&path).unwrap();
         let marker_start = source
             .find(marker)
             .expect("source marker should be present") as u32;
@@ -1191,7 +1048,7 @@ pub contract App {
         let authored_files = debug
             .sources
             .iter()
-            .filter(|source| source.uri.ends_with(fixture))
+            .filter(|source| source.uri == source_uri.as_str())
             .map(|source| source.file_key.clone())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(

@@ -1,4 +1,5 @@
 use common::InputDb;
+use dir_test::{Fixture, dir_test};
 use driver::DriverDataBase;
 use fe_codegen::{OptLevel, trace};
 use trace_facts::{TraceBundle, TraceFact, TraceMetadata, TraceSnapshot};
@@ -7,12 +8,11 @@ use url::Url;
 const CONTRIBUTOR: &str = "0x123456789abcde";
 const ADJACENT: &str = "0x223456789abcde";
 
-fn snapshot(source: &str, opt_level: OptLevel) -> TraceSnapshot {
+fn snapshot(source: &str, file_url: &Url, opt_level: OptLevel) -> TraceSnapshot {
     let mut db = DriverDataBase::default();
-    let file_url = Url::parse("file:///trace_semantic_canary.fe").unwrap();
     db.workspace()
         .touch(&mut db, file_url.clone(), Some(source.to_string()));
-    let file = db.workspace().get(&db, &file_url).unwrap();
+    let file = db.workspace().get(&db, file_url).unwrap();
     let top_mod = db.top_mod(file);
     let facts = trace::emit_observable_module_trace_facts(
         &db,
@@ -20,7 +20,7 @@ fn snapshot(source: &str, opt_level: OptLevel) -> TraceSnapshot {
             top_mod,
             input_owner_key: file_url.as_str(),
             source_uri: file_url.as_str(),
-            source_display_name: "trace_semantic_canary.fe",
+            source_display_name: "mask_elimination.fe",
             source_text: source,
             opt_level,
             contract: None,
@@ -31,7 +31,7 @@ fn snapshot(source: &str, opt_level: OptLevel) -> TraceSnapshot {
         "test",
         "evm/sonatina",
         vec!["trace-semantic-canary".to_string()],
-        "trace_semantic_canary.fe",
+        file_url.as_str(),
         vec![format!("optimize={opt_level}")],
     );
     TraceSnapshot::new(TraceBundle::new(metadata, facts)).unwrap()
@@ -64,31 +64,30 @@ fn immediate_push_origins(
         .collect()
 }
 
-#[test]
-fn o2_mask_elimination_preserves_contributing_source_and_rejects_adjacent_source() {
-    let source = r#"
-msg CanaryMsg {
-    #[selector = 0x01]
-    Get { n: u256, m: u256 } -> u256,
-}
-
-pub contract Canary {
-    recv CanaryMsg {
-        Get { n, m } -> u256 {
-            let unrelated = m & 0x223456789abcde
-            let first = n & 0x123456789abcde
-            let second = n & 0x123456789abcde
-            return (first | second) ^ unrelated
-        }
+#[dir_test(
+    dir: "$CARGO_MANIFEST_DIR/tests/fixtures/trace_semantic_canary",
+    glob: "*.fe"
+)]
+fn o2_mask_elimination_preserves_contributing_source_and_rejects_adjacent_source(
+    fixture: Fixture<&str>,
+) {
+    let file_url = Url::from_file_path(fixture.path()).expect("fixture path should be absolute");
+    // Exercise both checkout line endings on every host. The exact variant
+    // bytes are supplied to the compiler and used by the source-span oracle.
+    let lf = test_utils::normalize::normalize_newlines(fixture.content());
+    let crlf = lf.replace('\n', "\r\n");
+    for source in [lf.as_ref(), crlf.as_str()] {
+        assert_mask_attribution(source, &file_url);
     }
 }
-"#;
+
+fn assert_mask_attribution(source: &str, file_url: &Url) {
     let first = byte_range(source, "let first = n & 0x123456789abcde");
     let second = byte_range(source, "let second = n & 0x123456789abcde");
     let adjacent = byte_range(source, "let unrelated = m & 0x223456789abcde");
 
-    let o0 = snapshot(source, OptLevel::O0);
-    let o2 = snapshot(source, OptLevel::O2);
+    let o0 = snapshot(source, file_url, OptLevel::O0);
+    let o2 = snapshot(source, file_url, OptLevel::O2);
     let o0_contributors = immediate_push_origins(&o0, CONTRIBUTOR);
     let o2_contributors = immediate_push_origins(&o2, CONTRIBUTOR);
 
@@ -135,9 +134,7 @@ pub contract Canary {
         .facts()
         .iter()
         .find_map(|fact| match fact {
-            TraceFact::SourceFile(file) if file.uri == "file:///trace_semantic_canary.fe" => {
-                Some(&file.file_key)
-            }
+            TraceFact::SourceFile(file) if file.uri == file_url.as_str() => Some(&file.file_key),
             _ => None,
         })
         .expect("canary source file must be recorded");
