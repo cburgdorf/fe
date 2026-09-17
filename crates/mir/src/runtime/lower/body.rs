@@ -11,7 +11,7 @@ use hir::analysis::{
         SemanticInstance, SemanticInstanceKey, SemanticLocalKind, VariantIndex,
         borrowck::{
             NBorrowRoot, NEffectArg, NExpr, NLocalOrigin, NOperand, NSPlace, NSPlaceRoot, NSStmt,
-            NSStmtKind, NSTerminator, NSTerminatorKind, NormalizedSemanticBody,
+            NSStmtKind, NSTerminator, NSTerminatorKind, NormalizedSemanticBody, ReadMode,
             normalize_semantic_body,
         },
         eval_const_ref, get_or_build_semantic_instance, layout_evidence_body,
@@ -1284,11 +1284,41 @@ impl<'db> RmirEmitter<'db> {
             NExpr::Use(src) => {
                 let value = self.lower_semantic_operand_for_class(bb, *src, &dst_class);
                 let value = self.coerce_value_if_needed(bb, value, &dst_class);
+                // An object ref can be the runtime representation of an owned
+                // aggregate. Copying that value must not alias its backing object.
+                // Borrow/capability types, on the other hand, copy the handle.
+                let copies_aggregate = src.mode == ReadMode::Copy
+                    && self.semantic_value_class(src.local).as_ref() == Some(&dst_class)
+                    && matches!(
+                        dst_class,
+                        RuntimeClass::Ref {
+                            kind: RefKind::Object,
+                            view: RefView::Whole,
+                            ..
+                        }
+                    )
+                    && matches!(
+                        stored_class_for_ty_in_env(
+                            self.db,
+                            self.env,
+                            self.locals[dst.index()].semantic_ty,
+                        ),
+                        RuntimeClass::AggregateValue { .. }
+                    );
                 self.push_stmt(
                     bb,
                     RStmt::Assign {
                         dst,
-                        expr: RExpr::Use(value),
+                        expr: if copies_aggregate {
+                            RExpr::MaterializePlaceToObject {
+                                place: RuntimePlace {
+                                    root: PlaceRoot::Ref(value),
+                                    path: Box::default(),
+                                },
+                            }
+                        } else {
+                            RExpr::Use(value)
+                        },
                     },
                 );
             }
