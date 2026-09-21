@@ -197,10 +197,14 @@ fn verify_synthetic_function<'db>(
             RuntimeSyntheticSpec::ContractInitRoot { .. } => {
                 verify_has_terminator(body, |term| matches!(term, RTerminator::ReturnData { .. }))
             }
+            // Value-returning ABI wrappers terminate through ContractHost::return_value.
+            // verify_runtime_body has already checked that terminal calls target a
+            // non-returning callee with a matching signature.
             RuntimeSyntheticSpec::ContractRecvAbi { .. } => verify_has_terminator(body, |term| {
                 matches!(
                     term,
                     RTerminator::ReturnData { .. }
+                        | RTerminator::TerminalCall { .. }
                         | RTerminator::Revert { .. }
                         | RTerminator::RevertEmpty
                 )
