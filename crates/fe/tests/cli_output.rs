@@ -2233,6 +2233,7 @@ pub contract Foo uses (log: mut Log) {
         .find(|entry| entry["type"] == "event" && entry["name"] == "Transfer")
         .expect("event entry");
 
+    assert_eq!(event["anonymous"], false);
     assert_eq!(event["inputs"][0]["name"], "value");
     assert_eq!(event["inputs"][0]["type"], "uint256");
     assert!(
