@@ -1,1 +1,0 @@
-Fix an internal borrow-check error when reading a field through a pointer returned by a call, such as `pick(a, b).value`. Also fix silently lost writes when a `mut self` method call or a `with` binding reaches a value through a temporary pointer, such as `(*f()).set(1)` or `with ((*f()).counter) { ... }`: the call or effect now updates the pointee instead of a copy.

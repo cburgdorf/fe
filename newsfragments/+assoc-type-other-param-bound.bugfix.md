@@ -1,1 +1,0 @@
-Report `U::Name` and `Self::Name` as not found when only the bound on a different type parameter declares `Name`. For example, in `fn f<T: Arrow, U>(_ x: U::Dom)` and in `trait Eval<T: Arrow> { fn eval(_ x: Self::Dom) }`, the name used to resolve silently to `T::Dom`.

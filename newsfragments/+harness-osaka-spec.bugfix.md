@@ -1,1 +1,0 @@
-Run `fe test` and the contract test harness under Osaka rules, the EVM revision Fe compiles for. Previously tests executed with Prague rules, so Osaka instructions such as `CLZ` halted with `NotActivated`. The Osaka per-transaction gas cap (EIP-7825) is lifted for tests.

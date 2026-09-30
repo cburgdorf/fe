@@ -1,1 +1,0 @@
-Added `core::num::leading_zeros` and `core::num::trailing_zeros` for `u256`. Both return 256 for zero. `leading_zeros` compiles to the EVM `CLZ` instruction (EIP-7939) and to a branch-free bit search for native targets; both functions are also available in constant evaluation.

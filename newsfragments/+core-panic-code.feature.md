@@ -1,1 +1,0 @@
-Added `core::panic_code(code)`, which reverts with the Solidity `Panic(uint256)` payload, and the `core::panics::PANIC_*` constants (re-exported from `std::evm::panic`). Out-of-bounds `core::ptr` accesses now revert with `Panic(0x32)` instead of `INVALID`. On native targets the call traps.

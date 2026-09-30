@@ -1,1 +1,0 @@
-Fix parsing of generic arguments that start with a qualified path, such as `Wrapped<<T as Model>::Point>`. The `<<` is no longer mistaken for a left shift, so the argument now belongs to `Wrapped` in type position, in expression position, and in a method call such as `wrapped.pick<<T as Model>::Point>(value)`.

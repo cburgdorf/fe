@@ -1,1 +1,0 @@
-Teach the tree-sitter grammar the generic arguments that start with a qualified path, such as `Wrapped<<M as Model>::Point>::new(point)`. The compiler already accepted these in expression position while the grammar reported an error, so editors flagged valid code. A `<<` that is not followed by a qualified path is still a left shift.
