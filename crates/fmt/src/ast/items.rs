@@ -7,6 +7,7 @@ use parser::ast::{
     self, ImplItemKind, ItemKind, ItemModifierOwner, TraitItemKind, prelude::AstNode,
 };
 
+use super::attr::attr_lines;
 use super::types::{
     Doc, ToDoc, TokenPiece, block_list_auto, block_list_spaced_auto, block_list_with_comments,
     hardlines, has_comment_tokens, intersperse, newline_count, token_doc, token_doc_until_token,
@@ -227,6 +228,28 @@ fn node_leading_newlines(ctx: &RewriteContext, node: &parser::SyntaxNode) -> usi
     count
 }
 
+/// Counts newlines in a node's trailing trivia (after its last non-trivia
+/// token or child node).
+fn node_trailing_newlines(ctx: &RewriteContext, node: &parser::SyntaxNode) -> usize {
+    use parser::syntax_kind::SyntaxKind;
+    use parser::syntax_node::NodeOrToken;
+
+    let mut count = 0;
+    let mut child = node.last_child_or_token();
+    while let Some(current) = child {
+        match &current {
+            NodeOrToken::Token(token) => match token.kind() {
+                SyntaxKind::Newline => count += newline_count(ctx.snippet(token.text_range())),
+                SyntaxKind::WhiteSpace => {}
+                _ => break,
+            },
+            NodeOrToken::Node(_) => break,
+        }
+        child = current.prev_sibling_or_token();
+    }
+    count
+}
+
 /// Format a block of items `{ ... }`, preserving whether there was a blank line
 /// between entries in the source (2+ newlines => one blank line; otherwise none).
 /// Takes a syntax node and a function to cast child nodes to the item type.
@@ -244,7 +267,14 @@ fn block_items_doc<'a, T: ToDoc>(
     let mut is_first = true;
 
     for child in syntax.children_with_tokens() {
+        let mut newlines_after_entry = 0usize;
         let entry_doc = match child {
+            // A module's inner attributes (`#![...]`) come before its items.
+            // The line breaks after them belong to the attribute list node.
+            NodeOrToken::Node(node) if ast::AttrList::can_cast(node.kind()) => {
+                newlines_after_entry = node_trailing_newlines(ctx, &node);
+                ast::AttrList::cast(node).and_then(|attrs| attr_lines(&attrs, ctx))
+            }
             NodeOrToken::Node(node) => {
                 let Some(item) = cast_fn(node.clone()) else {
                     continue;
@@ -280,7 +310,7 @@ fn block_items_doc<'a, T: ToDoc>(
             inner = inner.append(hardlines(alloc, pending_newlines));
         }
 
-        pending_newlines = 0;
+        pending_newlines = newlines_after_entry;
         inner = inner.append(entry_doc);
     }
 
