@@ -350,7 +350,16 @@ impl<'db> Func<'db> {
 
             // Then run kind/const checks on the lowered semantic type
             let ret = self.return_ty(db);
-            let span = self.span().ret_ty().into();
+            let span: DynLazySpan<'db> = self.span().ret_ty().into();
+            if let Some(diag) = ty::ty_error::normalization_limit_diag(
+                db,
+                ret,
+                self.scope(),
+                self.assumptions(db),
+                span.clone(),
+            ) {
+                return vec![diag];
+            }
             if !ret.has_star_kind(db) {
                 diags.push(TyLowerDiag::ExpectedStarKind(span).into());
             } else if ret.is_const_ty(db) {

@@ -2652,6 +2652,14 @@ impl DiagnosticVoucher for TyLowerDiag<'_> {
                 error_code,
             ),
 
+            Self::TypeNormalizationLimit(span) => primary_diag(
+                Severity::Error,
+                "type normalization limit exceeded",
+                "the associated types here cannot be resolved within the limit",
+                span.resolve(db),
+                error_code,
+            ),
+
             Self::NonTrailingDefaultGenericParam(span) => primary_diag(
                 Severity::Error,
                 "generic parameters with a default must be trailing",

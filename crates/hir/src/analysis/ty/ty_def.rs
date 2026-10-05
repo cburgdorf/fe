@@ -1222,6 +1222,10 @@ pub enum InvalidCause<'db> {
     /// silently invalid.
     TypeLoweringCycle,
 
+    /// Normalizing this type needed more nested projections, or larger ones,
+    /// than the normalizer allows.
+    TypeNormalizationLimit,
+
     // TraitConstraintNotSat(PredicateId),
     ParseError,
 
@@ -1310,6 +1314,7 @@ impl InvalidCause<'_> {
             }
             InvalidCause::ConstEvalRecursiveConst { .. } => "ConstEvalRecursiveConst".into(),
             InvalidCause::TypeLoweringCycle => "TypeLoweringCycle".into(),
+            InvalidCause::TypeNormalizationLimit => "TypeNormalizationLimit".into(),
         }
     }
 }

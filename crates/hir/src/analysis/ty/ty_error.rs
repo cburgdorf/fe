@@ -16,6 +16,7 @@ use crate::analysis::{
 use super::{
     const_ty::{ConstBodyLowering, ConstTyData, HoleAnchor, LoweringContext, ty_is_fully_ground},
     diagnostics::{TyDiagCollection, TyLowerDiag},
+    normalize::normalize_ty,
     trait_resolution::PredicateListId,
     ty_def::{InvalidCause, TyData, TyId},
     ty_lower::lower_hir_ty_in_mode,
@@ -80,9 +81,30 @@ fn collect_hir_ty_diags_in_mode<'db>(
 
     // Fall back to semantic errors
     let ty = lower_hir_ty_in_mode(db, hir_ty, scope, assumptions, const_bodies);
-    emit_invalid_ty_error(db, ty, span.into())
+    if let Some(diag) = emit_invalid_ty_error(db, ty, span.clone().into()) {
+        return vec![diag];
+    }
+
+    normalization_limit_diag(db, ty, scope, assumptions, span.into())
         .into_iter()
         .collect()
+}
+
+/// Projections in a written type are resolved only when the type is
+/// normalized. Report one that cannot be resolved within the normalization
+/// limits where it is written: elsewhere it would be an invalid type, which
+/// matches any type.
+pub(crate) fn normalization_limit_diag<'db>(
+    db: &'db dyn HirAnalysisDb,
+    ty: TyId<'db>,
+    scope: ScopeId<'db>,
+    assumptions: PredicateListId<'db>,
+    span: DynLazySpan<'db>,
+) -> Option<TyDiagCollection<'db>> {
+    (ty.has_projection(db)
+        && first_invalid_ty_cause(db, normalize_ty(db, ty, scope, assumptions))
+            == Some(InvalidCause::TypeNormalizationLimit))
+    .then(|| TyLowerDiag::TypeNormalizationLimit(span).into())
 }
 
 pub fn collect_ty_lower_errors<'db>(
@@ -668,6 +690,8 @@ pub(crate) fn diag_from_invalid_cause<'db>(
         }
 
         InvalidCause::TypeLoweringCycle => TyLowerDiag::TypeLoweringCycle(span).into(),
+
+        InvalidCause::TypeNormalizationLimit => TyLowerDiag::TypeNormalizationLimit(span).into(),
 
         InvalidCause::NotAType(_) => return None,
 
