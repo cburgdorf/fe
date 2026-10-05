@@ -90,7 +90,7 @@ impl DriverDataBase {
     }
 
     pub fn emit_complete_diagnostics(&self, diagnostics: &[CompleteDiagnostic]) {
-        let writer = BufferWriter::stderr(ColorChoice::Auto);
+        let writer = BufferWriter::stderr(stderr_color_choice());
         let mut buffer = writer.buffer();
         let config = term::Config::default();
         let mut diagnostics = diagnostics.to_vec();
@@ -120,6 +120,15 @@ impl DriverDataBase {
     }
 }
 
+/// The `--color` preference for diagnostics written to standard error.
+fn stderr_color_choice() -> ColorChoice {
+    if common::color::should_colorize(common::color::ColorTarget::Stderr) {
+        ColorChoice::Always
+    } else {
+        ColorChoice::Never
+    }
+}
+
 fn initialize_mir_diagnostics_pass() -> AnalysisPassManager {
     let mut pass_manager = AnalysisPassManager::new();
     pass_manager.add_module_pass("SemanticBorrow", Box::new(SemanticBorrowAnalysisPass));
@@ -140,7 +149,7 @@ impl DiagnosticsCollection<'_> {
     }
 
     pub fn emit(&self, db: &DriverDataBase) {
-        let writer = BufferWriter::stderr(ColorChoice::Auto);
+        let writer = BufferWriter::stderr(stderr_color_choice());
         let mut buffer = writer.buffer();
         let config = term::Config::default();
 
