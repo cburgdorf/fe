@@ -378,6 +378,8 @@ impl<'db> Func<'db> {
             // Then run kind/const checks on the lowered semantic type
             let ret = self.return_ty(db);
             let span: DynLazySpan<'db> = self.span().ret_ty().into();
+            let solve_cx = ty::trait_resolution::TraitSolveCx::new(db, self.scope())
+                .with_assumptions(param_env(db, self.into()));
             if let Some(diag) = ty::ty_error::normalization_limit_diag(
                 db,
                 ret,
@@ -394,23 +396,25 @@ impl<'db> Func<'db> {
             } else if ty::ty_contains_const_hole(db, ret) {
                 diags.push(TyLowerDiag::ConstHoleInValuePosition { span, ty: ret }.into());
             } else if let ty::trait_resolution::WellFormedness::IllFormed { goal, subgoal } =
-                ty::trait_resolution::check_ty_wf(
-                    db,
-                    ty::trait_resolution::TraitSolveCx::new(db, self.scope())
-                        .with_assumptions(param_env(db, self.into())),
-                    ret,
-                )
+                ty::trait_resolution::check_ty_wf(db, solve_cx, ret)
             {
-                diags.push(
-                    TraitConstraintDiag::TraitBoundNotSat {
-                        span,
-                        primary_goal: goal,
-                        unsat_subgoal: subgoal,
-                        required_by: None,
-                        capability_hint: None,
-                    }
-                    .into(),
-                );
+                // Point at the written type inside a qualified path when that
+                // is what is ill-formed.
+                let precise = self.ret_ty_qualified_path_wf_diags(db, solve_cx);
+                if precise.is_empty() {
+                    diags.push(
+                        TraitConstraintDiag::TraitBoundNotSat {
+                            span,
+                            primary_goal: goal,
+                            unsat_subgoal: subgoal,
+                            required_by: None,
+                            capability_hint: None,
+                        }
+                        .into(),
+                    );
+                } else {
+                    diags.extend(precise);
+                }
             }
         }
         diags
