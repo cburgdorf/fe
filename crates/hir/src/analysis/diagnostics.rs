@@ -3573,6 +3573,25 @@ impl DiagnosticVoucher for BodyDiag<'_> {
                 )
             }
 
+            Self::CallReturnTypeConstFault { call, fault } => {
+                let mut diag = fault.to_complete(db);
+                for sub in &mut diag.sub_diagnostics {
+                    if sub.style == LabelStyle::Primary {
+                        sub.style = LabelStyle::Secondary;
+                    }
+                }
+                diag.sub_diagnostics.insert(
+                    0,
+                    SubDiagnostic::new(
+                        LabelStyle::Primary,
+                        "in the return type of this call".into(),
+                        call.resolve(db),
+                    ),
+                );
+                diag.error_code = error_code;
+                diag
+            }
+
             Self::StaticAssertFailed {
                 primary,
                 comparison,

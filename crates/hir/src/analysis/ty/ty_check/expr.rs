@@ -68,7 +68,7 @@ use crate::analysis::ty::{
     },
     ty_check::callable::{Callable, EffectProviderProvenance, EffectProviderSpecialization},
     ty_def::{CapabilityKind, PrimTy, TyBase, TyData, prim_int_bits},
-    ty_error::first_invalid_ty_cause,
+    ty_error::{diag_from_invalid_cause, first_invalid_ty_cause, is_const_eval_fault},
     unify::UnificationTable,
 };
 use crate::analysis::{
@@ -1453,6 +1453,7 @@ impl<'db> TyChecker<'db> {
 
         let ret_ty = callable.ret_ty(self.db);
         let normalized_ret_ty = self.normalize_ty(ret_ty);
+        self.report_instantiated_const_fault(&callable, normalized_ret_ty, expr);
         if let Some(kind) = self.const_intrinsic_kind(callable.callable_def()) {
             if !self.check_and_register_const_intrinsic(expr, callable, kind) {
                 return ExprProp::invalid(self.db);
@@ -1461,6 +1462,37 @@ impl<'db> TyChecker<'db> {
             self.env.register_semantic_call(expr, callable);
         }
         ExprProp::new(normalized_ret_ty, true)
+    }
+
+    /// A callee's return type with the call's generic arguments filled in can
+    /// hold a const that fails to evaluate only now, such as `S<{N - 5}>` at
+    /// `N = 2`. The failure leaves an invalid type, which matches any type and
+    /// so would let the call pass checking. Report it instead.
+    fn report_instantiated_const_fault(
+        &mut self,
+        callable: &Callable<'db>,
+        ret_ty: TyId<'db>,
+        expr: ExprId,
+    ) {
+        // A failure already in the declared return type is reported with the
+        // callee's signature.
+        let declared = callable
+            .callable_def()
+            .ret_ty(self.db)
+            .instantiate_identity();
+        if declared.has_invalid(self.db) {
+            return;
+        }
+        let call: DynLazySpan<'db> = expr.span(self.body()).into();
+        if let Some(cause) = first_invalid_ty_cause(self.db, ret_ty)
+            && is_const_eval_fault(&cause)
+            && let Some(fault) = diag_from_invalid_cause(call.clone(), &cause)
+        {
+            self.push_diag(BodyDiag::CallReturnTypeConstFault {
+                call,
+                fault: Box::new(fault),
+            });
+        }
     }
 
     fn check_assert(&mut self, expr: ExprId, args: &[HirCallArg<'db>]) -> ExprProp<'db> {
@@ -3487,6 +3519,7 @@ impl<'db> TyChecker<'db> {
 
         let ret_ty = callable.ret_ty(self.db);
         let normalized_ret_ty = self.normalize_ty(ret_ty);
+        self.report_instantiated_const_fault(&callable, normalized_ret_ty, expr);
         if let Some(kind) = self.const_intrinsic_kind(callable.callable_def()) {
             if !self.check_and_register_const_intrinsic(expr, callable, kind) {
                 return ExprProp::invalid(self.db);
