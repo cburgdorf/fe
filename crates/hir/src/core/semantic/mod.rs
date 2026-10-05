@@ -5080,7 +5080,12 @@ impl<'db> TraitAssocTypeView<'db> {
 }
 
 impl<'db> AssocTypeBoundView<'db> {
-    fn trait_ref(self, db: &'db dyn HirDb) -> TraitRefId<'db> {
+    /// Position of this bound in the associated type's bound list.
+    pub(crate) fn index(self) -> usize {
+        self.idx
+    }
+
+    pub(crate) fn trait_ref(self, db: &'db dyn HirDb) -> TraitRefId<'db> {
         match self.owner.bounds_raw(db)[self.idx] {
             TypeBound::Trait(tr) => tr,
             _ => unreachable!(),
