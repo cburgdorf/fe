@@ -186,6 +186,7 @@ pub enum TyLowerDiag<'db> {
     ConstEvalRecursionLimitExceeded(DynLazySpan<'db>),
     ConstEvalRecursiveConst(DynLazySpan<'db>),
     TypeLoweringCycle(DynLazySpan<'db>),
+    TypeNormalizationLimit(DynLazySpan<'db>),
 
     NonTrailingDefaultGenericParam(LazyGenericParamSpan<'db>),
 
@@ -324,6 +325,7 @@ impl TyLowerDiag<'_> {
             Self::ConstEvalRecursionLimitExceeded(_) => 27,
             Self::ConstEvalRecursiveConst(_) => 37,
             Self::TypeLoweringCycle(_) => 38,
+            Self::TypeNormalizationLimit(_) => 58,
             Self::MixedRefSelfPrefixWithExplicitType { .. } => 28,
             Self::MixedOwnSelfPrefixWithExplicitType { .. } => 29,
             Self::InvalidMutSelfPrefixWithExplicitType { .. } => 30,
@@ -552,6 +554,13 @@ pub enum BodyDiag<'db> {
         const_name: String,
         origin: String,
         reason: String,
+    },
+    /// A constant in a callee's return type fails to evaluate for the generic
+    /// arguments of this call, as `S<{N - 5}>` does at `N = 2`. `fault` is the
+    /// evaluation failure, reported at the constant.
+    CallReturnTypeConstFault {
+        call: DynLazySpan<'db>,
+        fault: Box<TyDiagCollection<'db>>,
     },
     WhereConstPredicateFailed(DynLazySpan<'db>),
     WhereTypeBoundMissing(DynLazySpan<'db>),
@@ -994,6 +1003,7 @@ impl<'db> BodyDiag<'db> {
             Self::ConstValueMustBeKnown(..) => 64,
             Self::ConstDependencyMustBeKnown { .. } => 90,
             Self::ConstEvaluationFailed { .. } => 89,
+            Self::CallReturnTypeConstFault { .. } => 96,
             Self::WhereConstPredicateFailed(..) => 91,
             Self::GenericConstPredicateUnsupported(..) => 92,
             Self::RecursiveConstRequirement(..) => 94,

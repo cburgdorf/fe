@@ -145,6 +145,32 @@ fn run_fe_main_with_stdin(args: &[&str], stdin_data: &str) -> (String, i32) {
 }
 
 #[test]
+fn test_cli_check_color_flag_controls_diagnostic_escape_codes() {
+    let temp = tempdir().expect("tempdir");
+    let file = temp.path().join("type_error.fe");
+    fs::write(&file, "fn f() -> u8 { true }\n").expect("write fixture");
+    for (choice, colored) in [("never", false), ("always", true)] {
+        let output = Command::new(fe_binary())
+            .args(["check", "--color", choice])
+            .arg(&file)
+            .env("TERM", "xterm-256color")
+            .env_remove("NO_COLOR")
+            .env_remove("CLICOLOR")
+            .env_remove("CLICOLOR_FORCE")
+            .output()
+            .expect("run fe check");
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("error"), "{stderr}");
+        assert_eq!(
+            stderr.contains('\x1b'),
+            colored,
+            "--color {choice}:\n{stderr:?}"
+        );
+    }
+}
+
+#[test]
 fn test_cli_check_invalid_named_const_used_in_type_position_reports_error_instead_of_panicking() {
     let temp = tempdir().expect("tempdir");
     let file = temp.path().join("invalid_const_ty_use.fe");

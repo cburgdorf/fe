@@ -116,7 +116,10 @@ use crate::analysis::ty::{
     pattern_types::{
         PatternDestructureMode, apply_pattern_borrow_mode, destructure_pattern_source,
     },
-    ty_error::{collect_ty_lower_errors, diag_from_invalid_cause},
+    ty_error::{
+        collect_ty_lower_errors, diag_from_invalid_cause, normalization_limit_diag,
+        qualified_path_wf_diags,
+    },
 };
 use crate::analysis::{
     HirAnalysisDb,
@@ -3258,7 +3261,28 @@ impl<'db> TyChecker<'db> {
             }
         }
 
-        if let Some(diag) = ty.emit_diag(self.db, span.clone().into()) {
+        // A qualified path resolves to a type that no longer mentions the
+        // types written inside it, so check those where they are written.
+        for diag in qualified_path_wf_diags(
+            self.db,
+            self.env.scope(),
+            hir_ty,
+            span.clone(),
+            self.env.assumptions(),
+            TraitSolveCx::new(self.db, self.env.scope()).with_assumptions(self.env.assumptions()),
+        ) {
+            self.push_diag(diag);
+        }
+
+        if let Some(diag) = ty.emit_diag(self.db, span.clone().into()).or_else(|| {
+            normalization_limit_diag(
+                self.db,
+                ty,
+                self.env.scope(),
+                self.env.assumptions(),
+                span.clone().into(),
+            )
+        }) {
             self.push_diag(diag)
         }
 
