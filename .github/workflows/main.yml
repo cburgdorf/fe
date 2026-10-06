@@ -56,7 +56,8 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Validate release notes entry
-        run: ./newsfragments/validate_files.py
+        # Outside target/, which the Rust cache keeps between runs.
+        run: make check-notes EISENBOTE="$RUNNER_TEMP/eisenbote"
       - name: Lint with rustfmt
         run: cargo fmt --all -- --check
       - name: Lint with clippy
