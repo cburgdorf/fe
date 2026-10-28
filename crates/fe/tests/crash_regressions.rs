@@ -39,8 +39,13 @@ fn spawn_reader<R: Read + Send + 'static>(mut pipe: R) -> thread::JoinHandle<Vec
 }
 
 fn run_fe_check(path: &Path) -> FeCheckRun {
+    run_fe_check_with(path, &[])
+}
+
+fn run_fe_check_with(path: &Path, extra_args: &[&str]) -> FeCheckRun {
     let mut child = Command::new(env!("CARGO_BIN_EXE_fe"))
         .args(["check", "--standalone", "--color", "never"])
+        .args(extra_args)
         .arg(path)
         .env("NO_COLOR", "1")
         .env("RUST_BACKTRACE", "0")
@@ -134,8 +139,18 @@ fn selected_const_invocation_extents_reduce_before_structural_repacking() {
 
 #[test]
 fn crash_regressions_do_not_panic() {
-    let dir = fixtures_dir();
-    let mut fixtures: Vec<PathBuf> = fs::read_dir(&dir)
+    assert_fixtures_check_cleanly(&fixtures_dir(), &[]);
+}
+
+// `fe check` recovers from syntax errors only when asked to, and recovery is
+// where a parser that stops making progress loops without end.
+#[test]
+fn recovery_mode_crash_regressions_do_not_panic() {
+    assert_fixtures_check_cleanly(&fixtures_dir().join("recovery_mode"), &["--recovery-mode"]);
+}
+
+fn assert_fixtures_check_cleanly(dir: &Path, extra_args: &[&str]) {
+    let mut fixtures: Vec<PathBuf> = fs::read_dir(dir)
         .unwrap_or_else(|err| panic!("failed to read crash regressions dir {dir:?}: {err}"))
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|path| is_fe_file(path))
@@ -150,7 +165,7 @@ fn crash_regressions_do_not_panic() {
     let mut failures = Vec::new();
 
     for fixture in fixtures {
-        let run = run_fe_check(&fixture);
+        let run = run_fe_check_with(&fixture, extra_args);
         let code = run.code;
         let combined = run.combined;
         let elapsed = run.elapsed;
