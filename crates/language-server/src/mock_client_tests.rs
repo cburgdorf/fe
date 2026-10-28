@@ -504,6 +504,7 @@ async fn mock_lsp_scenarios() {
     scenario_format_during_generic_struct_keystroke_sequence(&mut client, &uri).await;
     scenario_diagnostics_published_for_broken_code(&mut client).await;
     scenario_arithmetic_attr_reports_errors(&mut client, &uri).await;
+    scenario_incomplete_attribute_is_reported_and_editing_continues(&mut client, &uri).await;
     scenario_contract_analysis_reports_errors(&mut client, &uri).await;
     scenario_payable_attr_reports_errors(&mut client, &uri).await;
     scenario_errors_reported_after_panic_recovery(&mut client, &uri).await;
@@ -740,6 +741,26 @@ fn bad() {}"#,
          got: {:?}",
         client.diagnostics_for_uri(uri),
     );
+}
+
+/// Regression test: typing `#` before `[test]` made parser recovery loop without end,
+/// which blocked the server for good. A document that is only `#` must get a
+/// diagnostic, and the edit that completes the attribute must still be analyzed.
+async fn scenario_incomplete_attribute_is_reported_and_editing_continues(
+    client: &mut MockLspClient,
+    uri: &Url,
+) {
+    client.clear_diagnostics();
+    client.did_change(uri, 760, "#");
+    let found = client
+        .wait_for_diagnostics(|d| &d.uri == uri && !d.diagnostics.is_empty())
+        .await;
+    assert!(found, "expected a syntax error for a document that is `#`");
+
+    let complete = "#[test]\nfn check() {}";
+    client.clear_diagnostics();
+    client.did_change(uri, 770, complete);
+    client.analyze(uri, complete).await;
 }
 
 /// Regression test: ContractAnalysisPass was absent from initialize_analysis_pass().
