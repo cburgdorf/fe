@@ -79,6 +79,7 @@ impl super::Parse for ItemListScope {
                 break;
             }
 
+            let start = parser.token_pos;
             let ok = parser.parse_ok(ItemScope::default())?;
             if parser.current_kind().is_none() || (self.inside_mod && parser.bump_if(RBrace)) {
                 break;
@@ -94,6 +95,13 @@ impl super::Parse for ItemListScope {
                 )? {
                     parser.bump();
                 }
+            } else if parser.token_pos == start {
+                // Recovery stopped at a token that starts no item, so the next
+                // iteration would stop at it again. `ItemScope` consumes every
+                // token in this scope's recovery set, so this is a parser bug;
+                // consume the token anyway rather than loop without end.
+                debug_assert!(false, "no item starts at {:?}", parser.current_kind());
+                parser.unexpected_token_error("unexpected token, expected an item".into());
             }
         }
         Ok(())
